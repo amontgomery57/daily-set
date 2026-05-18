@@ -49,10 +49,17 @@ function findAllSets(cards) {
 //     (in many sets) create shortcuts — find one set, find several. So
 //     higher std means more clustered, which means *easier*; subtracted.
 // Raw composite = avgVars + 0.5 * decoys - 0.4 * membershipStd.
-// We then multiply by 2 to put the score on a familiar 1-10 scale.
-// Thresholds (5.5 / 6.5) are set at the empirical tertiles across all
-// valid 6-set puzzles, so Easy/Medium/Hard each contain ~1/3 of puzzles.
-// Will be recalibrated against real solve-time data once that exists.
+// We then linearly normalize to a 0-10 scale using the empirical min/max
+// observed across 2M sampled valid 6-set puzzles — so the easiest possible
+// puzzle scores ~0 and the hardest scores ~10.
+// Thresholds (4.4 / 5.7) are set at the empirical tertiles, so Easy /
+// Medium / Hard each contain ~1/3 of all possible valid puzzles. Will be
+// recalibrated against real solve-time data once that exists.
+const RAW_SCORE_MIN = 1.028;  // empirical min raw composite (n=46,553)
+const RAW_SCORE_MAX = 4.820;  // empirical max raw composite
+const SCORE_TERTILE_LOW = 4.4;   // empirical p33 mapped onto 0-10
+const SCORE_TERTILE_HIGH = 5.7;  // empirical p67 mapped onto 0-10
+
 function computePuzzleDifficulty(puzzle) {
   if (!puzzle || !puzzle.sets || !puzzle.cards) return null;
   const { cards, sets } = puzzle;
@@ -78,10 +85,14 @@ function computePuzzleDifficulty(puzzle) {
   const variance = memberships.reduce((s, m) => s + (m - meanMem) ** 2, 0) / memberships.length;
   const membershipStd = Math.sqrt(variance);
 
-  // Composite, scaled to 1-10. Higher = harder.
+  // Raw composite, then normalize to 0-10 using empirical bounds.
+  // Clamp in case a puzzle scores slightly outside the sampled range.
   const rawScore = avgVars + 0.5 * decoys - 0.4 * membershipStd;
-  const score = rawScore * 2;
-  const level = score < 5.5 ? 'easy' : score < 6.5 ? 'medium' : 'hard';
+  const normalized = ((rawScore - RAW_SCORE_MIN) / (RAW_SCORE_MAX - RAW_SCORE_MIN)) * 10;
+  const score = Math.max(0, Math.min(10, normalized));
+  const level = score < SCORE_TERTILE_LOW ? 'easy'
+              : score < SCORE_TERTILE_HIGH ? 'medium'
+              : 'hard';
 
   return { avgVars, decoys, membershipStd, rawScore, score, level };
 }
@@ -163,7 +174,12 @@ function formatCountdown(ms) {
 }
 
 function formatMmSs(s) {
-  return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, '0')}`;
+  // Times are stored as seconds with hundredths precision (e.g. 123.45 → "2:03.45").
+  // Integer values from older saved data still format cleanly (e.g. 123 → "2:03.00").
+  const safe = typeof s === 'number' && isFinite(s) ? s : 0;
+  const m = Math.floor(safe / 60);
+  const remaining = safe - m * 60;
+  return `${m}:${remaining.toFixed(2).padStart(5, '0')}`;
 }
 
 function formatLongDate(dateKey) {
@@ -1139,7 +1155,7 @@ function StatsContent({ onPlayerClick, currentName }) {
     stats[n] = {
       played: times.length,
       best: Math.min(...times),
-      avg: Math.round(times.reduce((s, t) => s + t, 0) / times.length),
+      avg: Math.round(times.reduce((s, t) => s + t, 0) / times.length * 100) / 100,
     };
   }
 
@@ -1287,10 +1303,10 @@ function PlayerStatsContent({ player, todayKey, currentName, onBack }) {
   const times = entries.map(e => e.time);
   const played = times.length;
   const best = Math.min(...times);
-  const avg = Math.round(times.reduce((s, t) => s + t, 0) / played);
+  const avg = Math.round(times.reduce((s, t) => s + t, 0) / played * 100) / 100;
   const sortedTimes = [...times].sort((a, b) => a - b);
   const median = sortedTimes.length % 2 === 0
-    ? Math.round((sortedTimes[sortedTimes.length / 2 - 1] + sortedTimes[sortedTimes.length / 2]) / 2)
+    ? Math.round((sortedTimes[sortedTimes.length / 2 - 1] + sortedTimes[sortedTimes.length / 2]) / 2 * 100) / 100
     : sortedTimes[Math.floor(sortedTimes.length / 2)];
 
   const multiPlayerEntries = entries.filter(e => e.total > 1);
@@ -1430,10 +1446,13 @@ function ScoringContent({ onBack }) {
       <div className="bg-white rounded-md border border-stone-300 p-3 mb-2
                       text-sm text-stone-800 tabular-nums text-center overflow-x-auto"
            style={{ fontFamily: '"Menlo", monospace' }}>
-        score = 2 × (avgVars + 0.5 × decoys − 0.4 × membershipStd)
+        score = ((raw − 1.028) / 3.792) × 10
       </div>
-      <p className="text-xs text-stone-500 mb-5 text-center">
-        The raw composite is doubled so the score lands on a familiar 1–10 scale.
+      <p className="text-xs text-stone-500 mb-5 text-center leading-relaxed">
+        where <span className="font-mono">raw = avgVars + 0.5 × decoys − 0.4 × membershipStd</span>.{' '}
+        The raw composite is normalized against the empirical min (1.028) and max
+        (4.820) observed across ~46,500 sampled valid 6-set puzzles, so the
+        easiest possible puzzle scores ~0 and the hardest ~10.
       </p>
 
       <section className="mb-4">
@@ -1492,25 +1511,43 @@ function ScoringContent({ onBack }) {
         puzzles, so each level contains roughly a third of all possible puzzles.
       </p>
       <div className="bg-white rounded-md border border-stone-300 divide-y divide-stone-200 mb-4">
-        <div className="px-4 py-2.5 flex justify-between items-center">
-          <span className="text-sm">🌶️ <span className="ml-1">Easy</span></span>
-          <span className="text-stone-500 tabular-nums text-sm"
+        <div className="px-4 py-1.5 flex items-center gap-3 bg-stone-50
+                        text-[10px] uppercase tracking-wider text-stone-500 font-semibold">
+          <span className="flex-1">Level</span>
+          <span className="w-20 text-right">Range</span>
+          <span className="w-28 text-right">Threshold</span>
+        </div>
+        <div className="px-4 py-2.5 flex items-center gap-3">
+          <span className="text-sm flex-1">🌶️ <span className="ml-1">Easy</span></span>
+          <span className="text-stone-700 tabular-nums text-sm font-medium w-20 text-right"
                 style={{ fontFamily: '"Menlo", monospace' }}>
-            score &lt; 5.5
+            0.0 – 4.4
+          </span>
+          <span className="text-stone-400 tabular-nums text-xs w-28 text-right"
+                style={{ fontFamily: '"Menlo", monospace' }}>
+            score &lt; 4.4
           </span>
         </div>
-        <div className="px-4 py-2.5 flex justify-between items-center">
-          <span className="text-sm">🌶️🌶️ <span className="ml-1">Medium</span></span>
-          <span className="text-stone-500 tabular-nums text-sm"
+        <div className="px-4 py-2.5 flex items-center gap-3">
+          <span className="text-sm flex-1">🌶️🌶️ <span className="ml-1">Medium</span></span>
+          <span className="text-stone-700 tabular-nums text-sm font-medium w-20 text-right"
                 style={{ fontFamily: '"Menlo", monospace' }}>
-            5.5 ≤ score &lt; 6.5
+            4.4 – 5.7
+          </span>
+          <span className="text-stone-400 tabular-nums text-xs w-28 text-right"
+                style={{ fontFamily: '"Menlo", monospace' }}>
+            4.4 ≤ score &lt; 5.7
           </span>
         </div>
-        <div className="px-4 py-2.5 flex justify-between items-center">
-          <span className="text-sm">🌶️🌶️🌶️ <span className="ml-1">Hard</span></span>
-          <span className="text-stone-500 tabular-nums text-sm"
+        <div className="px-4 py-2.5 flex items-center gap-3">
+          <span className="text-sm flex-1">🌶️🌶️🌶️ <span className="ml-1">Hard</span></span>
+          <span className="text-stone-700 tabular-nums text-sm font-medium w-20 text-right"
                 style={{ fontFamily: '"Menlo", monospace' }}>
-            score ≥ 6.5
+            5.7 – 10.0
+          </span>
+          <span className="text-stone-400 tabular-nums text-xs w-28 text-right"
+                style={{ fontFamily: '"Menlo", monospace' }}>
+            score ≥ 5.7
           </span>
         </div>
       </div>
@@ -1649,8 +1686,9 @@ export default function App() {
     const id = setInterval(() => {
       const ms = accumulatedMsRef.current +
         (startTimeRef.current !== null ? Date.now() - startTimeRef.current : 0);
-      setTime(Math.floor(ms / 1000));
-    }, 250);
+      // Store seconds with 2-decimal (centisecond) precision
+      setTime(Math.round(ms / 10) / 100);
+    }, 50);
     return () => clearInterval(id);
   }, [running]);
 
@@ -1701,7 +1739,8 @@ export default function App() {
             startTimeRef.current = null;
           }
           setRunning(false);
-          const finalTime = Math.floor(accumulatedMsRef.current / 1000);
+          // Final time as seconds with 2-decimal precision (e.g. 123.45)
+          const finalTime = Math.round(accumulatedMsRef.current / 10) / 100;
           setTime(finalTime);
           const newResult = { time: finalTime, completedAt: Date.now() };
           (async () => {
