@@ -146,9 +146,9 @@ function generateArchiveDates(todayKey, count = ARCHIVE_DAYS) {
 }
 
 // ===== Storage backend =====
-// Fill in your Supabase project URL and anon public key to deploy with a
-// shared leaderboard. Leave blank to run in Claude (uses window.storage)
-// or as a local-only build (uses localStorage; no shared leaderboard).
+// Supabase project for dailyset.net. The publishable key is designed to be
+// public — Row Level Security on the results/puzzles tables controls what
+// anyone can do (read + insert only). Safe to commit and to ship to clients.
 const SUPABASE_URL = 'https://ncujnlnlgzfxurlyfnzk.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_xD3sBJnHJ03O7Bv8xt1H9A_SXE8H6oL';
 const USE_SUPABASE = Boolean(SUPABASE_URL && SUPABASE_KEY);
@@ -215,7 +215,20 @@ const Storage = {
     }
     lsSetName(name);
   },
-  async getMyResult(dateKey) {
+  async getMyResult(dateKey, playerName) {
+    if (USE_SUPABASE && playerName) {
+      try {
+        const rows = await sbFetch(
+          `/results?date=eq.${encodeURIComponent(dateKey)}&name=eq.${encodeURIComponent(playerName)}&select=time_seconds,completed_at&limit=1`
+        );
+        if (rows && rows.length) {
+          const r = { time: rows[0].time_seconds, completedAt: rows[0].completed_at };
+          lsSetResult(dateKey, r);  // cache locally
+          return r;
+        }
+        return lsGetResult(dateKey);  // nothing in supabase; fall back to local cache
+      } catch { return lsGetResult(dateKey); }
+    }
     if (USE_SUPABASE) return lsGetResult(dateKey);
     if (hasStorage()) {
       try {
@@ -225,7 +238,25 @@ const Storage = {
     }
     return lsGetResult(dateKey);
   },
-  async loadMyResults() {
+  async loadMyResults(playerName) {
+    if (USE_SUPABASE && playerName) {
+      try {
+        const rows = await sbFetch(
+          `/results?name=eq.${encodeURIComponent(playerName)}&select=date,time_seconds,completed_at`
+        );
+        const out = {};
+        for (const row of rows || []) {
+          out[row.date] = { time: row.time_seconds, completedAt: row.completed_at };
+          lsSetResult(row.date, out[row.date]);  // cache locally
+        }
+        // Merge in any local-only entries (e.g. saved before name was set)
+        const local = lsListResults();
+        for (const [d, r] of Object.entries(local)) {
+          if (!out[d]) out[d] = r;
+        }
+        return out;
+      } catch { return lsListResults(); }
+    }
     if (USE_SUPABASE) return lsListResults();
     if (hasStorage()) {
       try {
@@ -1282,7 +1313,7 @@ export default function App() {
   // === Bulk-load all personal results once name is set ===
   useEffect(() => {
     if (!name) return;
-    Storage.loadMyResults().then(setMyResults);
+    Storage.loadMyResults(name).then(setMyResults);
   }, [name]);
 
   // === Load active puzzle state when activeDate changes ===
@@ -1309,7 +1340,7 @@ export default function App() {
     Storage.savePuzzle(activeDate, puzzle.cards);
 
     (async () => {
-      const r = await Storage.getMyResult(activeDate);
+      const r = await Storage.getMyResult(activeDate, name);
       if (cancelled) return;
       if (r) {
         setCurrentResult(r);
