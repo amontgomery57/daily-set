@@ -37,6 +37,55 @@ function findAllSets(cards) {
   return sets;
 }
 
+// ===== Puzzle difficulty scoring =====
+// Three structural metrics, independent of the player:
+//   avgVars: average number of varying attributes across all sets (1.0-4.0).
+//     A set varying in only 1 attribute (e.g. three red solid ovals, just
+//     1/2/3 of them) is trivially easy to spot. A set varying in all 4
+//     attributes looks maximally different and is the hardest to recognize.
+//   decoys: number of cards that belong to no set at all. Decoys force
+//     players to actively dismiss cards, which costs scan time.
+//   membershipStd: standard deviation of set-counts per card. Hub cards
+//     (in many sets) create shortcuts — find one set, find several. So
+//     higher std means more clustered, which means *easier*; subtracted.
+// Raw composite = avgVars + 0.5 * decoys - 0.4 * membershipStd.
+// We then multiply by 2 to put the score on a familiar 1-10 scale.
+// Thresholds (5.5 / 6.5) are set at the empirical tertiles across all
+// valid 6-set puzzles, so Easy/Medium/Hard each contain ~1/3 of puzzles.
+// Will be recalibrated against real solve-time data once that exists.
+function computePuzzleDifficulty(puzzle) {
+  if (!puzzle || !puzzle.sets || !puzzle.cards) return null;
+  const { cards, sets } = puzzle;
+  if (!sets.length) return null;
+
+  // 1. Average varying attributes per set (1.0 - 4.0)
+  let totalVars = 0;
+  for (const [i, j, k] of sets) {
+    const a = cards[i], b = cards[j], c = cards[k];
+    let v = 0;
+    for (const attr of ['color', 'shape', 'shading', 'number']) {
+      if (new Set([a[attr], b[attr], c[attr]]).size === 3) v++;
+    }
+    totalVars += v;
+  }
+  const avgVars = totalVars / sets.length;
+
+  // 2. Per-card memberships → decoys + spread
+  const memberships = new Array(cards.length).fill(0);
+  for (const [i, j, k] of sets) { memberships[i]++; memberships[j]++; memberships[k]++; }
+  const decoys = memberships.filter(m => m === 0).length;
+  const meanMem = memberships.reduce((s, m) => s + m, 0) / memberships.length;
+  const variance = memberships.reduce((s, m) => s + (m - meanMem) ** 2, 0) / memberships.length;
+  const membershipStd = Math.sqrt(variance);
+
+  // Composite, scaled to 1-10. Higher = harder.
+  const rawScore = avgVars + 0.5 * decoys - 0.4 * membershipStd;
+  const score = rawScore * 2;
+  const level = score < 5.5 ? 'easy' : score < 6.5 ? 'medium' : 'hard';
+
+  return { avgVars, decoys, membershipStd, rawScore, score, level };
+}
+
 // ===== Seeded RNG =====
 function hashString(s) {
   let h = 2166136261 >>> 0;
@@ -667,6 +716,48 @@ function StatCard({ label, value, sub, accent }) {
   );
 }
 
+// ===== Difficulty badge =====
+// Shows pepper icons, optional label ("Medium"), and the score (out of 10).
+// When onClick is provided, renders as a button with a small info icon so it
+// reads as an interactive element that explains itself when tapped.
+function DifficultyBadge({ difficulty, showLabel = false, showScore = true,
+                          onClick, className = '' }) {
+  if (!difficulty) return null;
+  const { level, score } = difficulty;
+  const peppers = level === 'easy' ? '🌶️'
+                : level === 'medium' ? '🌶️🌶️'
+                : '🌶️🌶️🌶️';
+  const label = level === 'easy' ? 'Easy'
+              : level === 'medium' ? 'Medium'
+              : 'Hard';
+  const inner = (
+    <span className={`inline-flex items-baseline gap-1 ${className}`}>
+      <span aria-label={label}>{peppers}</span>
+      {showLabel && <span className="text-stone-600 font-medium">{label}</span>}
+      {showScore && (
+        <span className="text-stone-500 tabular-nums"
+              style={{ fontFamily: '"Menlo", monospace' }}>
+          · {score.toFixed(1)}<span className="text-stone-400">/10</span>
+        </span>
+      )}
+      {onClick && (
+        <span className="text-stone-400 ml-0.5" aria-hidden="true"
+              style={{ fontSize: '0.9em' }}>ⓘ</span>
+      )}
+    </span>
+  );
+  if (onClick) {
+    return (
+      <button onClick={(e) => { e.stopPropagation(); onClick(); }}
+              className="hover:text-red-700 transition-colors cursor-pointer"
+              title="How is difficulty scored?">
+        {inner}
+      </button>
+    );
+  }
+  return inner;
+}
+
 // ===== Pause overlay (replaces cards while paused) =====
 function PauseOverlay({ time, foundCount, targetCount, onResume }) {
   return (
@@ -694,7 +785,8 @@ function PauseOverlay({ time, foundCount, targetCount, onResume }) {
 // ===== Game content (active timer + cards/overlay + sidebar) =====
 function GameContent({ puzzle, targetSets, time, foundSets, selected, flash,
                        userPaused, name, isPlayingToday, activeDate,
-                       onToggle, onPause, onResume, onRename }) {
+                       onToggle, onPause, onResume, onRename, onOpenScoring }) {
+  const difficulty = useMemo(() => computePuzzleDifficulty(puzzle), [puzzle]);
   return (
     <>
       <div className="text-center pt-3 pb-1">
@@ -712,12 +804,23 @@ function GameContent({ puzzle, targetSets, time, foundSets, selected, flash,
             </button>
           )}
         </div>
-        <div className="text-xs text-stone-500 mt-0.5">
-          {foundSets.length} / {targetSets} sets found · playing as{' '}
-          <button onClick={onRename}
-                  className="underline underline-offset-2 hover:text-stone-700">
-            {name}
-          </button>
+        <div className="text-xs text-stone-500 mt-1 flex items-center justify-center gap-2 flex-wrap">
+          {difficulty && (
+            <>
+              <DifficultyBadge difficulty={difficulty} showLabel
+                               onClick={onOpenScoring} />
+              <span className="text-stone-300">·</span>
+            </>
+          )}
+          <span>{foundSets.length} / {targetSets} sets found</span>
+          <span className="text-stone-300">·</span>
+          <span>
+            playing as{' '}
+            <button onClick={onRename}
+                    className="underline underline-offset-2 hover:text-stone-700">
+              {name}
+            </button>
+          </span>
         </div>
         {!isPlayingToday && (
           <div className="text-xs text-stone-500 mt-0.5 italic">
@@ -784,8 +887,9 @@ function GameContent({ puzzle, targetSets, time, foundSets, selected, flash,
 
 // ===== Completed content =====
 function CompletedContent({ result, leaderboard, name, isPlayingToday, dateKey,
-                            msUntilTomorrow, onPlayToday, onPlayerClick,
-                            onRefresh, refreshing, onRename }) {
+                            msUntilTomorrow, puzzle, onPlayToday, onPlayerClick,
+                            onRefresh, refreshing, onRename, onOpenScoring }) {
+  const difficulty = useMemo(() => computePuzzleDifficulty(puzzle), [puzzle]);
   return (
     <main className="flex-1 flex items-start justify-center p-4">
       <div className="max-w-md w-full bg-white rounded-xl shadow-md p-6">
@@ -803,6 +907,25 @@ function CompletedContent({ result, leaderboard, name, isPlayingToday, dateKey,
             <p className="text-xs text-stone-500 mt-1">
               Archived puzzle · {formatShortDate(dateKey)}
             </p>
+          )}
+          {difficulty && (
+            <div className="mt-3 flex flex-col items-center gap-1">
+              <div className="inline-flex items-baseline gap-1.5 px-3 py-1
+                              bg-stone-100 rounded-full text-sm">
+                <span className="text-stone-500 text-xs uppercase tracking-wider font-semibold">
+                  Difficulty
+                </span>
+                <DifficultyBadge difficulty={difficulty} showLabel />
+              </div>
+              {onOpenScoring && (
+                <button onClick={onOpenScoring}
+                  className="text-xs text-red-700 hover:text-red-900
+                             underline underline-offset-2 font-medium
+                             transition-colors mt-1">
+                  How is difficulty calculated? →
+                </button>
+              )}
+            </div>
           )}
         </div>
 
@@ -842,13 +965,24 @@ function CompletedContent({ result, leaderboard, name, isPlayingToday, dateKey,
 
 // ===== Archives content =====
 function ArchivesContent({ archiveDates, archiveResults, todayResult, todayKey,
-                           onPlayToday, onPlayArchive }) {
+                           onPlayToday, onPlayArchive, onOpenScoring }) {
   const allResults = { ...archiveResults };
   if (todayResult) allResults[todayKey] = todayResult;
   const playedCount = Object.keys(allResults).length;
   const totalCount = archiveDates.length + 1;
   const allTimes = Object.values(allResults).map((r) => r.time);
   const best = allTimes.length ? Math.min(...allTimes) : null;
+
+  // Compute difficulty for every shown puzzle (today + 30 days). Each
+  // generateDailyPuzzle is ~50ms worst case; memoized by date so this runs
+  // once when the archives view first mounts.
+  const difficulties = useMemo(() => {
+    const map = {};
+    for (const date of [todayKey, ...archiveDates]) {
+      map[date] = computePuzzleDifficulty(generateDailyPuzzle(date));
+    }
+    return map;
+  }, [todayKey, archiveDates]);
 
   let streak = 0;
   if (todayResult) streak = 1;
@@ -919,16 +1053,26 @@ function ArchivesContent({ archiveDates, archiveResults, todayResult, todayKey,
       <div className="bg-white rounded-md shadow-sm divide-y divide-stone-100 overflow-hidden">
         {archiveDates.map((date) => {
           const result = archiveResults[date];
+          // Using div + role=button so the difficulty badge inside can be its
+          // own clickable element (nested <button> in <button> is invalid HTML).
           return (
-            <button key={date} onClick={() => onPlayArchive(date)}
+            <div key={date} role="button" tabIndex={0}
+              onClick={() => onPlayArchive(date)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  onPlayArchive(date);
+                }
+              }}
               className="w-full flex items-center justify-between px-4 py-3
-                         hover:bg-stone-50 transition-colors text-left group">
+                         hover:bg-stone-50 transition-colors text-left group cursor-pointer
+                         focus:outline-none focus:bg-stone-50">
               <div className="flex items-center gap-3 min-w-0">
                 <span className={`text-lg w-5 inline-block text-center flex-shrink-0
                                  ${result ? 'text-green-600' : 'text-stone-300'}`}>
                   {result ? '✓' : '○'}
                 </span>
-                <div className="text-sm flex items-baseline gap-2 min-w-0">
+                <div className="text-sm flex items-baseline gap-2 min-w-0 flex-wrap">
                   <span className="text-stone-500 uppercase text-[11px] font-semibold
                                    tracking-wider w-9 flex-shrink-0">
                     {shortWeekday(date, true)}
@@ -936,6 +1080,11 @@ function ArchivesContent({ archiveDates, archiveResults, todayResult, todayKey,
                   <span className="text-stone-800 font-medium truncate">
                     {formatShortDate(date)}
                   </span>
+                  {difficulties[date] && (
+                    <DifficultyBadge difficulty={difficulties[date]}
+                                     onClick={onOpenScoring}
+                                     className="text-[11px]" />
+                  )}
                 </div>
               </div>
               <div className="text-sm flex-shrink-0">
@@ -950,7 +1099,7 @@ function ArchivesContent({ archiveDates, archiveResults, todayResult, todayKey,
                   </span>
                 )}
               </div>
-            </button>
+            </div>
           );
         })}
       </div>
@@ -1259,6 +1408,122 @@ function PlayerStatsContent({ player, todayKey, currentName, onBack }) {
   );
 }
 
+// ===== Scoring explanation page =====
+function ScoringContent({ onBack }) {
+  return (
+    <main className="flex-1 p-3 max-w-2xl w-full mx-auto">
+      <button onClick={onBack}
+        className="text-sm text-red-700 hover:text-red-900 font-medium mb-3 inline-flex items-center gap-1">
+        ← Back
+      </button>
+      <h2 className="text-2xl font-bold text-stone-800 mb-2"
+          style={{ fontFamily: '"Georgia", serif' }}>
+        How difficulty is scored
+      </h2>
+      <p className="text-stone-600 text-sm mb-5 leading-relaxed">
+        Every puzzle gets a score from <strong>structural properties of the
+        12-card layout itself</strong>, not from how long anyone took to solve
+        it. That keeps it honest — a 🌶️🌶️🌶️ today is comparable to a
+        🌶️🌶️🌶️ a year ago.
+      </p>
+
+      <div className="bg-white rounded-md border border-stone-300 p-3 mb-2
+                      text-sm text-stone-800 tabular-nums text-center overflow-x-auto"
+           style={{ fontFamily: '"Menlo", monospace' }}>
+        score = 2 × (avgVars + 0.5 × decoys − 0.4 × membershipStd)
+      </div>
+      <p className="text-xs text-stone-500 mb-5 text-center">
+        The raw composite is doubled so the score lands on a familiar 1–10 scale.
+      </p>
+
+      <section className="mb-4">
+        <h3 className="font-semibold text-stone-800 mb-1"
+            style={{ fontFamily: '"Georgia", serif' }}>
+          avgVars
+          <span className="text-stone-400 font-normal text-sm ml-1">
+            — average varying attributes per set
+          </span>
+        </h3>
+        <p className="text-sm text-stone-700 leading-relaxed">
+          Each set varies in 1–4 of its attributes (color, shape, shading,
+          number). A set with 1 varying attribute looks nearly identical
+          (e.g. three red solid ovals — just the count differs); a set with
+          all 4 varying looks maximally different and is the hardest to spot.{' '}
+          <strong>Higher = harder.</strong>
+        </p>
+      </section>
+
+      <section className="mb-4">
+        <h3 className="font-semibold text-stone-800 mb-1"
+            style={{ fontFamily: '"Georgia", serif' }}>
+          decoys
+          <span className="text-stone-400 font-normal text-sm ml-1">
+            — cards in zero sets
+          </span>
+        </h3>
+        <p className="text-sm text-stone-700 leading-relaxed">
+          Cards that don't belong to any set still have to be visually
+          evaluated and dismissed. More decoys means more wasted scanning.{' '}
+          <strong>Higher = harder.</strong>
+        </p>
+      </section>
+
+      <section className="mb-5">
+        <h3 className="font-semibold text-stone-800 mb-1"
+            style={{ fontFamily: '"Georgia", serif' }}>
+          membershipStd
+          <span className="text-stone-400 font-normal text-sm ml-1">
+            — how clustered the sets are
+          </span>
+        </h3>
+        <p className="text-sm text-stone-700 leading-relaxed">
+          The standard deviation of "how many sets each card belongs to." If a
+          few "hub" cards appear in many sets, finding one set tends to reveal
+          several others — your eye is already on those cards. Even spread =
+          no shortcuts. <strong>Higher = easier</strong> (so it's subtracted).
+        </p>
+      </section>
+
+      <h3 className="text-[11px] uppercase tracking-wider text-stone-500 mb-2 px-1 font-semibold">
+        Thresholds
+      </h3>
+      <p className="text-xs text-stone-500 mb-2 leading-relaxed">
+        Set at the empirical tertiles across ~46,500 sampled valid 6-set
+        puzzles, so each level contains roughly a third of all possible puzzles.
+      </p>
+      <div className="bg-white rounded-md border border-stone-300 divide-y divide-stone-200 mb-4">
+        <div className="px-4 py-2.5 flex justify-between items-center">
+          <span className="text-sm">🌶️ <span className="ml-1">Easy</span></span>
+          <span className="text-stone-500 tabular-nums text-sm"
+                style={{ fontFamily: '"Menlo", monospace' }}>
+            score &lt; 5.5
+          </span>
+        </div>
+        <div className="px-4 py-2.5 flex justify-between items-center">
+          <span className="text-sm">🌶️🌶️ <span className="ml-1">Medium</span></span>
+          <span className="text-stone-500 tabular-nums text-sm"
+                style={{ fontFamily: '"Menlo", monospace' }}>
+            5.5 ≤ score &lt; 6.5
+          </span>
+        </div>
+        <div className="px-4 py-2.5 flex justify-between items-center">
+          <span className="text-sm">🌶️🌶️🌶️ <span className="ml-1">Hard</span></span>
+          <span className="text-stone-500 tabular-nums text-sm"
+                style={{ fontFamily: '"Menlo", monospace' }}>
+            score ≥ 6.5
+          </span>
+        </div>
+      </div>
+
+      <p className="text-xs text-stone-500 italic leading-relaxed">
+        The coefficients (0.5, 0.4) and thresholds are first-pass estimates.
+        As solve-time data accumulates, they'll be recalibrated against what
+        actually predicts how hard humans find each puzzle.
+      </p>
+    </main>
+  );
+}
+
 // ===== Main app =====
 export default function App() {
   const [todayKey, setTodayKey] = useState(() => utcDateKey());
@@ -1292,6 +1557,9 @@ export default function App() {
 
   const [view, setView] = useState('game');
   const [viewingPlayer, setViewingPlayer] = useState(null);
+  // Remember where the user came from when they opened the scoring page so
+  // the Back button takes them back there (game vs archives).
+  const [scoringFrom, setScoringFrom] = useState('game');
   const [now, setNow] = useState(Date.now());
   const [refreshing, setRefreshing] = useState(false);
 
@@ -1483,9 +1751,16 @@ export default function App() {
     setView('playerStats');
   };
 
+  // Open the scoring page from anywhere; remember origin so Back returns there.
+  const openScoring = () => {
+    setScoringFrom(view);
+    setView('scoring');
+  };
+
   // Tab navigation
   const activeTab = view === 'archives' ? 'archives'
                   : (view === 'stats' || view === 'playerStats') ? 'stats'
+                  : view === 'scoring' ? (scoringFrom === 'archives' ? 'archives' : 'game')
                   : playingDate ? 'archives'  // archived puzzle in game view
                   : 'game';
 
@@ -1561,6 +1836,7 @@ export default function App() {
           todayKey={todayKey}
           onPlayToday={() => handleTabChange('game')}
           onPlayArchive={(date) => { setPlayingDate(date); setView('game'); }}
+          onOpenScoring={openScoring}
         />
       )}
 
@@ -1580,6 +1856,10 @@ export default function App() {
         />
       )}
 
+      {view === 'scoring' && (
+        <ScoringContent onBack={() => setView(scoringFrom)} />
+      )}
+
       {view === 'game' && currentResult && (
         <CompletedContent
           result={currentResult}
@@ -1588,11 +1868,13 @@ export default function App() {
           isPlayingToday={isPlayingToday}
           dateKey={activeDate}
           msUntilTomorrow={msUntilTomorrow}
+          puzzle={puzzle}
           onPlayToday={() => handleTabChange('game')}
           onPlayerClick={openPlayerStats}
           onRefresh={refreshLeaderboard}
           refreshing={refreshing}
           onRename={() => setView('rename')}
+          onOpenScoring={openScoring}
         />
       )}
 
@@ -1612,6 +1894,7 @@ export default function App() {
           onPause={() => setUserPaused(true)}
           onResume={() => setUserPaused(false)}
           onRename={() => setView('rename')}
+          onOpenScoring={openScoring}
         />
       )}
     </div>
