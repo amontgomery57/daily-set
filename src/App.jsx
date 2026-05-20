@@ -775,17 +775,15 @@ function DifficultyBadge({ difficulty, showLabel = false, showScore = true,
 }
 
 // ===== Pause overlay (replaces cards while paused) =====
-function PauseOverlay({ time, foundCount, targetCount, onResume }) {
+// Like the in-game header, the pause screen deliberately doesn't show elapsed
+// time — that's reserved for the completion screen.
+function PauseOverlay({ foundCount, targetCount, onResume }) {
   return (
     <div className="bg-white rounded-lg border-2 border-stone-200 shadow-sm
                     flex flex-col items-center justify-center text-center py-16 px-6"
          style={{ minHeight: '380px' }}>
       <div className="text-5xl mb-3">⏸</div>
-      <h2 className="text-lg font-semibold text-stone-600 mb-1">Paused</h2>
-      <div className="text-4xl font-mono font-bold text-stone-800 mb-1 tabular-nums"
-           style={{ fontFamily: '"Menlo", monospace' }}>
-        {formatMmSs(time)}
-      </div>
+      <h2 className="text-lg font-semibold text-stone-600 mb-2">Paused</h2>
       <p className="text-sm text-stone-500 mb-6">
         {foundCount} / {targetCount} sets found
       </p>
@@ -799,6 +797,9 @@ function PauseOverlay({ time, foundCount, targetCount, onResume }) {
 }
 
 // ===== Game content (active timer + cards/overlay + sidebar) =====
+// The timer runs the whole time but is hidden during play — the player only
+// sees their final time on the completion screen. This reduces clock anxiety
+// and keeps the focus on the puzzle itself.
 function GameContent({ puzzle, targetSets, time, foundSets, selected, flash,
                        userPaused, name, isPlayingToday, activeDate,
                        onToggle, onPause, onResume, onRename, onOpenScoring }) {
@@ -806,20 +807,16 @@ function GameContent({ puzzle, targetSets, time, foundSets, selected, flash,
   return (
     <>
       <div className="text-center pt-3 pb-1">
-        <div className="flex items-center justify-center gap-3">
-          <div className="text-3xl font-mono tabular-nums text-stone-800"
-               style={{ fontFamily: '"Menlo", "Courier New", monospace' }}>
-            {formatMmSs(time)}
-          </div>
-          {!userPaused && (
+        {!userPaused && (
+          <div className="flex items-center justify-center">
             <button onClick={onPause}
-              className="px-2.5 py-1 text-stone-600 hover:text-stone-900 hover:bg-stone-200
+              className="px-3 py-1.5 text-stone-600 hover:text-stone-900 hover:bg-stone-200
                          rounded text-sm font-medium transition-colors"
               title="Pause">
               ⏸ Pause
             </button>
-          )}
-        </div>
+          </div>
+        )}
         <div className="text-xs text-stone-500 mt-1 flex items-center justify-center gap-2 flex-wrap">
           {difficulty && (
             <>
@@ -849,7 +846,6 @@ function GameContent({ puzzle, targetSets, time, foundSets, selected, flash,
         <section className="flex-1">
           {userPaused ? (
             <PauseOverlay
-              time={time}
               foundCount={foundSets.length}
               targetCount={targetSets}
               onResume={onResume}
