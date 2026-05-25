@@ -391,6 +391,47 @@ const Storage = {
     }
     // local-only mode: skip (deterministic from date anyway)
   },
+  // Push any local results that the cloud doesn't have yet. This fixes the
+  // case where a save attempt failed silently (transient network, schema
+  // mismatch, etc.) — the result lives in localStorage so the user sees it
+  // in their own view, but it never reached the global leaderboard / daily
+  // log. Called on app load after the name is known. ignore-duplicates means
+  // it's safe to re-run; rows already in cloud are silently skipped.
+  async syncLocalToCloud(playerName) {
+    if (!USE_SUPABASE || !playerName) return { pushed: 0 };
+    try {
+      const rows = await sbFetch(
+        `/results?name=eq.${encodeURIComponent(playerName)}&select=date`
+      );
+      const cloudDates = new Set((rows || []).map((r) => r.date));
+      const local = lsListResults();
+      const missing = Object.entries(local).filter(([d]) => !cloudDates.has(d));
+      if (missing.length === 0) return { pushed: 0 };
+      let pushed = 0;
+      for (const [date, payload] of missing) {
+        if (!payload || typeof payload.time !== 'number') continue;
+        try {
+          await sbFetch('/results', {
+            method: 'POST',
+            headers: { Prefer: 'resolution=ignore-duplicates,return=minimal' },
+            body: JSON.stringify({
+              date, name: playerName,
+              time_seconds: payload.time,
+              completed_at: payload.completedAt || Date.now(),
+            }),
+          });
+          pushed++;
+        } catch (e) {
+          console.error(`syncLocalToCloud: failed for ${date}:`, e);
+        }
+      }
+      if (pushed > 0) console.log(`syncLocalToCloud: pushed ${pushed} result(s) to cloud`);
+      return { pushed };
+    } catch (e) {
+      console.error('syncLocalToCloud:', e);
+      return { pushed: 0 };
+    }
+  },
   async loadLeaderboard(dateKey) {
     if (USE_SUPABASE) {
       try {
@@ -512,18 +553,18 @@ function CardBody({ card }) {
 }
 
 function GameCard({ card, selected, flashing, onClick, disabled }) {
-  const border = flashing === 'bad' ? 'border-red-500 ring-2 ring-red-300'
-                : flashing === 'dup' ? 'border-amber-500 ring-2 ring-amber-300'
-                : selected ? 'border-blue-500 ring-2 ring-blue-200'
-                : 'border-gray-200';
+  const border = flashing === 'bad' ? 'border-red-500 ring-2 ring-red-300 bg-red-50/40'
+                : flashing === 'dup' ? 'border-amber-500 ring-2 ring-amber-300 bg-amber-50/40'
+                : selected ? 'border-blue-500 ring-2 ring-blue-300 bg-blue-50/50'
+                : 'border-gray-200 bg-white';
   return (
     <button
       onClick={onClick}
       disabled={disabled}
-      style={{ aspectRatio: CARD_ASPECT }}
-      className={`relative w-full bg-white rounded-lg border-2 ${border}
-        overflow-hidden transition-all duration-150 shadow-sm
-        ${disabled ? '' : 'hover:border-gray-400 hover:shadow active:scale-[0.97]'}`}
+      style={{ aspectRatio: CARD_ASPECT, touchAction: 'manipulation' }}
+      className={`relative w-full rounded-lg border-2 ${border}
+        overflow-hidden transition-colors duration-100 shadow-sm select-none
+        ${disabled ? '' : 'hover:border-gray-400 hover:shadow active:scale-[0.98]'}`}
     >
       <CardBody card={card} />
     </button>
@@ -1612,9 +1653,15 @@ export default function App() {
   }, []);
 
   // === Bulk-load all personal results once name is set ===
+  // Sync first so any local-only saves (e.g. ones whose Supabase POST failed
+  // silently) get pushed to cloud, then load so we see the merged view.
   useEffect(() => {
     if (!name) return;
-    Storage.loadMyResults(name).then(setMyResults);
+    (async () => {
+      await Storage.syncLocalToCloud(name);
+      const results = await Storage.loadMyResults(name);
+      setMyResults(results);
+    })();
   }, [name]);
 
   // === Load active puzzle state when activeDate changes ===
