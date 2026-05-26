@@ -7,7 +7,7 @@ const SHAPES = ['oval', 'diamond', 'squiggle'];
 const SHADINGS = ['solid', 'striped', 'open'];
 const NUMBERS = [1, 2, 3];
 const PUZZLE_VERSION = '1';
-const ARCHIVE_DAYS = 30;
+const ARCHIVE_DAYS = 60;
 
 // ===== Deck / set logic =====
 function generateDeck() {
@@ -791,13 +791,27 @@ function StatCard({ label, value, sub, accent }) {
 // When onClick is provided, renders as a button with a small info icon so it
 // reads as an interactive element that explains itself when tapped.
 // Five tiers: very-easy / easy / medium / hard / very-hard -> 1-5 peppers.
+// Each tier also carries its chart bar color, explanation-card colors, score
+// range, and estimated share / count of the ~1.65 trillion puzzle pool, so
+// the badge, the scoring page and the distribution charts all stay in sync.
 const DIFFICULTY_TIERS = {
-  'very-easy': { peppers: '🌶️',          label: 'Very Easy' },
-  'easy':      { peppers: '🌶️🌶️',        label: 'Easy' },
-  'medium':    { peppers: '🌶️🌶️🌶️',      label: 'Medium' },
-  'hard':      { peppers: '🌶️🌶️🌶️🌶️',    label: 'Hard' },
-  'very-hard': { peppers: '🌶️🌶️🌶️🌶️🌶️',  label: 'Very Hard' },
+  'very-easy': { peppers: '🌶️',          label: 'Very Easy',
+                 color: '#3f9650', cardBg: '#e7f3ea', cardFg: '#256634',
+                 range: '0.0 – 3.4', share: '9.6%',  est: '~158 B' },
+  'easy':      { peppers: '🌶️🌶️',        label: 'Easy',
+                 color: '#7a9e3a', cardBg: '#eef2e1', cardFg: '#566b1f',
+                 range: '3.4 – 4.4', share: '24.3%', est: '~401 B' },
+  'medium':    { peppers: '🌶️🌶️🌶️',      label: 'Medium',
+                 color: '#d99413', cardBg: '#fdf0dc', cardFg: '#92590b',
+                 range: '4.4 – 5.7', share: '33.3%', est: '~550 B' },
+  'hard':      { peppers: '🌶️🌶️🌶️🌶️',    label: 'Hard',
+                 color: '#d06a22', cardBg: '#fbe8da', cardFg: '#9a4a16',
+                 range: '5.7 – 7.0', share: '22.6%', est: '~373 B' },
+  'very-hard': { peppers: '🌶️🌶️🌶️🌶️🌶️',  label: 'Very Hard',
+                 color: '#c0392b', cardBg: '#fbe6e6', cardFg: '#9b2c2c',
+                 range: '7.0 – 10.0', share: '10.3%', est: '~171 B' },
 };
+const DIFFICULTY_ORDER = ['very-easy', 'easy', 'medium', 'hard', 'very-hard'];
 
 function DifficultyBadge({ difficulty, showLabel = false, showScore = true,
                           onClick, className = '' }) {
@@ -1047,9 +1061,9 @@ function ArchivesContent({ archiveDates, archiveResults, todayResult, todayKey,
   const allTimes = Object.values(allResults).map((r) => r.time);
   const best = allTimes.length ? Math.min(...allTimes) : null;
 
-  // Compute difficulty for every shown puzzle (today + 30 days). Each
-  // generateDailyPuzzle is ~50ms worst case; memoized by date so this runs
-  // once when the archives view first mounts.
+  // Compute difficulty for every shown puzzle (today + ARCHIVE_DAYS days).
+  // Each generateDailyPuzzle is ~50ms worst case; memoized by date so this
+  // runs once when the archives view first mounts.
   const difficulties = useMemo(() => {
     const map = {};
     for (const date of [todayKey, ...archiveDates]) {
@@ -1122,7 +1136,7 @@ function ArchivesContent({ archiveDates, archiveResults, todayResult, todayKey,
       </button>
 
       <h2 className="text-[11px] uppercase tracking-wider text-stone-500 mb-2 px-1 font-semibold">
-        Past 30 days
+        Past {ARCHIVE_DAYS} days
       </h2>
       <div className="bg-white rounded-md shadow-sm divide-y divide-stone-100 overflow-hidden">
         {archiveDates.map((date) => {
@@ -1483,7 +1497,125 @@ function PlayerStatsContent({ player, todayKey, currentName, onBack }) {
 }
 
 // ===== Scoring explanation page =====
+// ===== Difficulty distribution data =====
+// Precomputed by Monte-Carlo sampling 30,000,000 random 12-card layouts
+// (see the "Method" section on the scoring page). Every figure here is an
+// estimate derived from that sample except PUZZLE_UNIVERSE, which is exact.
+const PUZZLE_UNIVERSE = 70724320184700;   // C(81,12) — every 12-card layout
+const DIST_SAMPLE_N   = 700895;           // sampled valid 6-set puzzles
+// [setCount, estimated number of layouts with exactly that many sets]
+const SETCOUNT_DIST = [
+  [0, 2284383754579], [1, 10264189941200], [2, 18462798314654],
+  [3, 19278662284918], [4, 12743881263447], [5, 5649119219617],
+  [6, 1652344079862], [7, 330159986441], [8, 48255203662],
+  [9, 8163944027], [10, 2138231947],
+];
+// Difficulty histogram of the 6-set pool, 0.5-wide bins:
+// [scoreLo, sampledCount, estimatedBillionsOfPuzzles]
+const HISTO_BINS = [
+  [0.0, 21, 0.05], [0.5, 144, 0.34], [1.0, 1289, 3.04], [1.5, 3544, 8.35],
+  [2.0, 10425, 24.58], [2.5, 23085, 54.42], [3.0, 36807, 86.77],
+  [3.5, 79102, 186.48], [4.0, 83027, 195.73], [4.5, 113776, 268.22],
+  [5.0, 88500, 208.64], [5.5, 84956, 200.28], [6.0, 69057, 162.80],
+  [6.5, 34828, 82.11], [7.0, 22183, 52.30], [7.5, 20200, 47.62],
+  [8.0, 26625, 62.77], [8.5, 3147, 7.42], [9.0, 156, 0.37], [9.5, 23, 0.05],
+];
+
+function scoreToColor(s) {
+  if (s < SCORE_CUT_VERY_EASY) return DIFFICULTY_TIERS['very-easy'].color;
+  if (s < SCORE_CUT_EASY)      return DIFFICULTY_TIERS['easy'].color;
+  if (s < SCORE_CUT_MEDIUM)    return DIFFICULTY_TIERS['medium'].color;
+  if (s < SCORE_CUT_HARD)      return DIFFICULTY_TIERS['hard'].color;
+  return DIFFICULTY_TIERS['very-hard'].color;
+}
+
+// Build the "sets per random layout" bar chart as a standalone SVG string.
+function buildSetCountSvg() {
+  const W = 700, H = 320, ML = 64, MR = 14, MT = 30, MB = 46;
+  const plotW = W - ML - MR, plotH = H - MT - MB;
+  const yMax = 20;  // trillions
+  const slot = plotW / SETCOUNT_DIST.length;
+  const y = (v) => MT + plotH - (v / yMax) * plotH;
+  const fp = (p) => (p >= 1 ? p.toFixed(1) : p >= 0.1 ? p.toFixed(2) : p.toFixed(3)) + '%';
+  let s = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" `
+        + `style="width:100%;height:auto;display:block" role="img" `
+        + `aria-label="Bar chart: how many sets a random 12-card layout contains. It peaks at 3 sets; layouts with exactly 6 sets — the Daily SET pool — are only about 2.3 percent.">`;
+  for (let g = 0; g <= yMax; g += 5) {
+    const gy = y(g);
+    s += `<line x1="${ML}" y1="${gy}" x2="${W-MR}" y2="${gy}" stroke="#e7e5e4"/>`;
+    s += `<text x="${ML-7}" y="${gy+4}" text-anchor="end" font-size="12" fill="#a8a29e" font-family="Menlo, monospace">${g}T</text>`;
+  }
+  SETCOUNT_DIST.forEach(([k, cnt], i) => {
+    const v = cnt / 1e12;
+    const bx = ML + i*slot + slot*0.16, bw = slot*0.68;
+    const by = y(v), bh = MT + plotH - by, isPool = k === 6;
+    const pct = 100 * cnt / PUZZLE_UNIVERSE;
+    s += `<rect x="${bx}" y="${by}" width="${bw}" height="${Math.max(bh,0)}" fill="${isPool?'#c0392b':'#a8a29e'}" rx="2"/>`;
+    s += `<text x="${bx+bw/2}" y="${MT+plotH+18}" text-anchor="middle" font-size="12" fill="${isPool?'#b91c1c':'#78716c'}" font-weight="${isPool?'700':'400'}" font-family="Menlo, monospace">${k}</text>`;
+    if (bh >= 20) {
+      s += `<text x="${bx+bw/2}" y="${by-5}" text-anchor="middle" font-size="11" fill="#78716c" font-family="Menlo, monospace">${v.toFixed(1)}T</text>`;
+      s += `<text x="${bx+bw/2}" y="${by+bh/2+4}" text-anchor="middle" font-size="11.5" font-weight="700" fill="${isPool?'#fff':'#1c1917'}" font-family="Menlo, monospace">${fp(pct)}</text>`;
+    } else {
+      s += `<text x="${bx+bw/2}" y="${by-5}" text-anchor="middle" font-size="10.5" fill="#78716c" font-family="Menlo, monospace">${fp(pct)}</text>`;
+    }
+  });
+  const sixX = ML + 6*slot + slot*0.5;
+  s += `<text x="${sixX}" y="${MT-13}" text-anchor="middle" font-size="11.5" fill="#b91c1c" font-weight="700">▲ Daily SET pool</text>`;
+  s += `<line x1="${ML}" y1="${MT+plotH}" x2="${W-MR}" y2="${MT+plotH}" stroke="#a8a29e" stroke-width="1.4"/>`;
+  s += `<text x="${ML+plotW/2}" y="${H-6}" text-anchor="middle" font-size="12.5" fill="#57534e" font-weight="600">Number of sets in the layout</text>`;
+  s += `<text x="14" y="${MT+plotH/2}" text-anchor="middle" font-size="12" fill="#57534e" font-weight="600" transform="rotate(-90 14 ${MT+plotH/2})">Est. number of layouts</text>`;
+  return s + '</svg>';
+}
+
+// Build the difficulty histogram (five colour-coded tiers) as an SVG string.
+function buildDiffHistogramSvg() {
+  const W = 700, H = 360, ML = 56, MR = 14, MT = 26, MB = 46;
+  const plotW = W - ML - MR, plotH = H - MT - MB;
+  const yMax = Math.max(...HISTO_BINS.map((b) => b[2]));
+  const x = (v) => ML + (v / 10) * plotW;
+  const y = (v) => MT + plotH - (v / yMax) * plotH;
+  const cuts = [SCORE_CUT_VERY_EASY, SCORE_CUT_EASY, SCORE_CUT_MEDIUM, SCORE_CUT_HARD];
+  let s = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" `
+        + `style="width:100%;height:auto;display:block" role="img" `
+        + `aria-label="Histogram of difficulty across the 1.65 trillion six-set puzzles, in five colour-coded tiers. It is bell-shaped with a mean near 5 and a peak in the 4.5 to 5.0 bin.">`;
+  for (let g = 0; g <= 250; g += 50) {
+    const gy = y(g);
+    s += `<line x1="${ML}" y1="${gy}" x2="${W-MR}" y2="${gy}" stroke="#e7e5e4"/>`;
+    s += `<text x="${ML-7}" y="${gy+4}" text-anchor="end" font-size="12" fill="#a8a29e" font-family="Menlo, monospace">${g}B</text>`;
+  }
+  for (const [lo, , est] of HISTO_BINS) {
+    const bx = x(lo), bw = x(lo+0.5) - x(lo) - 1.4, by = y(est), bh = MT + plotH - by;
+    s += `<rect x="${bx}" y="${by}" width="${bw}" height="${Math.max(bh,0)}" fill="${scoreToColor(lo+0.25)}" rx="1.5"/>`;
+  }
+  for (const t of cuts) {
+    const tx = x(t);
+    s += `<line x1="${tx}" y1="${MT}" x2="${tx}" y2="${MT+plotH}" stroke="#1c1917" stroke-width="1.4" stroke-dasharray="4 3"/>`;
+    s += `<text x="${tx}" y="${MT-6}" text-anchor="middle" font-size="11" fill="#1c1917" font-weight="700" font-family="Menlo, monospace">${t.toFixed(1)}</text>`;
+  }
+  for (const [lo, samp, est] of HISTO_BINS) {
+    const pct = 100 * samp / DIST_SAMPLE_N;
+    if (pct < 1) continue;
+    const bx = x(lo), bw = x(lo+0.5) - x(lo) - 1.4, by = y(est), bh = MT + plotH - by;
+    if (bh >= 18)
+      s += `<text x="${bx+bw/2}" y="${by+bh/2+4}" text-anchor="middle" font-size="11" font-weight="700" fill="#fff" font-family="Menlo, monospace">${Math.round(pct)}%</text>`;
+  }
+  s += `<line x1="${ML}" y1="${MT+plotH}" x2="${W-MR}" y2="${MT+plotH}" stroke="#a8a29e" stroke-width="1.4"/>`;
+  for (let t = 0; t <= 10; t++) {
+    const tx = x(t);
+    s += `<line x1="${tx}" y1="${MT+plotH}" x2="${tx}" y2="${MT+plotH+4}" stroke="#a8a29e"/>`;
+    s += `<text x="${tx}" y="${MT+plotH+17}" text-anchor="middle" font-size="11.5" fill="#a8a29e" font-family="Menlo, monospace">${t}</text>`;
+  }
+  s += `<text x="${ML+plotW/2}" y="${H-6}" text-anchor="middle" font-size="12.5" fill="#57534e" font-weight="600">Difficulty score (0–10)</text>`;
+  s += `<text x="13" y="${MT+plotH/2}" text-anchor="middle" font-size="12" fill="#57534e" font-weight="600" transform="rotate(-90 13 ${MT+plotH/2})">Est. number of puzzles</text>`;
+  return s + '</svg>';
+}
+
+const SETCOUNT_SVG = buildSetCountSvg();
+const DIFF_HISTOGRAM_SVG = buildDiffHistogramSvg();
+
+// ===== Scoring explanation page =====
 function ScoringContent({ onBack }) {
+  const subhead = "text-[11px] uppercase tracking-wider text-stone-500 mb-1.5 px-0.5 font-semibold";
   return (
     <main className="flex-1 p-3 max-w-2xl w-full mx-auto">
       <button onClick={onBack}
@@ -1492,7 +1624,7 @@ function ScoringContent({ onBack }) {
       </button>
       <h2 className="text-2xl font-bold text-stone-800 mb-2"
           style={{ fontFamily: '"Georgia", serif' }}>
-        How difficulty is scored
+        How difficulty works
       </h2>
       <p className="text-stone-600 text-sm mb-5 leading-relaxed">
         Every puzzle gets a score from <strong>structural properties of the
@@ -1501,6 +1633,7 @@ function ScoringContent({ onBack }) {
         🌶️🌶️🌶️ a year ago.
       </p>
 
+      {/* ---- the score formula ---- */}
       <div className="bg-white rounded-md border border-stone-300 p-3 mb-2
                       text-sm text-stone-800 tabular-nums text-center overflow-x-auto"
            style={{ fontFamily: '"Menlo", monospace' }}>
@@ -1509,8 +1642,8 @@ function ScoringContent({ onBack }) {
       <p className="text-xs text-stone-500 mb-5 text-center leading-relaxed">
         where <span className="font-mono">raw = avgVars + 0.5 × decoys − 0.4 × membershipStd</span>.{' '}
         The raw composite is normalized against the empirical min (1.028) and max
-        (4.820) observed across ~46,500 sampled valid 6-set puzzles, so the
-        easiest possible puzzle scores ~0 and the hardest ~10.
+        (4.820) seen across a large sample of valid 6-set puzzles, so the easiest
+        possible puzzle scores ~0 and the hardest ~10.
       </p>
 
       <section className="mb-4">
@@ -1561,45 +1694,197 @@ function ScoringContent({ onBack }) {
         </p>
       </section>
 
-      <h3 className="text-[11px] uppercase tracking-wider text-stone-500 mb-2 px-1 font-semibold">
-        Difficulty tiers
-      </h3>
-      <p className="text-xs text-stone-500 mb-2 leading-relaxed">
-        Five tiers shaped as a bell curve, calibrated against ~700,000 sampled
-        valid 6-set puzzles. The middle three cuts come straight from the score
-        distribution: most puzzles are Medium, and the Very Easy / Very Hard
-        extremes are each only about 1 day in 10.
-      </p>
-      <div className="bg-white rounded-md border border-stone-300 divide-y divide-stone-200 mb-4">
-        <div className="px-4 py-1.5 flex items-center gap-3 bg-stone-50
-                        text-[10px] uppercase tracking-wider text-stone-500 font-semibold">
-          <span className="flex-1">Tier</span>
-          <span className="w-20 text-right">Range</span>
-          <span className="w-16 text-right">Share</span>
-        </div>
-        {[
-          ['🌶️', 'Very Easy', '0.0 – 3.4', '~10%'],
-          ['🌶️🌶️', 'Easy', '3.4 – 4.4', '~24%'],
-          ['🌶️🌶️🌶️', 'Medium', '4.4 – 5.7', '~33%'],
-          ['🌶️🌶️🌶️🌶️', 'Hard', '5.7 – 7.0', '~23%'],
-          ['🌶️🌶️🌶️🌶️🌶️', 'Very Hard', '7.0 – 10.0', '~10%'],
-        ].map(([peppers, name, range, share]) => (
-          <div key={name} className="px-4 py-2.5 flex items-center gap-3">
-            <span className="text-sm flex-1">
-              <span style={{ whiteSpace: 'nowrap' }}>{peppers}</span>
-              <span className="ml-1.5">{name}</span>
-            </span>
-            <span className="text-stone-700 tabular-nums text-sm font-medium w-20 text-right"
-                  style={{ fontFamily: '"Menlo", monospace' }}>
-              {range}
-            </span>
-            <span className="text-stone-400 tabular-nums text-xs w-16 text-right"
-                  style={{ fontFamily: '"Menlo", monospace' }}>
-              {share}
-            </span>
-          </div>
-        ))}
+      {/* ---- the five tiers ---- */}
+      <div className="border-t border-stone-200 pt-5 mb-3">
+        <h3 className="text-lg font-bold text-stone-800 mb-1"
+            style={{ fontFamily: '"Georgia", serif' }}>
+          The five difficulty tiers
+        </h3>
+        <p className="text-sm text-stone-600 leading-relaxed">
+          The score is bucketed into five tiers shaped as a bell curve. The two
+          inner cuts (4.4 and 5.7) sit where the score distribution naturally
+          splits into thirds; the outer cuts carve off the rarest ~10% at each
+          end. Most puzzles are Medium — a Very Easy or Very Hard day comes
+          around roughly once every ten days.
+        </p>
       </div>
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-2">
+        {DIFFICULTY_ORDER.map((key) => {
+          const t = DIFFICULTY_TIERS[key];
+          return (
+            <div key={key} className="rounded-lg p-2.5 text-center"
+                 style={{ background: t.cardBg, color: t.cardFg }}>
+              <div className="text-base leading-none"
+                   style={{ whiteSpace: 'nowrap' }}>{t.peppers}</div>
+              <div className="text-xs font-bold mt-1">{t.label}</div>
+              <div className="text-[10px] mt-0.5 tabular-nums"
+                   style={{ fontFamily: '"Menlo", monospace' }}>{t.range}</div>
+              <div className="text-sm font-bold mt-1 tabular-nums">{t.est}</div>
+              <div className="text-[10px] opacity-75">{t.share} of pool</div>
+            </div>
+          );
+        })}
+      </div>
+      <p className="text-xs text-stone-400 italic mb-5 leading-relaxed">
+        "Est." is the estimated number of puzzles in that tier, out of the
+        ~1.65 trillion that exist. Because the two inner cuts are unchanged from
+        the old three-tier system, Medium is identical and the old Easy / Hard
+        each simply split in two.
+      </p>
+
+      {/* ---- the bigger picture ---- */}
+      <div className="border-t border-stone-200 pt-5 mb-3">
+        <h3 className="text-lg font-bold text-stone-800 mb-1"
+            style={{ fontFamily: '"Georgia", serif' }}>
+          How many SET puzzles are there?
+        </h3>
+        <p className="text-sm text-stone-600 leading-relaxed">
+          A "puzzle" is a layout of 12 cards containing exactly 6 sets. There
+          are vastly more 12-card layouts than there are puzzles — here's where
+          the pool comes from.
+        </p>
+      </div>
+
+      {/* funnel */}
+      <div className="rounded-lg bg-stone-100 border border-stone-300 p-3 text-center">
+        <div className="text-[10px] uppercase tracking-wider font-bold text-stone-500">
+          Every 12-card layout
+        </div>
+        <div className="text-2xl font-bold text-stone-700 tabular-nums mt-0.5"
+             style={{ fontFamily: '"Menlo", monospace' }}>
+          70.72<span className="text-sm font-normal text-stone-400"> trillion</span>
+        </div>
+        <div className="text-[11px] text-stone-500 mt-0.5">
+          C(81,&nbsp;12) = 70,724,320,184,700 — any 12 cards from the deck. Exact.
+        </div>
+      </div>
+      <div className="text-center py-1.5">
+        <div className="text-red-600 text-lg leading-none">▼</div>
+        <div className="inline-block bg-white border border-dashed border-red-400
+                        text-red-800 text-[11px] font-medium px-3 py-1 rounded-full mt-1">
+          keep only layouts with exactly 6 sets — 2.34% qualify
+        </div>
+      </div>
+      <div className="rounded-lg bg-red-50 border-2 border-red-200 p-3 text-center mx-auto"
+           style={{ maxWidth: '80%' }}>
+        <div className="text-[10px] uppercase tracking-wider font-bold text-red-800">
+          The Daily SET pool
+        </div>
+        <div className="text-2xl font-bold text-red-700 tabular-nums mt-0.5"
+             style={{ fontFamily: '"Menlo", monospace' }}>
+          ~1.65<span className="text-sm font-normal text-red-400"> trillion</span>
+        </div>
+        <div className="text-[11px] text-red-800 mt-0.5">
+          the 6-set layouts — what today's puzzle is drawn from
+        </div>
+      </div>
+      <p className="text-xs text-stone-500 leading-relaxed mt-3 mb-5">
+        Only 2.34% of random 12-card layouts contain exactly 6 sets — but the
+        deck is so large that this is still about 1.65 trillion distinct
+        puzzles. Difficulty is only defined for these.
+      </p>
+
+      {/* set-count chart */}
+      <h4 className={subhead}>Sets per random layout</h4>
+      <div className="bg-white rounded-md border border-stone-200 p-2 mb-1">
+        <div className="overflow-x-auto">
+          <div style={{ minWidth: '540px' }}
+               dangerouslySetInnerHTML={{ __html: SETCOUNT_SVG }} />
+        </div>
+      </div>
+      <p className="text-xs text-stone-500 mb-5 leading-relaxed">
+        Deal 12 random cards and count the sets. Most layouts have 2–4. The red
+        bar — exactly 6 sets — is the only one Daily SET keeps; every other bar
+        is discarded.
+      </p>
+
+      {/* difficulty histogram */}
+      <h4 className={subhead}>Difficulty across the puzzle pool</h4>
+      <div className="bg-white rounded-md border border-stone-200 p-2 mb-1">
+        <div className="overflow-x-auto">
+          <div style={{ minWidth: '540px' }}
+               dangerouslySetInnerHTML={{ __html: DIFF_HISTOGRAM_SVG }} />
+        </div>
+        <div className="flex flex-wrap justify-center gap-x-3 gap-y-1 mt-1.5 px-1">
+          {DIFFICULTY_ORDER.map((key) => {
+            const t = DIFFICULTY_TIERS[key];
+            return (
+              <span key={key}
+                    className="inline-flex items-center gap-1 text-[10px] text-stone-500">
+                <span style={{ width: '10px', height: '10px', borderRadius: '2px',
+                               background: t.color, display: 'inline-block' }} />
+                {t.label}
+              </span>
+            );
+          })}
+          <span className="inline-flex items-center gap-1 text-[10px] text-stone-500">
+            <span style={{ width: '14px', height: '0', borderTop: '2px dashed #1c1917',
+                           display: 'inline-block' }} />
+            tier cuts
+          </span>
+        </div>
+      </div>
+      <p className="text-xs text-stone-500 mb-5 leading-relaxed">
+        Every one of the ~1.65 trillion puzzles, scored and binned. The dashed
+        lines are the tier cuts; the figure inside each bar is that bin's share
+        of the pool. The distribution is bell-shaped — mean 5.1 — so the
+        extreme tiers really are rare.
+      </p>
+
+      {/* raw bin table */}
+      <h4 className={subhead}>Raw bin data</h4>
+      <div className="bg-white rounded-md border border-stone-200 overflow-hidden mb-1">
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead className="bg-stone-100">
+              <tr>
+                <th className="px-3 py-2 text-left font-semibold text-stone-600">Score bin</th>
+                <th className="px-3 py-2 text-right font-semibold text-stone-600">Sampled</th>
+                <th className="px-3 py-2 text-right font-semibold text-stone-600">Est. in pool</th>
+                <th className="px-3 py-2 text-right font-semibold text-stone-600">Share</th>
+              </tr>
+            </thead>
+            <tbody>
+              {HISTO_BINS.map(([lo, samp, est], i) => (
+                <tr key={lo} className={i % 2 === 0 ? 'bg-white' : 'bg-stone-50'}>
+                  <td className="px-3 py-1.5 text-stone-700 whitespace-nowrap">
+                    {lo.toFixed(1)} – {(lo + 0.5).toFixed(1)}
+                  </td>
+                  <td className="px-3 py-1.5 text-right tabular-nums text-stone-700"
+                      style={{ fontFamily: '"Menlo", monospace' }}>
+                    {samp.toLocaleString()}
+                  </td>
+                  <td className="px-3 py-1.5 text-right tabular-nums text-stone-700"
+                      style={{ fontFamily: '"Menlo", monospace' }}>
+                    {est.toFixed(2)} B
+                  </td>
+                  <td className="px-3 py-1.5 text-right tabular-nums text-stone-700"
+                      style={{ fontFamily: '"Menlo", monospace' }}>
+                    {(100 * samp / DIST_SAMPLE_N).toFixed(2)}%
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <p className="text-xs text-stone-500 mb-5 leading-relaxed">
+        Score percentiles across the pool — p10&nbsp;3.4 · p25&nbsp;4.2 ·
+        p50&nbsp;5.0 · p75&nbsp;6.0 · p90&nbsp;7.0. Mean 5.1, standard
+        deviation 1.4.
+      </p>
+
+      {/* method */}
+      <h4 className={subhead}>Method</h4>
+      <p className="text-xs text-stone-500 leading-relaxed mb-5">
+        The 70.72-trillion figure is exact — it is C(81,&nbsp;12). Everything
+        else is estimated by sampling 30,000,000 random 12-card layouts and
+        counting the sets in each. 2.34% had exactly 6 sets, which scaled up by
+        C(81,&nbsp;12) gives ~1.65 trillion puzzles (95% confidence ±0.2%).
+        Difficulty was then computed for all 700,895 sampled 6-set puzzles with
+        the formula above. A "layout" / "puzzle" is an unordered set of 12
+        cards; layouts related by SET's symmetries are not deduplicated.
+      </p>
 
       <p className="text-xs text-stone-500 italic leading-relaxed">
         The coefficients (0.5, 0.4) and tier cuts are first-pass estimates.
