@@ -52,13 +52,24 @@ function findAllSets(cards) {
 // We then linearly normalize to a 0-10 scale using the empirical min/max
 // observed across 2M sampled valid 6-set puzzles — so the easiest possible
 // puzzle scores ~0 and the hardest scores ~10.
-// Thresholds (4.4 / 5.7) are set at the empirical tertiles, so Easy /
-// Medium / Hard each contain ~1/3 of all possible valid puzzles. Will be
-// recalibrated against real solve-time data once that exists.
+// Five difficulty tiers, shaped as a bell curve (~10/24/33/23/10). The two
+// inner cuts (4.4 / 5.7) are the old Easy/Medium/Hard tertile boundaries, so
+// this is a strict refinement: Medium is unchanged, and the old Easy / Hard
+// each split into a normal tier plus a rare ~10% extreme tier. Verified
+// against ~700k sampled valid 6-set puzzles. Will be recalibrated against
+// real solve-time data once that exists.
 const RAW_SCORE_MIN = 1.028;  // empirical min raw composite (n=46,553)
 const RAW_SCORE_MAX = 4.820;  // empirical max raw composite
-const SCORE_TERTILE_LOW = 4.4;   // empirical p33 mapped onto 0-10
-const SCORE_TERTILE_HIGH = 5.7;  // empirical p67 mapped onto 0-10
+// Tier cut points on the 0-10 scale (ascending). Shares of the puzzle pool:
+//   very-easy  < 3.4         ~9.6%
+//   easy       3.4 - 4.4    ~24.3%
+//   medium     4.4 - 5.7    ~33.3%
+//   hard       5.7 - 7.0    ~22.6%
+//   very-hard  >= 7.0       ~10.3%
+const SCORE_CUT_VERY_EASY = 3.4;
+const SCORE_CUT_EASY      = 4.4;
+const SCORE_CUT_MEDIUM    = 5.7;
+const SCORE_CUT_HARD      = 7.0;
 
 function computePuzzleDifficulty(puzzle) {
   if (!puzzle || !puzzle.sets || !puzzle.cards) return null;
@@ -90,9 +101,11 @@ function computePuzzleDifficulty(puzzle) {
   const rawScore = avgVars + 0.5 * decoys - 0.4 * membershipStd;
   const normalized = ((rawScore - RAW_SCORE_MIN) / (RAW_SCORE_MAX - RAW_SCORE_MIN)) * 10;
   const score = Math.max(0, Math.min(10, normalized));
-  const level = score < SCORE_TERTILE_LOW ? 'easy'
-              : score < SCORE_TERTILE_HIGH ? 'medium'
-              : 'hard';
+  const level = score < SCORE_CUT_VERY_EASY ? 'very-easy'
+              : score < SCORE_CUT_EASY      ? 'easy'
+              : score < SCORE_CUT_MEDIUM    ? 'medium'
+              : score < SCORE_CUT_HARD      ? 'hard'
+              :                               'very-hard';
 
   return { avgVars, decoys, membershipStd, rawScore, score, level };
 }
@@ -777,19 +790,24 @@ function StatCard({ label, value, sub, accent }) {
 // Shows pepper icons, optional label ("Medium"), and the score (out of 10).
 // When onClick is provided, renders as a button with a small info icon so it
 // reads as an interactive element that explains itself when tapped.
+// Five tiers: very-easy / easy / medium / hard / very-hard -> 1-5 peppers.
+const DIFFICULTY_TIERS = {
+  'very-easy': { peppers: '🌶️',          label: 'Very Easy' },
+  'easy':      { peppers: '🌶️🌶️',        label: 'Easy' },
+  'medium':    { peppers: '🌶️🌶️🌶️',      label: 'Medium' },
+  'hard':      { peppers: '🌶️🌶️🌶️🌶️',    label: 'Hard' },
+  'very-hard': { peppers: '🌶️🌶️🌶️🌶️🌶️',  label: 'Very Hard' },
+};
+
 function DifficultyBadge({ difficulty, showLabel = false, showScore = true,
                           onClick, className = '' }) {
   if (!difficulty) return null;
   const { level, score } = difficulty;
-  const peppers = level === 'easy' ? '🌶️'
-                : level === 'medium' ? '🌶️🌶️'
-                : '🌶️🌶️🌶️';
-  const label = level === 'easy' ? 'Easy'
-              : level === 'medium' ? 'Medium'
-              : 'Hard';
+  const tier = DIFFICULTY_TIERS[level] || DIFFICULTY_TIERS['medium'];
+  const { peppers, label } = tier;
   const inner = (
     <span className={`inline-flex items-baseline gap-1 ${className}`}>
-      <span aria-label={label}>{peppers}</span>
+      <span aria-label={label} style={{ whiteSpace: 'nowrap' }}>{peppers}</span>
       {showLabel && <span className="text-stone-600 font-medium">{label}</span>}
       {showScore && (
         <span className="text-stone-500 tabular-nums"
@@ -859,7 +877,10 @@ function GameContent({ puzzle, targetSets, time, foundSets, selected, flash,
           </div>
         )}
         <div className="text-xs text-stone-500 mt-1 flex items-center justify-center gap-2 flex-wrap">
-          {difficulty && (
+          {/* Today's difficulty stays hidden until the puzzle is finished so
+              it can't bias play. Archived puzzles still show it (already
+              solvable at the player's leisure). */}
+          {difficulty && !isPlayingToday && (
             <>
               <DifficultyBadge difficulty={difficulty} showLabel
                                onClick={onOpenScoring} />
@@ -1541,56 +1562,47 @@ function ScoringContent({ onBack }) {
       </section>
 
       <h3 className="text-[11px] uppercase tracking-wider text-stone-500 mb-2 px-1 font-semibold">
-        Thresholds
+        Difficulty tiers
       </h3>
       <p className="text-xs text-stone-500 mb-2 leading-relaxed">
-        Set at the empirical tertiles across ~46,500 sampled valid 6-set
-        puzzles, so each level contains roughly a third of all possible puzzles.
+        Five tiers shaped as a bell curve, calibrated against ~700,000 sampled
+        valid 6-set puzzles. The middle three cuts come straight from the score
+        distribution: most puzzles are Medium, and the Very Easy / Very Hard
+        extremes are each only about 1 day in 10.
       </p>
       <div className="bg-white rounded-md border border-stone-300 divide-y divide-stone-200 mb-4">
         <div className="px-4 py-1.5 flex items-center gap-3 bg-stone-50
                         text-[10px] uppercase tracking-wider text-stone-500 font-semibold">
-          <span className="flex-1">Level</span>
+          <span className="flex-1">Tier</span>
           <span className="w-20 text-right">Range</span>
-          <span className="w-28 text-right">Threshold</span>
+          <span className="w-16 text-right">Share</span>
         </div>
-        <div className="px-4 py-2.5 flex items-center gap-3">
-          <span className="text-sm flex-1">🌶️ <span className="ml-1">Easy</span></span>
-          <span className="text-stone-700 tabular-nums text-sm font-medium w-20 text-right"
-                style={{ fontFamily: '"Menlo", monospace' }}>
-            0.0 – 4.4
-          </span>
-          <span className="text-stone-400 tabular-nums text-xs w-28 text-right"
-                style={{ fontFamily: '"Menlo", monospace' }}>
-            score &lt; 4.4
-          </span>
-        </div>
-        <div className="px-4 py-2.5 flex items-center gap-3">
-          <span className="text-sm flex-1">🌶️🌶️ <span className="ml-1">Medium</span></span>
-          <span className="text-stone-700 tabular-nums text-sm font-medium w-20 text-right"
-                style={{ fontFamily: '"Menlo", monospace' }}>
-            4.4 – 5.7
-          </span>
-          <span className="text-stone-400 tabular-nums text-xs w-28 text-right"
-                style={{ fontFamily: '"Menlo", monospace' }}>
-            4.4 ≤ score &lt; 5.7
-          </span>
-        </div>
-        <div className="px-4 py-2.5 flex items-center gap-3">
-          <span className="text-sm flex-1">🌶️🌶️🌶️ <span className="ml-1">Hard</span></span>
-          <span className="text-stone-700 tabular-nums text-sm font-medium w-20 text-right"
-                style={{ fontFamily: '"Menlo", monospace' }}>
-            5.7 – 10.0
-          </span>
-          <span className="text-stone-400 tabular-nums text-xs w-28 text-right"
-                style={{ fontFamily: '"Menlo", monospace' }}>
-            score ≥ 5.7
-          </span>
-        </div>
+        {[
+          ['🌶️', 'Very Easy', '0.0 – 3.4', '~10%'],
+          ['🌶️🌶️', 'Easy', '3.4 – 4.4', '~24%'],
+          ['🌶️🌶️🌶️', 'Medium', '4.4 – 5.7', '~33%'],
+          ['🌶️🌶️🌶️🌶️', 'Hard', '5.7 – 7.0', '~23%'],
+          ['🌶️🌶️🌶️🌶️🌶️', 'Very Hard', '7.0 – 10.0', '~10%'],
+        ].map(([peppers, name, range, share]) => (
+          <div key={name} className="px-4 py-2.5 flex items-center gap-3">
+            <span className="text-sm flex-1">
+              <span style={{ whiteSpace: 'nowrap' }}>{peppers}</span>
+              <span className="ml-1.5">{name}</span>
+            </span>
+            <span className="text-stone-700 tabular-nums text-sm font-medium w-20 text-right"
+                  style={{ fontFamily: '"Menlo", monospace' }}>
+              {range}
+            </span>
+            <span className="text-stone-400 tabular-nums text-xs w-16 text-right"
+                  style={{ fontFamily: '"Menlo", monospace' }}>
+              {share}
+            </span>
+          </div>
+        ))}
       </div>
 
       <p className="text-xs text-stone-500 italic leading-relaxed">
-        The coefficients (0.5, 0.4) and thresholds are first-pass estimates.
+        The coefficients (0.5, 0.4) and tier cuts are first-pass estimates.
         As solve-time data accumulates, they'll be recalibrated against what
         actually predicts how hard humans find each puzzle.
       </p>
