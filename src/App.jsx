@@ -7,7 +7,6 @@ const SHAPES = ['oval', 'diamond', 'squiggle'];
 const SHADINGS = ['solid', 'striped', 'open'];
 const NUMBERS = [1, 2, 3];
 const PUZZLE_VERSION = '1';
-const ARCHIVE_DAYS = 60;
 
 // ===== Deck / set logic =====
 function generateDeck() {
@@ -52,24 +51,13 @@ function findAllSets(cards) {
 // We then linearly normalize to a 0-10 scale using the empirical min/max
 // observed across 2M sampled valid 6-set puzzles — so the easiest possible
 // puzzle scores ~0 and the hardest scores ~10.
-// Five difficulty tiers, shaped as a bell curve (~10/24/33/23/10). The two
-// inner cuts (4.4 / 5.7) are the old Easy/Medium/Hard tertile boundaries, so
-// this is a strict refinement: Medium is unchanged, and the old Easy / Hard
-// each split into a normal tier plus a rare ~10% extreme tier. Verified
-// against ~700k sampled valid 6-set puzzles. Will be recalibrated against
-// real solve-time data once that exists.
+// Thresholds (4.4 / 5.7) are set at the empirical tertiles, so Easy /
+// Medium / Hard each contain ~1/3 of all possible valid puzzles. Will be
+// recalibrated against real solve-time data once that exists.
 const RAW_SCORE_MIN = 1.028;  // empirical min raw composite (n=46,553)
 const RAW_SCORE_MAX = 4.820;  // empirical max raw composite
-// Tier cut points on the 0-10 scale (ascending). Shares of the puzzle pool:
-//   very-easy  < 3.4         ~9.6%
-//   easy       3.4 - 4.4    ~24.3%
-//   medium     4.4 - 5.7    ~33.3%
-//   hard       5.7 - 7.0    ~22.6%
-//   very-hard  >= 7.0       ~10.3%
-const SCORE_CUT_VERY_EASY = 3.4;
-const SCORE_CUT_EASY      = 4.4;
-const SCORE_CUT_MEDIUM    = 5.7;
-const SCORE_CUT_HARD      = 7.0;
+const SCORE_TERTILE_LOW = 4.4;   // empirical p33 mapped onto 0-10
+const SCORE_TERTILE_HIGH = 5.7;  // empirical p67 mapped onto 0-10
 
 function computePuzzleDifficulty(puzzle) {
   if (!puzzle || !puzzle.sets || !puzzle.cards) return null;
@@ -101,11 +89,9 @@ function computePuzzleDifficulty(puzzle) {
   const rawScore = avgVars + 0.5 * decoys - 0.4 * membershipStd;
   const normalized = ((rawScore - RAW_SCORE_MIN) / (RAW_SCORE_MAX - RAW_SCORE_MIN)) * 10;
   const score = Math.max(0, Math.min(10, normalized));
-  const level = score < SCORE_CUT_VERY_EASY ? 'very-easy'
-              : score < SCORE_CUT_EASY      ? 'easy'
-              : score < SCORE_CUT_MEDIUM    ? 'medium'
-              : score < SCORE_CUT_HARD      ? 'hard'
-              :                               'very-hard';
+  const level = score < SCORE_TERTILE_LOW ? 'easy'
+              : score < SCORE_TERTILE_HIGH ? 'medium'
+              : 'hard';
 
   return { avgVars, decoys, membershipStd, rawScore, score, level };
 }
@@ -212,15 +198,6 @@ function shortWeekday(dateKey, upper = false) {
     weekday: 'short', timeZone: 'UTC',
   });
   return upper ? s.toUpperCase() : s;
-}
-
-function generateArchiveDates(todayKey, count = ARCHIVE_DAYS) {
-  const baseTime = dateKeyToUTC(todayKey);
-  const dates = [];
-  for (let i = 1; i <= count; i++) {
-    dates.push(utcDateKey(new Date(baseTime - i * 86400000)));
-  }
-  return dates;
 }
 
 // ===== Storage backend =====
@@ -790,38 +767,19 @@ function StatCard({ label, value, sub, accent }) {
 // Shows pepper icons, optional label ("Medium"), and the score (out of 10).
 // When onClick is provided, renders as a button with a small info icon so it
 // reads as an interactive element that explains itself when tapped.
-// Five tiers: very-easy / easy / medium / hard / very-hard -> 1-5 peppers.
-// Each tier also carries its chart bar color, explanation-card colors, score
-// range, and estimated share / count of the ~1.65 trillion puzzle pool, so
-// the badge, the scoring page and the distribution charts all stay in sync.
-const DIFFICULTY_TIERS = {
-  'very-easy': { peppers: '🌶️',          label: 'Very Easy',
-                 color: '#3f9650', cardBg: '#e7f3ea', cardFg: '#256634',
-                 range: '0.0 – 3.4', share: '9.6%',  est: '~158 B' },
-  'easy':      { peppers: '🌶️🌶️',        label: 'Easy',
-                 color: '#7a9e3a', cardBg: '#eef2e1', cardFg: '#566b1f',
-                 range: '3.4 – 4.4', share: '24.3%', est: '~401 B' },
-  'medium':    { peppers: '🌶️🌶️🌶️',      label: 'Medium',
-                 color: '#d99413', cardBg: '#fdf0dc', cardFg: '#92590b',
-                 range: '4.4 – 5.7', share: '33.3%', est: '~550 B' },
-  'hard':      { peppers: '🌶️🌶️🌶️🌶️',    label: 'Hard',
-                 color: '#d06a22', cardBg: '#fbe8da', cardFg: '#9a4a16',
-                 range: '5.7 – 7.0', share: '22.6%', est: '~373 B' },
-  'very-hard': { peppers: '🌶️🌶️🌶️🌶️🌶️',  label: 'Very Hard',
-                 color: '#c0392b', cardBg: '#fbe6e6', cardFg: '#9b2c2c',
-                 range: '7.0 – 10.0', share: '10.3%', est: '~171 B' },
-};
-const DIFFICULTY_ORDER = ['very-easy', 'easy', 'medium', 'hard', 'very-hard'];
-
 function DifficultyBadge({ difficulty, showLabel = false, showScore = true,
                           onClick, className = '' }) {
   if (!difficulty) return null;
   const { level, score } = difficulty;
-  const tier = DIFFICULTY_TIERS[level] || DIFFICULTY_TIERS['medium'];
-  const { peppers, label } = tier;
+  const peppers = level === 'easy' ? '🌶️'
+                : level === 'medium' ? '🌶️🌶️'
+                : '🌶️🌶️🌶️';
+  const label = level === 'easy' ? 'Easy'
+              : level === 'medium' ? 'Medium'
+              : 'Hard';
   const inner = (
     <span className={`inline-flex items-baseline gap-1 ${className}`}>
-      <span aria-label={label} style={{ whiteSpace: 'nowrap' }}>{peppers}</span>
+      <span aria-label={label}>{peppers}</span>
       {showLabel && <span className="text-stone-600 font-medium">{label}</span>}
       {showScore && (
         <span className="text-stone-500 tabular-nums"
@@ -891,10 +849,7 @@ function GameContent({ puzzle, targetSets, time, foundSets, selected, flash,
           </div>
         )}
         <div className="text-xs text-stone-500 mt-1 flex items-center justify-center gap-2 flex-wrap">
-          {/* Today's difficulty stays hidden until the puzzle is finished so
-              it can't bias play. Archived puzzles still show it (already
-              solvable at the player's leisure). */}
-          {difficulty && !isPlayingToday && (
+          {difficulty && (
             <>
               <DifficultyBadge difficulty={difficulty} showLabel
                                onClick={onOpenScoring} />
@@ -1052,48 +1007,134 @@ function CompletedContent({ result, leaderboard, name, isPlayingToday, dateKey,
 }
 
 // ===== Archives content =====
-function ArchivesContent({ archiveDates, archiveResults, todayResult, todayKey,
-                           onPlayToday, onPlayArchive, onOpenScoring }) {
-  const allResults = { ...archiveResults };
-  if (todayResult) allResults[todayKey] = todayResult;
-  const playedCount = Object.keys(allResults).length;
-  const totalCount = archiveDates.length + 1;
-  const allTimes = Object.values(allResults).map((r) => r.time);
-  const best = allTimes.length ? Math.min(...allTimes) : null;
+// NYT-style monthly calendar. Each cell shows just the day number; the cell
+// background carries completion state (solid red = solved, white card =
+// unplayed past, dashed faded = future, red ring = today). Solved cells get a
+// small medal in the corner when the player ranked 1st/2nd/3rd among 2+
+// players that day. Tapping a cell expands a detail strip below with the
+// puzzle's difficulty, the player's time (if solved), rank info, and a
+// play/play-again button. Month nav arrows let users browse any prior month.
+function ArchivesContent({ myResults, todayKey, currentName,
+                           onPlayDate, onOpenScoring }) {
+  const todayMonth = todayKey.substring(0, 7);  // "2026-05"
+  const [viewMonth, setViewMonth] = useState(todayMonth);
+  const [selectedDate, setSelectedDate] = useState(todayKey);
 
-  // Compute difficulty for every shown puzzle (today + ARCHIVE_DAYS days).
-  // Each generateDailyPuzzle is ~50ms worst case; memoized by date so this
-  // runs once when the archives view first mounts.
-  const difficulties = useMemo(() => {
-    const map = {};
-    for (const date of [todayKey, ...archiveDates]) {
-      map[date] = computePuzzleDifficulty(generateDailyPuzzle(date));
+  // Cross-player history is needed to compute medals (rank among everyone who
+  // solved that day). This is the same query the stats page uses, so it's
+  // already cached on the backend side for short windows.
+  const [allHistory, setAllHistory] = useState({});
+  useEffect(() => { Storage.loadAllHistory().then(setAllHistory); }, []);
+
+  // === Lifetime stats (overall, not per visible month — the calendar lets
+  // you browse around but your numbers stay yours) ===
+  const lifetime = useMemo(() => {
+    const dates = Object.keys(myResults);
+    const played = dates.length;
+    const times = dates.map((d) => myResults[d].time).filter((t) => t != null);
+    const best = times.length ? Math.min(...times) : null;
+    const playedSet = new Set(dates);
+    let streak = 0;
+    let cursor = todayKey;
+    if (!playedSet.has(cursor)) {
+      cursor = utcDateKey(new Date(dateKeyToUTC(cursor) - 86400000));
     }
-    return map;
-  }, [todayKey, archiveDates]);
+    while (playedSet.has(cursor)) {
+      streak++;
+      cursor = utcDateKey(new Date(dateKeyToUTC(cursor) - 86400000));
+    }
+    return { played, best, streak };
+  }, [myResults, todayKey]);
 
-  let streak = 0;
-  if (todayResult) streak = 1;
-  for (const date of archiveDates) {
-    if (archiveResults[date]) streak++;
-    else break;
-  }
+  // === Month grid generation ===
+  const monthCells = useMemo(() => {
+    const [y, m] = viewMonth.split('-').map(Number);
+    const firstDayOfWeek = new Date(Date.UTC(y, m - 1, 1)).getUTCDay();
+    const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+    const cells = [];
+    for (let i = 0; i < firstDayOfWeek; i++) cells.push(null);
+    for (let d = 1; d <= lastDay; d++) {
+      const dateKey = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      cells.push({ day: d, dateKey });
+    }
+    return cells;
+  }, [viewMonth]);
+
+  const monthLabel = useMemo(() => {
+    const [y, m] = viewMonth.split('-').map(Number);
+    return new Date(Date.UTC(y, m - 1, 1)).toLocaleDateString(undefined, {
+      year: 'numeric', month: 'long', timeZone: 'UTC',
+    });
+  }, [viewMonth]);
+
+  // Forward nav stops at today's month — no future months to browse.
+  const canGoForward = viewMonth < todayMonth;
+
+  const changeMonth = (delta) => {
+    const [y, m] = viewMonth.split('-').map(Number);
+    const next = new Date(Date.UTC(y, m - 1 + delta, 1));
+    const newMonth = utcDateKey(next).substring(0, 7);
+    setViewMonth(newMonth);
+    // Auto-select a useful day in the new month so the detail strip stays
+    // populated: today for the current month, otherwise the last day of that
+    // month (so any solved-day medals are visible right away).
+    if (newMonth === todayMonth) {
+      setSelectedDate(todayKey);
+    } else {
+      const [ny, nm] = newMonth.split('-').map(Number);
+      const last = new Date(Date.UTC(ny, nm, 0)).getUTCDate();
+      setSelectedDate(`${ny}-${String(nm).padStart(2, '0')}-${String(last).padStart(2, '0')}`);
+    }
+  };
+
+  // === Medal computation per date (for the current player) ===
+  // Only awarded when 2+ players solved that day — no rank in a solo round.
+  const medalFor = (dateKey) => {
+    const dateResults = allHistory[dateKey];
+    if (!dateResults || !dateResults[currentName]) return null;
+    const entries = Object.entries(dateResults);
+    if (entries.length < 2) return null;
+    const sorted = entries.sort((a, b) => a[1].time - b[1].time);
+    const rank = sorted.findIndex(([n]) => n === currentName);
+    return rank === 0 ? 'gold' : rank === 1 ? 'silver' : rank === 2 ? 'bronze' : null;
+  };
+  const playerCount = (dateKey) =>
+    Object.keys(allHistory[dateKey] || {}).length;
+
+  // === Selected day info for the detail strip ===
+  // Difficulty is computed only for the selected date (one generateDailyPuzzle
+  // per selection, ~50ms worst case) rather than for every visible cell.
+  const selectedInfo = useMemo(() => {
+    if (!selectedDate) return null;
+    const result = myResults[selectedDate];
+    const isToday = selectedDate === todayKey;
+    const isFuture = selectedDate > todayKey;
+    const medal = result ? medalFor(selectedDate) : null;
+    const count = playerCount(selectedDate);
+    const difficulty = computePuzzleDifficulty(generateDailyPuzzle(selectedDate));
+    return { result, isToday, isFuture, medal, count, difficulty };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedDate, myResults, allHistory, todayKey]);
+
+  const MEDAL = { gold: '🥇', silver: '🥈', bronze: '🥉' };
+  const RANK_WORD = { gold: '1st', silver: '2nd', bronze: '3rd' };
 
   return (
-    <main className="flex-1 p-3 max-w-2xl w-full mx-auto">
+    <main className="flex-1 p-3 max-w-md w-full mx-auto">
+      {/* Lifetime stats */}
       <div className="bg-white rounded-md shadow-sm mb-4 p-4">
         <div className="grid grid-cols-3 gap-2 divide-x divide-stone-200">
           <div className="text-center">
             <div className="text-[10px] text-stone-500 uppercase tracking-wider font-semibold">Played</div>
             <div className="text-xl font-semibold text-stone-800 mt-0.5 tabular-nums">
-              {playedCount}<span className="text-stone-400 text-sm font-normal">/{totalCount}</span>
+              {lifetime.played}
             </div>
           </div>
           <div className="text-center">
             <div className="text-[10px] text-stone-500 uppercase tracking-wider font-semibold">Streak</div>
             <div className="text-xl font-semibold text-red-700 mt-0.5 tabular-nums">
-              {streak}<span className="text-sm text-stone-500 font-normal ml-1">
-                {streak === 1 ? 'day' : 'days'}
+              {lifetime.streak}<span className="text-sm text-stone-500 font-normal ml-1">
+                {lifetime.streak === 1 ? 'day' : 'days'}
               </span>
             </div>
           </div>
@@ -1101,101 +1142,264 @@ function ArchivesContent({ archiveDates, archiveResults, todayResult, todayKey,
             <div className="text-[10px] text-stone-500 uppercase tracking-wider font-semibold">Best</div>
             <div className="text-xl font-semibold text-stone-800 mt-0.5 tabular-nums"
                  style={{ fontFamily: '"Menlo", monospace' }}>
-              {best != null ? formatMmSs(best) : '—'}
+              {lifetime.best != null ? formatMmSs(lifetime.best) : '—'}
             </div>
           </div>
         </div>
       </div>
 
-      <h2 className="text-[11px] uppercase tracking-wider text-stone-500 mb-2 px-1 font-semibold">Today</h2>
-      <button onClick={onPlayToday}
-        className="w-full mb-4 flex items-center justify-between px-4 py-3 bg-white
-                   border-2 border-red-200 rounded-md hover:border-red-400
-                   hover:bg-red-50/30 transition-all text-left shadow-sm">
-        <div className="flex items-center gap-3">
-          <span className={`text-xl ${todayResult ? 'text-green-600' : 'text-red-700'}`}>
-            {todayResult ? '✓' : '★'}
-          </span>
-          <div>
-            <div className="font-semibold text-stone-800">
-              {shortWeekday(todayKey)}, {formatShortDate(todayKey)}
-            </div>
-            <div className="text-xs text-stone-500">Today's puzzle</div>
-          </div>
-        </div>
-        <div className="text-sm">
-          {todayResult ? (
-            <span className="font-mono text-red-700 font-semibold tabular-nums"
-                  style={{ fontFamily: '"Menlo", monospace' }}>
-              {formatMmSs(todayResult.time)}
-            </span>
-          ) : (
-            <span className="text-red-700 font-medium">Play →</span>
-          )}
-        </div>
-      </button>
+      {/* Month navigation */}
+      <div className="flex items-center justify-between mb-3 px-1">
+        <button onClick={() => changeMonth(-1)}
+          aria-label="Previous month"
+          className="w-9 h-9 flex items-center justify-center rounded-md
+                     border border-stone-300 text-stone-600 hover:bg-stone-100
+                     transition-colors text-lg leading-none">
+          ‹
+        </button>
+        <span className="text-base font-semibold text-stone-800"
+              style={{ fontFamily: '"Georgia", serif' }}>
+          {monthLabel}
+        </span>
+        <button onClick={() => changeMonth(1)}
+          disabled={!canGoForward}
+          aria-label="Next month"
+          className="w-9 h-9 flex items-center justify-center rounded-md
+                     border border-stone-300 text-stone-600 hover:bg-stone-100
+                     disabled:opacity-30 disabled:cursor-not-allowed
+                     transition-colors text-lg leading-none">
+          ›
+        </button>
+      </div>
 
-      <h2 className="text-[11px] uppercase tracking-wider text-stone-500 mb-2 px-1 font-semibold">
-        Past {ARCHIVE_DAYS} days
-      </h2>
-      <div className="bg-white rounded-md shadow-sm divide-y divide-stone-100 overflow-hidden">
-        {archiveDates.map((date) => {
-          const result = archiveResults[date];
-          // Using div + role=button so the difficulty badge inside can be its
-          // own clickable element (nested <button> in <button> is invalid HTML).
+      {/* Weekday headers */}
+      <div className="grid grid-cols-7 gap-1.5 mb-1.5 px-1">
+        {['S','M','T','W','T','F','S'].map((d, i) => (
+          <div key={i}
+               className="text-center text-[10px] text-stone-400 uppercase font-semibold tracking-wider">
+            {d}
+          </div>
+        ))}
+      </div>
+
+      {/* Calendar grid */}
+      <div className="grid grid-cols-7 gap-1.5 px-1">
+        {monthCells.map((cell, idx) => {
+          if (!cell) return <div key={`empty-${idx}`} className="aspect-square" />;
+          const { day, dateKey } = cell;
+          const result = myResults[dateKey];
+          const isToday = dateKey === todayKey;
+          const isFuture = dateKey > todayKey;
+          const isSelected = dateKey === selectedDate;
+          const solved = !!result;
+          const medal = solved ? medalFor(dateKey) : null;
+
+          const stateClass = solved
+            ? 'bg-red-700 text-white border-0'
+            : isFuture
+              ? 'bg-transparent text-stone-400 border border-dashed border-stone-300 opacity-55'
+              : 'bg-white text-stone-900 border border-stone-200';
+
+          // Today's red ring and the selection dark ring stack via box-shadow
+          // because Tailwind's ring utilities don't easily compose two rings.
+          const shadows = [];
+          if (isToday) shadows.push('0 0 0 2px #B91C1C');
+          if (isSelected) shadows.push(isToday ? '0 0 0 4px #292524' : '0 0 0 2px #292524');
+          const inlineStyle = {
+            boxShadow: shadows.length ? shadows.join(', ') : undefined,
+            transform: isSelected ? 'scale(1.08)' : undefined,
+            zIndex: isSelected ? 1 : undefined,
+            touchAction: 'manipulation',
+          };
+
+          const label = `${dateKey}`
+            + (solved ? ' solved' : isToday ? ' today' : isFuture ? ' future' : '')
+            + (medal ? ` ${RANK_WORD[medal]} of ${playerCount(dateKey)} players` : '');
+
           return (
-            <div key={date} role="button" tabIndex={0}
-              onClick={() => onPlayArchive(date)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault();
-                  onPlayArchive(date);
-                }
-              }}
-              className="w-full flex items-center justify-between px-4 py-3
-                         hover:bg-stone-50 transition-colors text-left group cursor-pointer
-                         focus:outline-none focus:bg-stone-50">
-              <div className="flex items-center gap-3 min-w-0">
-                <span className={`text-lg w-5 inline-block text-center flex-shrink-0
-                                 ${result ? 'text-green-600' : 'text-stone-300'}`}>
-                  {result ? '✓' : '○'}
+            <button key={dateKey}
+              onClick={() => setSelectedDate(dateKey)}
+              aria-label={label}
+              style={inlineStyle}
+              className={`aspect-square rounded-md text-sm font-medium
+                          flex items-center justify-center relative select-none
+                          transition-transform duration-100 ${stateClass}`}>
+              {day}
+              {medal && (
+                <span aria-hidden="true"
+                  className="absolute"
+                  style={{ top: 1, right: 2, fontSize: 11, lineHeight: 1,
+                           filter: 'drop-shadow(0 0 1px rgba(0,0,0,0.35))' }}>
+                  {MEDAL[medal]}
                 </span>
-                <div className="text-sm flex items-baseline gap-2 min-w-0 flex-wrap">
-                  <span className="text-stone-500 uppercase text-[11px] font-semibold
-                                   tracking-wider w-9 flex-shrink-0">
-                    {shortWeekday(date, true)}
-                  </span>
-                  <span className="text-stone-800 font-medium truncate">
-                    {formatShortDate(date)}
-                  </span>
-                  {difficulties[date] && (
-                    <DifficultyBadge difficulty={difficulties[date]}
-                                     onClick={onOpenScoring}
-                                     className="text-[11px]" />
-                  )}
-                </div>
-              </div>
-              <div className="text-sm flex-shrink-0">
-                {result ? (
-                  <span className="font-mono text-stone-700 tabular-nums"
-                        style={{ fontFamily: '"Menlo", monospace' }}>
-                    {formatMmSs(result.time)}
-                  </span>
-                ) : (
-                  <span className="text-stone-400 text-xs group-hover:text-red-700 transition-colors">
-                    Play →
-                  </span>
-                )}
-              </div>
-            </div>
+              )}
+            </button>
           );
         })}
+      </div>
+
+      {/* Detail strip for the selected day */}
+      {selectedInfo && (
+        <ArchiveDetailStrip
+          dateKey={selectedDate}
+          info={selectedInfo}
+          MEDAL={MEDAL}
+          RANK_WORD={RANK_WORD}
+          onPlay={() => onPlayDate(selectedDate)}
+          onOpenScoring={onOpenScoring}
+        />
+      )}
+
+      {/* Legend */}
+      <div className="flex items-center gap-3 mt-3 text-[11px] text-stone-500 flex-wrap px-1">
+        <span className="flex items-center gap-1.5">
+          <span className="w-3.5 h-3.5 rounded-sm bg-red-700" />
+          solved
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span className="w-3.5 h-3.5 rounded-sm bg-white border border-stone-300" />
+          not played
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span className="w-3.5 h-3.5 rounded-sm"
+                style={{ boxShadow: 'inset 0 0 0 2px #B91C1C' }} />
+          today
+        </span>
+        <span className="flex items-center gap-1">
+          <span aria-hidden="true">🥇🥈🥉</span>
+          <span>daily rank</span>
+        </span>
       </div>
 
       <p className="text-[11px] text-stone-400 text-center mt-4 mb-2">
         A new puzzle drops every day at midnight UTC.
       </p>
     </main>
+  );
+}
+
+// Detail strip rendered below the calendar grid, varying its layout by whether
+// the selected day was solved, is today, is in the future, or is an unplayed
+// past day.
+function ArchiveDetailStrip({ dateKey, info, MEDAL, RANK_WORD,
+                              onPlay, onOpenScoring }) {
+  const { result, isToday, isFuture, medal, count, difficulty } = info;
+  const dateLong = formatLongDate(dateKey);
+  const wrap = "bg-white border border-stone-200 rounded-md mt-4 p-4 shadow-sm";
+
+  if (isToday && !result) {
+    return (
+      <div className={wrap}>
+        <div className="flex items-start justify-between mb-3 gap-3">
+          <div className="min-w-0">
+            <div className="text-[11px] uppercase tracking-wider text-red-700 font-semibold">
+              Today
+            </div>
+            <div className="text-base font-medium mt-0.5"
+                 style={{ fontFamily: '"Georgia", serif' }}>
+              {dateLong}
+            </div>
+          </div>
+          {difficulty && (
+            <div className="flex-shrink-0">
+              <DifficultyBadge difficulty={difficulty} onClick={onOpenScoring} />
+            </div>
+          )}
+        </div>
+        <button onClick={onPlay}
+          className="w-full bg-red-700 hover:bg-red-800 text-white rounded-md
+                     py-2.5 text-sm font-medium transition-colors">
+          Play today's puzzle →
+        </button>
+      </div>
+    );
+  }
+
+  if (result) {
+    return (
+      <div className={wrap}>
+        <div className="flex items-start justify-between gap-3 mb-3">
+          <div className="min-w-0">
+            <div className="text-base font-medium"
+                 style={{ fontFamily: '"Georgia", serif' }}>
+              {dateLong}
+            </div>
+            <div className="text-xs text-stone-500 mt-1 flex items-center gap-1.5 flex-wrap">
+              <span>solved</span>
+              {difficulty && (
+                <>
+                  <span className="text-stone-300">·</span>
+                  <DifficultyBadge difficulty={difficulty} onClick={onOpenScoring} />
+                </>
+              )}
+            </div>
+            {medal && (
+              <div className="text-xs text-stone-700 mt-1.5 inline-flex items-center gap-1">
+                <span aria-hidden="true">{MEDAL[medal]}</span>
+                <span>{RANK_WORD[medal]} of {count} players</span>
+              </div>
+            )}
+          </div>
+          <div className="text-2xl font-semibold text-red-700 tabular-nums flex-shrink-0"
+               style={{ fontFamily: '"Menlo", monospace' }}>
+            {formatMmSs(result.time)}
+          </div>
+        </div>
+        <button onClick={onPlay}
+          className="w-full bg-transparent hover:bg-stone-50 border border-stone-300
+                     text-stone-700 rounded-md py-2 text-sm font-medium
+                     transition-colors">
+          Play again
+        </button>
+      </div>
+    );
+  }
+
+  if (isFuture) {
+    return (
+      <div className={wrap}>
+        <div className="flex items-start justify-between">
+          <div>
+            <div className="text-base font-medium text-stone-600"
+                 style={{ fontFamily: '"Georgia", serif' }}>
+              {dateLong}
+            </div>
+            <div className="text-xs text-stone-400 mt-1">
+              Drops at midnight UTC
+            </div>
+          </div>
+          <span className="text-stone-400 text-lg" aria-hidden="true">🔒</span>
+        </div>
+      </div>
+    );
+  }
+
+  // Unsolved past
+  return (
+    <div className={wrap}>
+      <div className="flex items-start justify-between gap-3 mb-3">
+        <div className="min-w-0">
+          <div className="text-base font-medium"
+               style={{ fontFamily: '"Georgia", serif' }}>
+            {dateLong}
+          </div>
+          <div className="text-xs text-stone-500 mt-1 flex items-center gap-1.5 flex-wrap">
+            <span>not played</span>
+            {difficulty && (
+              <>
+                <span className="text-stone-300">·</span>
+                <DifficultyBadge difficulty={difficulty} onClick={onOpenScoring} />
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+      <button onClick={onPlay}
+        className="w-full bg-red-700 hover:bg-red-800 text-white rounded-md
+                   py-2.5 text-sm font-medium transition-colors">
+        Play this puzzle →
+      </button>
+    </div>
   );
 }
 
@@ -1497,125 +1701,7 @@ function PlayerStatsContent({ player, todayKey, currentName, onBack }) {
 }
 
 // ===== Scoring explanation page =====
-// ===== Difficulty distribution data =====
-// Precomputed by Monte-Carlo sampling 30,000,000 random 12-card layouts
-// (see the "Method" section on the scoring page). Every figure here is an
-// estimate derived from that sample except PUZZLE_UNIVERSE, which is exact.
-const PUZZLE_UNIVERSE = 70724320184700;   // C(81,12) — every 12-card layout
-const DIST_SAMPLE_N   = 700895;           // sampled valid 6-set puzzles
-// [setCount, estimated number of layouts with exactly that many sets]
-const SETCOUNT_DIST = [
-  [0, 2284383754579], [1, 10264189941200], [2, 18462798314654],
-  [3, 19278662284918], [4, 12743881263447], [5, 5649119219617],
-  [6, 1652344079862], [7, 330159986441], [8, 48255203662],
-  [9, 8163944027], [10, 2138231947],
-];
-// Difficulty histogram of the 6-set pool, 0.5-wide bins:
-// [scoreLo, sampledCount, estimatedBillionsOfPuzzles]
-const HISTO_BINS = [
-  [0.0, 21, 0.05], [0.5, 144, 0.34], [1.0, 1289, 3.04], [1.5, 3544, 8.35],
-  [2.0, 10425, 24.58], [2.5, 23085, 54.42], [3.0, 36807, 86.77],
-  [3.5, 79102, 186.48], [4.0, 83027, 195.73], [4.5, 113776, 268.22],
-  [5.0, 88500, 208.64], [5.5, 84956, 200.28], [6.0, 69057, 162.80],
-  [6.5, 34828, 82.11], [7.0, 22183, 52.30], [7.5, 20200, 47.62],
-  [8.0, 26625, 62.77], [8.5, 3147, 7.42], [9.0, 156, 0.37], [9.5, 23, 0.05],
-];
-
-function scoreToColor(s) {
-  if (s < SCORE_CUT_VERY_EASY) return DIFFICULTY_TIERS['very-easy'].color;
-  if (s < SCORE_CUT_EASY)      return DIFFICULTY_TIERS['easy'].color;
-  if (s < SCORE_CUT_MEDIUM)    return DIFFICULTY_TIERS['medium'].color;
-  if (s < SCORE_CUT_HARD)      return DIFFICULTY_TIERS['hard'].color;
-  return DIFFICULTY_TIERS['very-hard'].color;
-}
-
-// Build the "sets per random layout" bar chart as a standalone SVG string.
-function buildSetCountSvg() {
-  const W = 700, H = 320, ML = 64, MR = 14, MT = 30, MB = 46;
-  const plotW = W - ML - MR, plotH = H - MT - MB;
-  const yMax = 20;  // trillions
-  const slot = plotW / SETCOUNT_DIST.length;
-  const y = (v) => MT + plotH - (v / yMax) * plotH;
-  const fp = (p) => (p >= 1 ? p.toFixed(1) : p >= 0.1 ? p.toFixed(2) : p.toFixed(3)) + '%';
-  let s = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" `
-        + `style="width:100%;height:auto;display:block" role="img" `
-        + `aria-label="Bar chart: how many sets a random 12-card layout contains. It peaks at 3 sets; layouts with exactly 6 sets — the Daily SET pool — are only about 2.3 percent.">`;
-  for (let g = 0; g <= yMax; g += 5) {
-    const gy = y(g);
-    s += `<line x1="${ML}" y1="${gy}" x2="${W-MR}" y2="${gy}" stroke="#e7e5e4"/>`;
-    s += `<text x="${ML-7}" y="${gy+4}" text-anchor="end" font-size="12" fill="#a8a29e" font-family="Menlo, monospace">${g}T</text>`;
-  }
-  SETCOUNT_DIST.forEach(([k, cnt], i) => {
-    const v = cnt / 1e12;
-    const bx = ML + i*slot + slot*0.16, bw = slot*0.68;
-    const by = y(v), bh = MT + plotH - by, isPool = k === 6;
-    const pct = 100 * cnt / PUZZLE_UNIVERSE;
-    s += `<rect x="${bx}" y="${by}" width="${bw}" height="${Math.max(bh,0)}" fill="${isPool?'#c0392b':'#a8a29e'}" rx="2"/>`;
-    s += `<text x="${bx+bw/2}" y="${MT+plotH+18}" text-anchor="middle" font-size="12" fill="${isPool?'#b91c1c':'#78716c'}" font-weight="${isPool?'700':'400'}" font-family="Menlo, monospace">${k}</text>`;
-    if (bh >= 20) {
-      s += `<text x="${bx+bw/2}" y="${by-5}" text-anchor="middle" font-size="11" fill="#78716c" font-family="Menlo, monospace">${v.toFixed(1)}T</text>`;
-      s += `<text x="${bx+bw/2}" y="${by+bh/2+4}" text-anchor="middle" font-size="11.5" font-weight="700" fill="${isPool?'#fff':'#1c1917'}" font-family="Menlo, monospace">${fp(pct)}</text>`;
-    } else {
-      s += `<text x="${bx+bw/2}" y="${by-5}" text-anchor="middle" font-size="10.5" fill="#78716c" font-family="Menlo, monospace">${fp(pct)}</text>`;
-    }
-  });
-  const sixX = ML + 6*slot + slot*0.5;
-  s += `<text x="${sixX}" y="${MT-13}" text-anchor="middle" font-size="11.5" fill="#b91c1c" font-weight="700">▲ Daily SET pool</text>`;
-  s += `<line x1="${ML}" y1="${MT+plotH}" x2="${W-MR}" y2="${MT+plotH}" stroke="#a8a29e" stroke-width="1.4"/>`;
-  s += `<text x="${ML+plotW/2}" y="${H-6}" text-anchor="middle" font-size="12.5" fill="#57534e" font-weight="600">Number of sets in the layout</text>`;
-  s += `<text x="14" y="${MT+plotH/2}" text-anchor="middle" font-size="12" fill="#57534e" font-weight="600" transform="rotate(-90 14 ${MT+plotH/2})">Est. number of layouts</text>`;
-  return s + '</svg>';
-}
-
-// Build the difficulty histogram (five colour-coded tiers) as an SVG string.
-function buildDiffHistogramSvg() {
-  const W = 700, H = 360, ML = 56, MR = 14, MT = 26, MB = 46;
-  const plotW = W - ML - MR, plotH = H - MT - MB;
-  const yMax = Math.max(...HISTO_BINS.map((b) => b[2]));
-  const x = (v) => ML + (v / 10) * plotW;
-  const y = (v) => MT + plotH - (v / yMax) * plotH;
-  const cuts = [SCORE_CUT_VERY_EASY, SCORE_CUT_EASY, SCORE_CUT_MEDIUM, SCORE_CUT_HARD];
-  let s = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" `
-        + `style="width:100%;height:auto;display:block" role="img" `
-        + `aria-label="Histogram of difficulty across the 1.65 trillion six-set puzzles, in five colour-coded tiers. It is bell-shaped with a mean near 5 and a peak in the 4.5 to 5.0 bin.">`;
-  for (let g = 0; g <= 250; g += 50) {
-    const gy = y(g);
-    s += `<line x1="${ML}" y1="${gy}" x2="${W-MR}" y2="${gy}" stroke="#e7e5e4"/>`;
-    s += `<text x="${ML-7}" y="${gy+4}" text-anchor="end" font-size="12" fill="#a8a29e" font-family="Menlo, monospace">${g}B</text>`;
-  }
-  for (const [lo, , est] of HISTO_BINS) {
-    const bx = x(lo), bw = x(lo+0.5) - x(lo) - 1.4, by = y(est), bh = MT + plotH - by;
-    s += `<rect x="${bx}" y="${by}" width="${bw}" height="${Math.max(bh,0)}" fill="${scoreToColor(lo+0.25)}" rx="1.5"/>`;
-  }
-  for (const t of cuts) {
-    const tx = x(t);
-    s += `<line x1="${tx}" y1="${MT}" x2="${tx}" y2="${MT+plotH}" stroke="#1c1917" stroke-width="1.4" stroke-dasharray="4 3"/>`;
-    s += `<text x="${tx}" y="${MT-6}" text-anchor="middle" font-size="11" fill="#1c1917" font-weight="700" font-family="Menlo, monospace">${t.toFixed(1)}</text>`;
-  }
-  for (const [lo, samp, est] of HISTO_BINS) {
-    const pct = 100 * samp / DIST_SAMPLE_N;
-    if (pct < 1) continue;
-    const bx = x(lo), bw = x(lo+0.5) - x(lo) - 1.4, by = y(est), bh = MT + plotH - by;
-    if (bh >= 18)
-      s += `<text x="${bx+bw/2}" y="${by+bh/2+4}" text-anchor="middle" font-size="11" font-weight="700" fill="#fff" font-family="Menlo, monospace">${Math.round(pct)}%</text>`;
-  }
-  s += `<line x1="${ML}" y1="${MT+plotH}" x2="${W-MR}" y2="${MT+plotH}" stroke="#a8a29e" stroke-width="1.4"/>`;
-  for (let t = 0; t <= 10; t++) {
-    const tx = x(t);
-    s += `<line x1="${tx}" y1="${MT+plotH}" x2="${tx}" y2="${MT+plotH+4}" stroke="#a8a29e"/>`;
-    s += `<text x="${tx}" y="${MT+plotH+17}" text-anchor="middle" font-size="11.5" fill="#a8a29e" font-family="Menlo, monospace">${t}</text>`;
-  }
-  s += `<text x="${ML+plotW/2}" y="${H-6}" text-anchor="middle" font-size="12.5" fill="#57534e" font-weight="600">Difficulty score (0–10)</text>`;
-  s += `<text x="13" y="${MT+plotH/2}" text-anchor="middle" font-size="12" fill="#57534e" font-weight="600" transform="rotate(-90 13 ${MT+plotH/2})">Est. number of puzzles</text>`;
-  return s + '</svg>';
-}
-
-const SETCOUNT_SVG = buildSetCountSvg();
-const DIFF_HISTOGRAM_SVG = buildDiffHistogramSvg();
-
-// ===== Scoring explanation page =====
 function ScoringContent({ onBack }) {
-  const subhead = "text-[11px] uppercase tracking-wider text-stone-500 mb-1.5 px-0.5 font-semibold";
   return (
     <main className="flex-1 p-3 max-w-2xl w-full mx-auto">
       <button onClick={onBack}
@@ -1624,7 +1710,7 @@ function ScoringContent({ onBack }) {
       </button>
       <h2 className="text-2xl font-bold text-stone-800 mb-2"
           style={{ fontFamily: '"Georgia", serif' }}>
-        How difficulty works
+        How difficulty is scored
       </h2>
       <p className="text-stone-600 text-sm mb-5 leading-relaxed">
         Every puzzle gets a score from <strong>structural properties of the
@@ -1633,7 +1719,6 @@ function ScoringContent({ onBack }) {
         🌶️🌶️🌶️ a year ago.
       </p>
 
-      {/* ---- the score formula ---- */}
       <div className="bg-white rounded-md border border-stone-300 p-3 mb-2
                       text-sm text-stone-800 tabular-nums text-center overflow-x-auto"
            style={{ fontFamily: '"Menlo", monospace' }}>
@@ -1642,8 +1727,8 @@ function ScoringContent({ onBack }) {
       <p className="text-xs text-stone-500 mb-5 text-center leading-relaxed">
         where <span className="font-mono">raw = avgVars + 0.5 × decoys − 0.4 × membershipStd</span>.{' '}
         The raw composite is normalized against the empirical min (1.028) and max
-        (4.820) seen across a large sample of valid 6-set puzzles, so the easiest
-        possible puzzle scores ~0 and the hardest ~10.
+        (4.820) observed across ~46,500 sampled valid 6-set puzzles, so the
+        easiest possible puzzle scores ~0 and the hardest ~10.
       </p>
 
       <section className="mb-4">
@@ -1694,200 +1779,57 @@ function ScoringContent({ onBack }) {
         </p>
       </section>
 
-      {/* ---- the five tiers ---- */}
-      <div className="border-t border-stone-200 pt-5 mb-3">
-        <h3 className="text-lg font-bold text-stone-800 mb-1"
-            style={{ fontFamily: '"Georgia", serif' }}>
-          The five difficulty tiers
-        </h3>
-        <p className="text-sm text-stone-600 leading-relaxed">
-          The score is bucketed into five tiers shaped as a bell curve. The two
-          inner cuts (4.4 and 5.7) sit where the score distribution naturally
-          splits into thirds; the outer cuts carve off the rarest ~10% at each
-          end. Most puzzles are Medium — a Very Easy or Very Hard day comes
-          around roughly once every ten days.
-        </p>
-      </div>
-      <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-2">
-        {DIFFICULTY_ORDER.map((key) => {
-          const t = DIFFICULTY_TIERS[key];
-          return (
-            <div key={key} className="rounded-lg p-2.5 text-center"
-                 style={{ background: t.cardBg, color: t.cardFg }}>
-              <div className="text-base leading-none"
-                   style={{ whiteSpace: 'nowrap' }}>{t.peppers}</div>
-              <div className="text-xs font-bold mt-1">{t.label}</div>
-              <div className="text-[10px] mt-0.5 tabular-nums"
-                   style={{ fontFamily: '"Menlo", monospace' }}>{t.range}</div>
-              <div className="text-sm font-bold mt-1 tabular-nums">{t.est}</div>
-              <div className="text-[10px] opacity-75">{t.share} of pool</div>
-            </div>
-          );
-        })}
-      </div>
-      <p className="text-xs text-stone-400 italic mb-5 leading-relaxed">
-        "Est." is the estimated number of puzzles in that tier, out of the
-        ~1.65 trillion that exist. Because the two inner cuts are unchanged from
-        the old three-tier system, Medium is identical and the old Easy / Hard
-        each simply split in two.
+      <h3 className="text-[11px] uppercase tracking-wider text-stone-500 mb-2 px-1 font-semibold">
+        Thresholds
+      </h3>
+      <p className="text-xs text-stone-500 mb-2 leading-relaxed">
+        Set at the empirical tertiles across ~46,500 sampled valid 6-set
+        puzzles, so each level contains roughly a third of all possible puzzles.
       </p>
-
-      {/* ---- the bigger picture ---- */}
-      <div className="border-t border-stone-200 pt-5 mb-3">
-        <h3 className="text-lg font-bold text-stone-800 mb-1"
-            style={{ fontFamily: '"Georgia", serif' }}>
-          How many SET puzzles are there?
-        </h3>
-        <p className="text-sm text-stone-600 leading-relaxed">
-          A "puzzle" is a layout of 12 cards containing exactly 6 sets. There
-          are vastly more 12-card layouts than there are puzzles — here's where
-          the pool comes from.
-        </p>
-      </div>
-
-      {/* funnel */}
-      <div className="rounded-lg bg-stone-100 border border-stone-300 p-3 text-center">
-        <div className="text-[10px] uppercase tracking-wider font-bold text-stone-500">
-          Every 12-card layout
+      <div className="bg-white rounded-md border border-stone-300 divide-y divide-stone-200 mb-4">
+        <div className="px-4 py-1.5 flex items-center gap-3 bg-stone-50
+                        text-[10px] uppercase tracking-wider text-stone-500 font-semibold">
+          <span className="flex-1">Level</span>
+          <span className="w-20 text-right">Range</span>
+          <span className="w-28 text-right">Threshold</span>
         </div>
-        <div className="text-2xl font-bold text-stone-700 tabular-nums mt-0.5"
-             style={{ fontFamily: '"Menlo", monospace' }}>
-          70.72<span className="text-sm font-normal text-stone-400"> trillion</span>
+        <div className="px-4 py-2.5 flex items-center gap-3">
+          <span className="text-sm flex-1">🌶️ <span className="ml-1">Easy</span></span>
+          <span className="text-stone-700 tabular-nums text-sm font-medium w-20 text-right"
+                style={{ fontFamily: '"Menlo", monospace' }}>
+            0.0 – 4.4
+          </span>
+          <span className="text-stone-400 tabular-nums text-xs w-28 text-right"
+                style={{ fontFamily: '"Menlo", monospace' }}>
+            score &lt; 4.4
+          </span>
         </div>
-        <div className="text-[11px] text-stone-500 mt-0.5">
-          C(81,&nbsp;12) = 70,724,320,184,700 — any 12 cards from the deck. Exact.
+        <div className="px-4 py-2.5 flex items-center gap-3">
+          <span className="text-sm flex-1">🌶️🌶️ <span className="ml-1">Medium</span></span>
+          <span className="text-stone-700 tabular-nums text-sm font-medium w-20 text-right"
+                style={{ fontFamily: '"Menlo", monospace' }}>
+            4.4 – 5.7
+          </span>
+          <span className="text-stone-400 tabular-nums text-xs w-28 text-right"
+                style={{ fontFamily: '"Menlo", monospace' }}>
+            4.4 ≤ score &lt; 5.7
+          </span>
         </div>
-      </div>
-      <div className="text-center py-1.5">
-        <div className="text-red-600 text-lg leading-none">▼</div>
-        <div className="inline-block bg-white border border-dashed border-red-400
-                        text-red-800 text-[11px] font-medium px-3 py-1 rounded-full mt-1">
-          keep only layouts with exactly 6 sets — 2.34% qualify
-        </div>
-      </div>
-      <div className="rounded-lg bg-red-50 border-2 border-red-200 p-3 text-center mx-auto"
-           style={{ maxWidth: '80%' }}>
-        <div className="text-[10px] uppercase tracking-wider font-bold text-red-800">
-          The Daily SET pool
-        </div>
-        <div className="text-2xl font-bold text-red-700 tabular-nums mt-0.5"
-             style={{ fontFamily: '"Menlo", monospace' }}>
-          ~1.65<span className="text-sm font-normal text-red-400"> trillion</span>
-        </div>
-        <div className="text-[11px] text-red-800 mt-0.5">
-          the 6-set layouts — what today's puzzle is drawn from
-        </div>
-      </div>
-      <p className="text-xs text-stone-500 leading-relaxed mt-3 mb-5">
-        Only 2.34% of random 12-card layouts contain exactly 6 sets — but the
-        deck is so large that this is still about 1.65 trillion distinct
-        puzzles. Difficulty is only defined for these.
-      </p>
-
-      {/* set-count chart */}
-      <h4 className={subhead}>Sets per random layout</h4>
-      <div className="bg-white rounded-md border border-stone-200 p-2 mb-1">
-        <div className="overflow-x-auto">
-          <div style={{ minWidth: '540px' }}
-               dangerouslySetInnerHTML={{ __html: SETCOUNT_SVG }} />
-        </div>
-      </div>
-      <p className="text-xs text-stone-500 mb-5 leading-relaxed">
-        Deal 12 random cards and count the sets. Most layouts have 2–4. The red
-        bar — exactly 6 sets — is the only one Daily SET keeps; every other bar
-        is discarded.
-      </p>
-
-      {/* difficulty histogram */}
-      <h4 className={subhead}>Difficulty across the puzzle pool</h4>
-      <div className="bg-white rounded-md border border-stone-200 p-2 mb-1">
-        <div className="overflow-x-auto">
-          <div style={{ minWidth: '540px' }}
-               dangerouslySetInnerHTML={{ __html: DIFF_HISTOGRAM_SVG }} />
-        </div>
-        <div className="flex flex-wrap justify-center gap-x-3 gap-y-1 mt-1.5 px-1">
-          {DIFFICULTY_ORDER.map((key) => {
-            const t = DIFFICULTY_TIERS[key];
-            return (
-              <span key={key}
-                    className="inline-flex items-center gap-1 text-[10px] text-stone-500">
-                <span style={{ width: '10px', height: '10px', borderRadius: '2px',
-                               background: t.color, display: 'inline-block' }} />
-                {t.label}
-              </span>
-            );
-          })}
-          <span className="inline-flex items-center gap-1 text-[10px] text-stone-500">
-            <span style={{ width: '14px', height: '0', borderTop: '2px dashed #1c1917',
-                           display: 'inline-block' }} />
-            tier cuts
+        <div className="px-4 py-2.5 flex items-center gap-3">
+          <span className="text-sm flex-1">🌶️🌶️🌶️ <span className="ml-1">Hard</span></span>
+          <span className="text-stone-700 tabular-nums text-sm font-medium w-20 text-right"
+                style={{ fontFamily: '"Menlo", monospace' }}>
+            5.7 – 10.0
+          </span>
+          <span className="text-stone-400 tabular-nums text-xs w-28 text-right"
+                style={{ fontFamily: '"Menlo", monospace' }}>
+            score ≥ 5.7
           </span>
         </div>
       </div>
-      <p className="text-xs text-stone-500 mb-5 leading-relaxed">
-        Every one of the ~1.65 trillion puzzles, scored and binned. The dashed
-        lines are the tier cuts; the figure inside each bar is that bin's share
-        of the pool. The distribution is bell-shaped — mean 5.1 — so the
-        extreme tiers really are rare.
-      </p>
-
-      {/* raw bin table */}
-      <h4 className={subhead}>Raw bin data</h4>
-      <div className="bg-white rounded-md border border-stone-200 overflow-hidden mb-1">
-        <div className="overflow-x-auto">
-          <table className="w-full text-xs">
-            <thead className="bg-stone-100">
-              <tr>
-                <th className="px-3 py-2 text-left font-semibold text-stone-600">Score bin</th>
-                <th className="px-3 py-2 text-right font-semibold text-stone-600">Sampled</th>
-                <th className="px-3 py-2 text-right font-semibold text-stone-600">Est. in pool</th>
-                <th className="px-3 py-2 text-right font-semibold text-stone-600">Share</th>
-              </tr>
-            </thead>
-            <tbody>
-              {HISTO_BINS.map(([lo, samp, est], i) => (
-                <tr key={lo} className={i % 2 === 0 ? 'bg-white' : 'bg-stone-50'}>
-                  <td className="px-3 py-1.5 text-stone-700 whitespace-nowrap">
-                    {lo.toFixed(1)} – {(lo + 0.5).toFixed(1)}
-                  </td>
-                  <td className="px-3 py-1.5 text-right tabular-nums text-stone-700"
-                      style={{ fontFamily: '"Menlo", monospace' }}>
-                    {samp.toLocaleString()}
-                  </td>
-                  <td className="px-3 py-1.5 text-right tabular-nums text-stone-700"
-                      style={{ fontFamily: '"Menlo", monospace' }}>
-                    {est.toFixed(2)} B
-                  </td>
-                  <td className="px-3 py-1.5 text-right tabular-nums text-stone-700"
-                      style={{ fontFamily: '"Menlo", monospace' }}>
-                    {(100 * samp / DIST_SAMPLE_N).toFixed(2)}%
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-      <p className="text-xs text-stone-500 mb-5 leading-relaxed">
-        Score percentiles across the pool — p10&nbsp;3.4 · p25&nbsp;4.2 ·
-        p50&nbsp;5.0 · p75&nbsp;6.0 · p90&nbsp;7.0. Mean 5.1, standard
-        deviation 1.4.
-      </p>
-
-      {/* method */}
-      <h4 className={subhead}>Method</h4>
-      <p className="text-xs text-stone-500 leading-relaxed mb-5">
-        The 70.72-trillion figure is exact — it is C(81,&nbsp;12). Everything
-        else is estimated by sampling 30,000,000 random 12-card layouts and
-        counting the sets in each. 2.34% had exactly 6 sets, which scaled up by
-        C(81,&nbsp;12) gives ~1.65 trillion puzzles (95% confidence ±0.2%).
-        Difficulty was then computed for all 700,895 sampled 6-set puzzles with
-        the formula above. A "layout" / "puzzle" is an unordered set of 12
-        cards; layouts related by SET's symmetries are not deduplicated.
-      </p>
 
       <p className="text-xs text-stone-500 italic leading-relaxed">
-        The coefficients (0.5, 0.4) and tier cuts are first-pass estimates.
+        The coefficients (0.5, 0.4) and thresholds are first-pass estimates.
         As solve-time data accumulates, they'll be recalibrated against what
         actually predicts how hard humans find each puzzle.
       </p>
@@ -1904,8 +1846,6 @@ export default function App() {
 
   const puzzle = useMemo(() => generateDailyPuzzle(activeDate), [activeDate]);
   const targetSets = puzzle.sets.length;
-
-  const archiveDates = useMemo(() => generateArchiveDates(todayKey), [todayKey]);
 
   const [name, setNameState] = useState(null);
   const [loadingName, setLoadingName] = useState(true);
@@ -2157,12 +2097,6 @@ export default function App() {
 
   // Derived
   const msUntilTomorrow = msUntilNextUtcMidnight();
-  const todayResult = myResults[todayKey];
-  const archiveResults = useMemo(() => {
-    const r = {};
-    for (const d of archiveDates) if (myResults[d]) r[d] = myResults[d];
-    return r;
-  }, [myResults, archiveDates]);
 
   // === Render ===
   if (loadingName) {
@@ -2209,12 +2143,15 @@ export default function App() {
 
       {view === 'archives' && (
         <ArchivesContent
-          archiveDates={archiveDates}
-          archiveResults={archiveResults}
-          todayResult={todayResult}
+          myResults={myResults}
           todayKey={todayKey}
-          onPlayToday={() => handleTabChange('game')}
-          onPlayArchive={(date) => { setPlayingDate(date); setView('game'); }}
+          currentName={name}
+          onPlayDate={(date) => {
+            // Today => regular play; any other date => archived puzzle.
+            if (date === todayKey) setPlayingDate(null);
+            else setPlayingDate(date);
+            setView('game');
+          }}
           onOpenScoring={openScoring}
         />
       )}
