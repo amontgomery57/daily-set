@@ -789,10 +789,11 @@ function StatCard({ label, value, sub, accent }) {
 // reads as an interactive element that explains itself when tapped.
 // Three buckets: easy / medium / hard -> 1 / 2 / 3 filled stars.
 const DIFFICULTY_TIERS = {
-  'easy':   { stars: 1, label: 'Easy' },
-  'medium': { stars: 2, label: 'Medium' },
-  'hard':   { stars: 3, label: 'Hard' },
+  'easy':   { stars: 1, label: 'Easy',   color: '#15803d' },
+  'medium': { stars: 2, label: 'Medium', color: '#d97706' },
+  'hard':   { stars: 3, label: 'Hard',   color: '#b91c1c' },
 };
+const DIFFICULTY_ORDER = ['easy', 'medium', 'hard'];
 
 function DifficultyBadge({ difficulty, showLabel = false, onClick, className = '' }) {
   if (!difficulty) return null;
@@ -1719,8 +1720,126 @@ function PlayerStatsContent({ player, todayKey, currentName, onBack }) {
   );
 }
 
+// ===== Difficulty distribution data =====
+// PUZZLE_UNIVERSE is exact; the rest are Monte-Carlo estimates. The set-count
+// distribution comes from an earlier 30M-layout sample (it's formula-
+// independent). The difficulty histogram was recomputed for the v2 formula by
+// sampling 17,158,209 random 12-card layouts (400,000 valid 6-set puzzles).
+const PUZZLE_UNIVERSE = 70724320184700;   // C(81,12) — every 12-card layout
+const DIST_SAMPLE_N   = 400000;           // sampled valid 6-set puzzles (v2)
+// [setCount, estimated number of layouts with exactly that many sets]
+const SETCOUNT_DIST = [
+  [0, 2284383754579], [1, 10264189941200], [2, 18462798314654],
+  [3, 19278662284918], [4, 12743881263447], [5, 5649119219617],
+  [6, 1652344079862], [7, 330159986441], [8, 48255203662],
+  [9, 8163944027], [10, 2138231947],
+];
+// v2 difficulty histogram of the 6-set pool, 0.5-wide bins:
+// [scoreLo, sampledCount, estimatedBillionsOfPuzzles]
+const HISTO_BINS = [
+  [0.0, 72, 0.30], [0.5, 560, 2.31], [1.0, 2346, 9.69], [1.5, 7129, 29.45],
+  [2.0, 14711, 60.77], [2.5, 33319, 137.64], [3.0, 26135, 107.96],
+  [3.5, 37034, 152.98], [4.0, 53452, 220.80], [4.5, 58774, 242.79],
+  [5.0, 58681, 242.40], [5.5, 19643, 81.14], [6.0, 16020, 66.18],
+  [6.5, 15301, 63.21], [7.0, 12142, 50.16], [7.5, 16507, 68.19],
+  [8.0, 12204, 50.41], [8.5, 9884, 40.83], [9.0, 4863, 20.09],
+  [9.5, 1223, 5.05],
+];
+
+function scoreToColor(s) {
+  if (s < SCORE_CUT_EASY) return DIFFICULTY_TIERS['easy'].color;
+  if (s < SCORE_CUT_HARD) return DIFFICULTY_TIERS['medium'].color;
+  return DIFFICULTY_TIERS['hard'].color;
+}
+
+// Build the "sets per random layout" bar chart as a standalone SVG string.
+function buildSetCountSvg() {
+  const W = 700, H = 320, ML = 64, MR = 14, MT = 30, MB = 46;
+  const plotW = W - ML - MR, plotH = H - MT - MB;
+  const yMax = 20;  // trillions
+  const slot = plotW / SETCOUNT_DIST.length;
+  const y = (v) => MT + plotH - (v / yMax) * plotH;
+  const fp = (p) => (p >= 1 ? p.toFixed(1) : p >= 0.1 ? p.toFixed(2) : p.toFixed(3)) + '%';
+  let s = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" `
+        + `style="width:100%;height:auto;display:block" role="img" `
+        + `aria-label="Bar chart: how many sets a random 12-card layout contains. It peaks at 3 sets; layouts with exactly 6 sets — the Daily SET pool — are only about 2.3 percent.">`;
+  for (let g = 0; g <= yMax; g += 5) {
+    const gy = y(g);
+    s += `<line x1="${ML}" y1="${gy}" x2="${W-MR}" y2="${gy}" stroke="#e7e5e4"/>`;
+    s += `<text x="${ML-7}" y="${gy+4}" text-anchor="end" font-size="12" fill="#a8a29e" font-family="Menlo, monospace">${g}T</text>`;
+  }
+  SETCOUNT_DIST.forEach(([k, cnt], i) => {
+    const v = cnt / 1e12;
+    const bx = ML + i*slot + slot*0.16, bw = slot*0.68;
+    const by = y(v), bh = MT + plotH - by, isPool = k === 6;
+    const pct = 100 * cnt / PUZZLE_UNIVERSE;
+    s += `<rect x="${bx}" y="${by}" width="${bw}" height="${Math.max(bh,0)}" fill="${isPool?'#c0392b':'#a8a29e'}" rx="2"/>`;
+    s += `<text x="${bx+bw/2}" y="${MT+plotH+18}" text-anchor="middle" font-size="12" fill="${isPool?'#b91c1c':'#78716c'}" font-weight="${isPool?'700':'400'}" font-family="Menlo, monospace">${k}</text>`;
+    if (bh >= 20) {
+      s += `<text x="${bx+bw/2}" y="${by-5}" text-anchor="middle" font-size="11" fill="#78716c" font-family="Menlo, monospace">${v.toFixed(1)}T</text>`;
+      s += `<text x="${bx+bw/2}" y="${by+bh/2+4}" text-anchor="middle" font-size="11.5" font-weight="700" fill="${isPool?'#fff':'#1c1917'}" font-family="Menlo, monospace">${fp(pct)}</text>`;
+    } else {
+      s += `<text x="${bx+bw/2}" y="${by-5}" text-anchor="middle" font-size="10.5" fill="#78716c" font-family="Menlo, monospace">${fp(pct)}</text>`;
+    }
+  });
+  const sixX = ML + 6*slot + slot*0.5;
+  s += `<text x="${sixX}" y="${MT-13}" text-anchor="middle" font-size="11.5" fill="#b91c1c" font-weight="700">▲ Daily SET pool</text>`;
+  s += `<line x1="${ML}" y1="${MT+plotH}" x2="${W-MR}" y2="${MT+plotH}" stroke="#a8a29e" stroke-width="1.4"/>`;
+  s += `<text x="${ML+plotW/2}" y="${H-6}" text-anchor="middle" font-size="12.5" fill="#57534e" font-weight="600">Number of sets in the layout</text>`;
+  s += `<text x="14" y="${MT+plotH/2}" text-anchor="middle" font-size="12" fill="#57534e" font-weight="600" transform="rotate(-90 14 ${MT+plotH/2})">Est. number of layouts</text>`;
+  return s + '</svg>';
+}
+
+// Build the v2 difficulty histogram (three colour-coded tiers) as an SVG string.
+function buildDiffHistogramSvg() {
+  const W = 700, H = 360, ML = 56, MR = 14, MT = 26, MB = 46;
+  const plotW = W - ML - MR, plotH = H - MT - MB;
+  const yMax = 250;
+  const x = (v) => ML + (v / 10) * plotW;
+  const y = (v) => MT + plotH - (v / yMax) * plotH;
+  const cuts = [SCORE_CUT_EASY, SCORE_CUT_HARD];
+  let s = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" `
+        + `style="width:100%;height:auto;display:block" role="img" `
+        + `aria-label="Histogram of v2 difficulty across the 1.65 trillion six-set puzzles, in three colour-coded star tiers. It is centred near 5 with rarer extremes.">`;
+  for (let g = 0; g <= yMax; g += 50) {
+    const gy = y(g);
+    s += `<line x1="${ML}" y1="${gy}" x2="${W-MR}" y2="${gy}" stroke="#e7e5e4"/>`;
+    s += `<text x="${ML-7}" y="${gy+4}" text-anchor="end" font-size="12" fill="#a8a29e" font-family="Menlo, monospace">${g}B</text>`;
+  }
+  for (const [lo, , est] of HISTO_BINS) {
+    const bx = x(lo), bw = x(lo+0.5) - x(lo) - 1.4, by = y(est), bh = MT + plotH - by;
+    s += `<rect x="${bx}" y="${by}" width="${bw}" height="${Math.max(bh,0)}" fill="${scoreToColor(lo+0.25)}" rx="1.5"/>`;
+  }
+  for (const t of cuts) {
+    const tx = x(t);
+    s += `<line x1="${tx}" y1="${MT}" x2="${tx}" y2="${MT+plotH}" stroke="#1c1917" stroke-width="1.4" stroke-dasharray="4 3"/>`;
+    s += `<text x="${tx}" y="${MT-6}" text-anchor="middle" font-size="11" fill="#1c1917" font-weight="700" font-family="Menlo, monospace">${t.toFixed(1)}</text>`;
+  }
+  for (const [lo, samp] of HISTO_BINS) {
+    const pct = 100 * samp / DIST_SAMPLE_N;
+    if (pct < 1) continue;
+    const bx = x(lo), bw = x(lo+0.5) - x(lo) - 1.4, est = HISTO_BINS.find(b => b[0]===lo)[2];
+    const by = y(est), bh = MT + plotH - by;
+    if (bh >= 18)
+      s += `<text x="${bx+bw/2}" y="${by+bh/2+4}" text-anchor="middle" font-size="11" font-weight="700" fill="#fff" font-family="Menlo, monospace">${Math.round(pct)}%</text>`;
+  }
+  s += `<line x1="${ML}" y1="${MT+plotH}" x2="${W-MR}" y2="${MT+plotH}" stroke="#a8a29e" stroke-width="1.4"/>`;
+  for (let t = 0; t <= 10; t++) {
+    const tx = x(t);
+    s += `<line x1="${tx}" y1="${MT+plotH}" x2="${tx}" y2="${MT+plotH+4}" stroke="#a8a29e"/>`;
+    s += `<text x="${tx}" y="${MT+plotH+17}" text-anchor="middle" font-size="11.5" fill="#a8a29e" font-family="Menlo, monospace">${t}</text>`;
+  }
+  s += `<text x="${ML+plotW/2}" y="${H-6}" text-anchor="middle" font-size="12.5" fill="#57534e" font-weight="600">Difficulty score (0–10)</text>`;
+  s += `<text x="13" y="${MT+plotH/2}" text-anchor="middle" font-size="12" fill="#57534e" font-weight="600" transform="rotate(-90 13 ${MT+plotH/2})">Est. number of puzzles</text>`;
+  return s + '</svg>';
+}
+
+const SETCOUNT_SVG = buildSetCountSvg();
+const DIFF_HISTOGRAM_SVG = buildDiffHistogramSvg();
+
 // ===== Scoring explanation page =====
 function ScoringContent({ onBack }) {
+  const subhead = "text-[11px] uppercase tracking-wider text-stone-500 mb-2 px-1 font-semibold mt-1";
   return (
     <main className="flex-1 p-3 max-w-2xl w-full mx-auto">
       <button onClick={onBack}
@@ -1868,6 +1987,157 @@ function ScoringContent({ onBack }) {
           brutal for another.
         </p>
       </div>
+
+      <h3 className="text-[11px] uppercase tracking-wider text-stone-500 mb-2 px-1 font-semibold">
+        The puzzle universe
+      </h3>
+      <p className="text-xs text-stone-500 mb-3 leading-relaxed">
+        Difficulty is only defined for layouts that are actually puzzles — the
+        ones with exactly six sets. Here's how narrow that pool is, and how the
+        scores spread across it.
+      </p>
+
+      {/* funnel */}
+      <div className="rounded-lg bg-stone-100 border border-stone-300 p-3 text-center">
+        <div className="text-[10px] uppercase tracking-wider font-bold text-stone-500">
+          Every 12-card layout
+        </div>
+        <div className="text-2xl font-bold text-stone-700 tabular-nums mt-0.5"
+             style={{ fontFamily: '"Menlo", monospace' }}>
+          70.72<span className="text-sm font-normal text-stone-400"> trillion</span>
+        </div>
+        <div className="text-[11px] text-stone-500 mt-0.5">
+          C(81,&nbsp;12) = 70,724,320,184,700 — any 12 cards from the deck. Exact.
+        </div>
+      </div>
+      <div className="text-center py-1.5">
+        <div className="text-red-600 text-lg leading-none">▼</div>
+        <div className="inline-block bg-white border border-dashed border-red-400
+                        text-red-800 text-[11px] font-medium px-3 py-1 rounded-full mt-1">
+          keep only layouts with exactly 6 sets — 2.33% qualify
+        </div>
+      </div>
+      <div className="rounded-lg bg-red-50 border-2 border-red-200 p-3 text-center mx-auto"
+           style={{ maxWidth: '80%' }}>
+        <div className="text-[10px] uppercase tracking-wider font-bold text-red-800">
+          The Daily SET pool
+        </div>
+        <div className="text-2xl font-bold text-red-700 tabular-nums mt-0.5"
+             style={{ fontFamily: '"Menlo", monospace' }}>
+          ~1.65<span className="text-sm font-normal text-red-400"> trillion</span>
+        </div>
+        <div className="text-[11px] text-red-800 mt-0.5">
+          the 6-set layouts — what every daily puzzle is drawn from
+        </div>
+      </div>
+      <p className="text-xs text-stone-500 leading-relaxed mt-3 mb-5">
+        Only about 2.33% of random 12-card layouts contain exactly 6 sets — but
+        the deck is so large that this is still roughly 1.65 trillion distinct
+        puzzles.
+      </p>
+
+      {/* set-count chart */}
+      <h4 className={subhead}>Sets per random layout</h4>
+      <div className="bg-white rounded-md border border-stone-200 p-2 mb-1">
+        <div className="overflow-x-auto">
+          <div style={{ minWidth: '540px' }}
+               dangerouslySetInnerHTML={{ __html: SETCOUNT_SVG }} />
+        </div>
+      </div>
+      <p className="text-xs text-stone-500 mb-5 leading-relaxed">
+        Deal 12 random cards and count the sets. Most layouts have 2–4. The red
+        bar — exactly 6 sets — is the only one Daily SET keeps; every other bar
+        is discarded.
+      </p>
+
+      {/* difficulty histogram */}
+      <h4 className={subhead}>Difficulty across the puzzle pool</h4>
+      <div className="bg-white rounded-md border border-stone-200 p-2 mb-1">
+        <div className="overflow-x-auto">
+          <div style={{ minWidth: '540px' }}
+               dangerouslySetInnerHTML={{ __html: DIFF_HISTOGRAM_SVG }} />
+        </div>
+        <div className="flex flex-wrap justify-center gap-x-3 gap-y-1 mt-1.5 px-1">
+          {DIFFICULTY_ORDER.map((key) => {
+            const t = DIFFICULTY_TIERS[key];
+            return (
+              <span key={key}
+                    className="inline-flex items-center gap-1 text-[10px] text-stone-500">
+                <span style={{ width: '10px', height: '10px', borderRadius: '2px',
+                               background: t.color, display: 'inline-block' }} />
+                {'★'.repeat(t.stars)} {t.label}
+              </span>
+            );
+          })}
+          <span className="inline-flex items-center gap-1 text-[10px] text-stone-500">
+            <span style={{ width: '14px', height: '0', borderTop: '2px dashed #1c1917',
+                           display: 'inline-block' }} />
+            star cuts (3.6 / 5.7)
+          </span>
+        </div>
+      </div>
+      <p className="text-xs text-stone-500 mb-5 leading-relaxed">
+        Every one of the ~1.65 trillion puzzles, scored with the v2 formula and
+        binned. The dashed lines are the 1★/2★ and 2★/3★ cuts; the figure inside
+        each bar is that bin's share of the pool. The bulk sits in the middle —
+        which is exactly why 2★ is the broad "typical" bucket and the star
+        ratings only call out the rarer ends.
+      </p>
+
+      {/* raw bin table */}
+      <h4 className={subhead}>Raw bin data</h4>
+      <div className="bg-white rounded-md border border-stone-200 overflow-hidden mb-1">
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead className="bg-stone-100">
+              <tr>
+                <th className="px-3 py-2 text-left font-semibold text-stone-600">Score bin</th>
+                <th className="px-3 py-2 text-right font-semibold text-stone-600">Sampled</th>
+                <th className="px-3 py-2 text-right font-semibold text-stone-600">Est. in pool</th>
+                <th className="px-3 py-2 text-right font-semibold text-stone-600">Share</th>
+              </tr>
+            </thead>
+            <tbody>
+              {HISTO_BINS.map(([lo, samp, est], i) => (
+                <tr key={lo} className={i % 2 === 0 ? 'bg-white' : 'bg-stone-50'}>
+                  <td className="px-3 py-1.5 text-stone-700 whitespace-nowrap">
+                    {lo.toFixed(1)} – {(lo + 0.5).toFixed(1)}
+                  </td>
+                  <td className="px-3 py-1.5 text-right tabular-nums text-stone-700"
+                      style={{ fontFamily: '"Menlo", monospace' }}>
+                    {samp.toLocaleString()}
+                  </td>
+                  <td className="px-3 py-1.5 text-right tabular-nums text-stone-700"
+                      style={{ fontFamily: '"Menlo", monospace' }}>
+                    {est.toFixed(2)} B
+                  </td>
+                  <td className="px-3 py-1.5 text-right tabular-nums text-stone-700"
+                      style={{ fontFamily: '"Menlo", monospace' }}>
+                    {(100 * samp / DIST_SAMPLE_N).toFixed(2)}%
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <p className="text-xs text-stone-500 mb-5 leading-relaxed">
+        Score percentiles across the pool — p10&nbsp;2.7 · p25&nbsp;3.6 ·
+        p50&nbsp;4.5 · p75&nbsp;5.7 · p90&nbsp;7.5. Mean 4.9, standard
+        deviation 1.8.
+      </p>
+
+      {/* method */}
+      <h4 className={subhead}>Method</h4>
+      <p className="text-xs text-stone-500 leading-relaxed mb-5">
+        The 70.72-trillion figure is exact — it is C(81,&nbsp;12). Everything
+        else is estimated by sampling random 12-card layouts and counting the
+        sets in each. About 2.33% had exactly 6 sets, which scaled up by
+        C(81,&nbsp;12) gives ~1.65 trillion puzzles. The v2 difficulty score
+        was then computed for 400,000 sampled 6-set puzzles. A "layout" /
+        "puzzle" is an unordered set of 12 cards; layouts related by SET's
+        symmetries are not deduplicated.
+      </p>
 
       <p className="text-xs text-stone-500 italic leading-relaxed">
         The coefficients and star cut points will be re-fit periodically as
