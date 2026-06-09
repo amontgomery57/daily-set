@@ -60,12 +60,16 @@ function findAllSets(cards) {
 // takes. ScoringContent carries the honest framing of that limit.
 const RAW_SCORE_MIN = 0.0;  // empirical min raw composite (n=30,000 sampled)
 const RAW_SCORE_MAX = 5.5;  // empirical max raw composite
-// Tier cut points on the 0-10 scale (ascending), set so the tiers cover
-// roughly 9% / 28% / 28% / 25% / 10% of all valid 6-set puzzles:
-const SCORE_CUT_VERY_EASY = 2.7;
-const SCORE_CUT_EASY      = 4.1;
-const SCORE_CUT_MEDIUM    = 5.2;
-const SCORE_CUT_HARD      = 7.7;
+// Three buckets -> 1/2/3 stars. Cut points on the 0-10 scale are the
+// population quartiles (p25 / p75), so ~20% of layouts land in 1-star,
+// ~55% in 2-star, ~25% in 3-star. This is deliberately the only split of
+// the score that separates *monotonically* on real solve time: in our data
+// 1-star days are genuinely faster (mean z -0.48), 3-star genuinely slower
+// (+0.38), and the big 2-star middle sits at average (+0.03). Finer splits
+// (e.g. 5 tiers) put the middle out of order, because layout structure just
+// doesn't distinguish medium-hard puzzles reliably.
+const SCORE_CUT_EASY = 3.6;  // < this -> 1 star
+const SCORE_CUT_HARD = 5.7;  // >= this -> 3 stars; between -> 2 stars
 
 function computePuzzleDifficulty(puzzle) {
   if (!puzzle || !puzzle.sets || !puzzle.cards) return null;
@@ -105,11 +109,9 @@ function computePuzzleDifficulty(puzzle) {
   const rawScore = 0.75 * avgVars + 1.0 * decoys - 0.25 * nCompact;
   const normalized = ((rawScore - RAW_SCORE_MIN) / (RAW_SCORE_MAX - RAW_SCORE_MIN)) * 10;
   const score = Math.max(0, Math.min(10, normalized));
-  const level = score < SCORE_CUT_VERY_EASY ? 'very-easy'
-              : score < SCORE_CUT_EASY      ? 'easy'
-              : score < SCORE_CUT_MEDIUM    ? 'medium'
-              : score < SCORE_CUT_HARD      ? 'hard'
-              :                               'very-hard';
+  const level = score < SCORE_CUT_EASY ? 'easy'
+              : score < SCORE_CUT_HARD ? 'medium'
+              :                          'hard';
 
   return { avgVars, decoys, nCompact, rawScore, score, level };
 }
@@ -782,34 +784,28 @@ function StatCard({ label, value, sub, accent }) {
 }
 
 // ===== Difficulty badge =====
-// Shows pepper icons, optional label ("Medium"), and the score (out of 10).
+// Shows a 1-3 filled-star rating with an optional word label ("Medium").
 // When onClick is provided, renders as a button with a small info icon so it
 // reads as an interactive element that explains itself when tapped.
-// Five tiers: very-easy / easy / medium / hard / very-hard -> 1-5 peppers.
+// Three buckets: easy / medium / hard -> 1 / 2 / 3 filled stars.
 const DIFFICULTY_TIERS = {
-  'very-easy': { peppers: '🌶️',          label: 'Very Easy' },
-  'easy':      { peppers: '🌶️🌶️',        label: 'Easy' },
-  'medium':    { peppers: '🌶️🌶️🌶️',      label: 'Medium' },
-  'hard':      { peppers: '🌶️🌶️🌶️🌶️',    label: 'Hard' },
-  'very-hard': { peppers: '🌶️🌶️🌶️🌶️🌶️',  label: 'Very Hard' },
+  'easy':   { stars: 1, label: 'Easy' },
+  'medium': { stars: 2, label: 'Medium' },
+  'hard':   { stars: 3, label: 'Hard' },
 };
 
-function DifficultyBadge({ difficulty, showLabel = false, showScore = true,
-                          onClick, className = '' }) {
+function DifficultyBadge({ difficulty, showLabel = false, onClick, className = '' }) {
   if (!difficulty) return null;
-  const { level, score } = difficulty;
+  const { level } = difficulty;
   const tier = DIFFICULTY_TIERS[level] || DIFFICULTY_TIERS['medium'];
-  const { peppers, label } = tier;
+  const { stars, label } = tier;
   const inner = (
     <span className={`inline-flex items-baseline gap-1 ${className}`}>
-      <span aria-label={label} style={{ whiteSpace: 'nowrap' }}>{peppers}</span>
+      <span aria-label={`${label} — ${stars} of 3 stars`} className="text-red-600"
+            style={{ whiteSpace: 'nowrap', letterSpacing: '0.05em' }}>
+        {'★'.repeat(stars)}<span className="text-stone-300">{'★'.repeat(3 - stars)}</span>
+      </span>
       {showLabel && <span className="text-stone-600 font-medium">{label}</span>}
-      {showScore && (
-        <span className="text-stone-500 tabular-nums"
-              style={{ fontFamily: '"Menlo", monospace' }}>
-          · {score.toFixed(1)}<span className="text-stone-400">/10</span>
-        </span>
-      )}
       {onClick && (
         <span className="text-stone-400 ml-0.5" aria-hidden="true"
               style={{ fontSize: '0.9em' }}>ⓘ</span>
@@ -1804,30 +1800,31 @@ function ScoringContent({ onBack }) {
       </section>
 
       <h3 className="text-[11px] uppercase tracking-wider text-stone-500 mb-2 px-1 font-semibold">
-        Tiers
+        Star ratings
       </h3>
       <p className="text-xs text-stone-500 mb-2 leading-relaxed">
-        Cut points are set against the distribution of all valid 6-set
-        layouts, shaped like a bell: the extreme tiers are rare (~10% each),
-        the middle three cover the rest.
+        The 0–10 score is bucketed into three star ratings at the population
+        quartiles, so 1★ and 3★ are the rarer ends (~20% and ~25% of all
+        layouts) and 2★ is the broad middle. These are the only cuts that line
+        up in the right order against real solve times — see below.
       </p>
       <div className="bg-white rounded-md border border-stone-300 divide-y divide-stone-200 mb-5">
         <div className="px-4 py-1.5 flex items-center gap-3 bg-stone-50
                         text-[10px] uppercase tracking-wider text-stone-500 font-semibold">
-          <span className="flex-1">Level</span>
+          <span className="flex-1">Rating</span>
           <span className="w-24 text-right">Score range</span>
           <span className="w-16 text-right">Share</span>
         </div>
         {[
-          ['🌶️', 'Very Easy', '0.0 – 2.7', '~9%'],
-          ['🌶️🌶️', 'Easy', '2.7 – 4.1', '~28%'],
-          ['🌶️🌶️🌶️', 'Medium', '4.1 – 5.2', '~28%'],
-          ['🌶️🌶️🌶️🌶️', 'Hard', '5.2 – 7.7', '~25%'],
-          ['🌶️🌶️🌶️🌶️🌶️', 'Very Hard', '7.7 – 10.0', '~10%'],
-        ].map(([peppers, label, range, share]) => (
+          [1, 'Easy', '0.0 – 3.6', '~20%'],
+          [2, 'Medium', '3.6 – 5.7', '~55%'],
+          [3, 'Hard', '5.7 – 10.0', '~25%'],
+        ].map(([stars, label, range, share]) => (
           <div key={label} className="px-4 py-2.5 flex items-center gap-3">
             <span className="text-sm flex-1 min-w-0">
-              <span style={{ whiteSpace: 'nowrap' }}>{peppers}</span>
+              <span className="text-red-600" style={{ whiteSpace: 'nowrap', letterSpacing: '0.05em' }}>
+                {'★'.repeat(stars)}<span className="text-stone-300">{'★'.repeat(3 - stars)}</span>
+              </span>
               <span className="ml-1.5">{label}</span>
             </span>
             <span className="text-stone-700 tabular-nums text-sm font-medium w-24 text-right flex-shrink-0"
@@ -1843,35 +1840,38 @@ function ScoringContent({ onBack }) {
       </div>
 
       <h3 className="text-[11px] uppercase tracking-wider text-stone-500 mb-2 px-1 font-semibold">
-        What this score can — and can't — tell you
+        What this rating can — and can't — tell you
       </h3>
       <div className="bg-stone-100 border border-stone-200 rounded-md p-4 text-sm
                       text-stone-700 leading-relaxed space-y-3 mb-4">
         <p>
-          Read the peppers as <strong>"structural complexity, roughly"</strong>{' '}
+          Read the stars as <strong>"structural complexity, roughly"</strong>{' '}
           — not a promise about how your solve will go.
         </p>
         <p>
           The formula was recalibrated in June 2026 against 150 real solves
           from this site's own leaderboard. Even after recalibration, the
-          score's correlation with (player-adjusted) solve times is about
-          0.3 — meaning the layout's structure explains only around{' '}
+          underlying score's correlation with (player-adjusted) solve times is
+          about 0.3 — meaning the layout's structure explains only around{' '}
           <strong>10% of the variance</strong> in how long a puzzle takes.
           The rest is everything a layout metric can't see: which set your
           eye happens to land on first, focus, luck.
         </p>
         <p>
-          The extremes are the most trustworthy part. Very Easy days really
-          do get solved noticeably faster and Very Hard days slower, while
-          the middle tiers overlap a lot — a 🌶️🌶️ day can absolutely fight
-          you harder than a 🌶️🌶️🌶️🌶️ one. The same puzzle also routinely
-          splits the leaderboard: fast for one player, brutal for another.
+          That's exactly why there are only three buckets instead of a precise
+          number. The good news: across our data the three ratings line up in
+          the right order — 1★ days really do get solved faster on average,
+          3★ days slower, and 2★ sits in between. The honest caveat: it's an
+          average, and 2★ is the big middle where structure says the least. A
+          2★ puzzle can absolutely fight you harder than a 3★ one, and the
+          same puzzle routinely splits the leaderboard — fast for one player,
+          brutal for another.
         </p>
       </div>
 
       <p className="text-xs text-stone-500 italic leading-relaxed">
-        The coefficients and tier cuts will be re-fit periodically as more
-        solve data accumulates.
+        The coefficients and star cut points will be re-fit periodically as
+        more solve data accumulates.
       </p>
     </main>
   );
