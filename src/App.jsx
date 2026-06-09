@@ -37,27 +37,35 @@ function findAllSets(cards) {
 }
 
 // ===== Puzzle difficulty scoring =====
-// Three structural metrics, independent of the player:
-//   avgVars: average number of varying attributes across all sets (1.0-4.0).
+// Structural metrics, independent of the player:
+//   avgVars: average number of varying attributes across the 6 sets (1.0-4.0).
 //     A set varying in only 1 attribute (e.g. three red solid ovals, just
-//     1/2/3 of them) is trivially easy to spot. A set varying in all 4
-//     attributes looks maximally different and is the hardest to recognize.
-//   decoys: number of cards that belong to no set at all. Decoys force
-//     players to actively dismiss cards, which costs scan time.
-//   membershipStd: standard deviation of set-counts per card. Hub cards
-//     (in many sets) create shortcuts — find one set, find several. So
-//     higher std means more clustered, which means *easier*; subtracted.
-// Raw composite = avgVars + 0.5 * decoys - 0.4 * membershipStd.
-// We then linearly normalize to a 0-10 scale using the empirical min/max
-// observed across 2M sampled valid 6-set puzzles — so the easiest possible
-// puzzle scores ~0 and the hardest scores ~10.
-// Thresholds (4.4 / 5.7) are set at the empirical tertiles, so Easy /
-// Medium / Hard each contain ~1/3 of all possible valid puzzles. Will be
-// recalibrated against real solve-time data once that exists.
-const RAW_SCORE_MIN = 1.028;  // empirical min raw composite (n=46,553)
-const RAW_SCORE_MAX = 4.820;  // empirical max raw composite
-const SCORE_TERTILE_LOW = 4.4;   // empirical p33 mapped onto 0-10
-const SCORE_TERTILE_HIGH = 5.7;  // empirical p67 mapped onto 0-10
+//     1/2/3 of them) is trivially easy to spot; one varying in all 4 looks
+//     maximally different and is the hardest to recognize.
+//   decoys: cards that belong to no set at all. Decoys force players to
+//     actively dismiss cards, which costs scan time. Empirically the
+//     strongest single predictor of real solve times.
+//   nCompact: number of sets whose three cards sit near each other in the
+//     4-column grid (sum of pairwise Chebyshev distances <= 4). Neighboring
+//     cards get compared more often, so compact sets are found sooner;
+//     subtracted.
+//
+// v2 (June 2026): recalibrated against 150 real solves (98 puzzle days,
+// players with 8+ plays, per-player normalized log solve times):
+//   raw = 0.75*avgVars + 1.0*decoys - 0.25*nCompact
+// Coefficients follow the fitted regression ratios. v1's membershipStd term
+// was dropped: its empirical sign was the opposite of the design assumption.
+// Correlation with normalized solve times is ~0.3 (v1 scored ~0.27), i.e.
+// layout structure explains roughly 10% of the variance in how long a puzzle
+// takes. ScoringContent carries the honest framing of that limit.
+const RAW_SCORE_MIN = 0.0;  // empirical min raw composite (n=30,000 sampled)
+const RAW_SCORE_MAX = 5.5;  // empirical max raw composite
+// Tier cut points on the 0-10 scale (ascending), set so the tiers cover
+// roughly 9% / 28% / 28% / 25% / 10% of all valid 6-set puzzles:
+const SCORE_CUT_VERY_EASY = 2.7;
+const SCORE_CUT_EASY      = 4.1;
+const SCORE_CUT_MEDIUM    = 5.2;
+const SCORE_CUT_HARD      = 7.7;
 
 function computePuzzleDifficulty(puzzle) {
   if (!puzzle || !puzzle.sets || !puzzle.cards) return null;
@@ -76,24 +84,34 @@ function computePuzzleDifficulty(puzzle) {
   }
   const avgVars = totalVars / sets.length;
 
-  // 2. Per-card memberships → decoys + spread
+  // 2. Per-card memberships -> decoys
   const memberships = new Array(cards.length).fill(0);
   for (const [i, j, k] of sets) { memberships[i]++; memberships[j]++; memberships[k]++; }
   const decoys = memberships.filter(m => m === 0).length;
-  const meanMem = memberships.reduce((s, m) => s + m, 0) / memberships.length;
-  const variance = memberships.reduce((s, m) => s + (m - meanMem) ** 2, 0) / memberships.length;
-  const membershipStd = Math.sqrt(variance);
 
-  // Raw composite, then normalize to 0-10 using empirical bounds.
+  // 3. Spatial compactness: card index i renders at grid (row i/4, col i%4).
+  // A set's spread = sum of pairwise Chebyshev distances between its cards;
+  // spread <= 4 means the three cards are roughly adjacent on screen.
+  const pos = (i) => [Math.floor(i / 4), i % 4];
+  const cheb = (p, q) => Math.max(Math.abs(p[0] - q[0]), Math.abs(p[1] - q[1]));
+  let nCompact = 0;
+  for (const [i, j, k] of sets) {
+    const [a, b, c] = [pos(i), pos(j), pos(k)];
+    if (cheb(a, b) + cheb(a, c) + cheb(b, c) <= 4) nCompact++;
+  }
+
+  // Raw composite, then normalize to 0-10 using empirical population bounds.
   // Clamp in case a puzzle scores slightly outside the sampled range.
-  const rawScore = avgVars + 0.5 * decoys - 0.4 * membershipStd;
+  const rawScore = 0.75 * avgVars + 1.0 * decoys - 0.25 * nCompact;
   const normalized = ((rawScore - RAW_SCORE_MIN) / (RAW_SCORE_MAX - RAW_SCORE_MIN)) * 10;
   const score = Math.max(0, Math.min(10, normalized));
-  const level = score < SCORE_TERTILE_LOW ? 'easy'
-              : score < SCORE_TERTILE_HIGH ? 'medium'
-              : 'hard';
+  const level = score < SCORE_CUT_VERY_EASY ? 'very-easy'
+              : score < SCORE_CUT_EASY      ? 'easy'
+              : score < SCORE_CUT_MEDIUM    ? 'medium'
+              : score < SCORE_CUT_HARD      ? 'hard'
+              :                               'very-hard';
 
-  return { avgVars, decoys, membershipStd, rawScore, score, level };
+  return { avgVars, decoys, nCompact, rawScore, score, level };
 }
 
 // ===== Seeded RNG =====
@@ -767,19 +785,24 @@ function StatCard({ label, value, sub, accent }) {
 // Shows pepper icons, optional label ("Medium"), and the score (out of 10).
 // When onClick is provided, renders as a button with a small info icon so it
 // reads as an interactive element that explains itself when tapped.
+// Five tiers: very-easy / easy / medium / hard / very-hard -> 1-5 peppers.
+const DIFFICULTY_TIERS = {
+  'very-easy': { peppers: '🌶️',          label: 'Very Easy' },
+  'easy':      { peppers: '🌶️🌶️',        label: 'Easy' },
+  'medium':    { peppers: '🌶️🌶️🌶️',      label: 'Medium' },
+  'hard':      { peppers: '🌶️🌶️🌶️🌶️',    label: 'Hard' },
+  'very-hard': { peppers: '🌶️🌶️🌶️🌶️🌶️',  label: 'Very Hard' },
+};
+
 function DifficultyBadge({ difficulty, showLabel = false, showScore = true,
                           onClick, className = '' }) {
   if (!difficulty) return null;
   const { level, score } = difficulty;
-  const peppers = level === 'easy' ? '🌶️'
-                : level === 'medium' ? '🌶️🌶️'
-                : '🌶️🌶️🌶️';
-  const label = level === 'easy' ? 'Easy'
-              : level === 'medium' ? 'Medium'
-              : 'Hard';
+  const tier = DIFFICULTY_TIERS[level] || DIFFICULTY_TIERS['medium'];
+  const { peppers, label } = tier;
   const inner = (
     <span className={`inline-flex items-baseline gap-1 ${className}`}>
-      <span aria-label={label}>{peppers}</span>
+      <span aria-label={label} style={{ whiteSpace: 'nowrap' }}>{peppers}</span>
       {showLabel && <span className="text-stone-600 font-medium">{label}</span>}
       {showScore && (
         <span className="text-stone-500 tabular-nums"
@@ -849,7 +872,10 @@ function GameContent({ puzzle, targetSets, time, foundSets, selected, flash,
           </div>
         )}
         <div className="text-xs text-stone-500 mt-1 flex items-center justify-center gap-2 flex-wrap">
-          {difficulty && (
+          {/* Difficulty stays hidden for today's puzzle until it's solved,
+              so it can't anchor expectations mid-solve. Archived puzzles
+              show it up front. */}
+          {difficulty && !isPlayingToday && (
             <>
               <DifficultyBadge difficulty={difficulty} showLabel
                                onClick={onOpenScoring} />
@@ -1300,11 +1326,8 @@ function ArchiveDetailStrip({ dateKey, info, MEDAL, RANK_WORD,
               {dateLong}
             </div>
           </div>
-          {difficulty && (
-            <div className="flex-shrink-0">
-              <DifficultyBadge difficulty={difficulty} onClick={onOpenScoring} />
-            </div>
-          )}
+          {/* No difficulty badge here: today's difficulty is hidden until
+              the puzzle is solved. */}
         </div>
         <button onClick={onPlay}
           className="w-full bg-red-700 hover:bg-red-800 text-white rounded-md
@@ -1715,20 +1738,19 @@ function ScoringContent({ onBack }) {
       <p className="text-stone-600 text-sm mb-5 leading-relaxed">
         Every puzzle gets a score from <strong>structural properties of the
         12-card layout itself</strong>, not from how long anyone took to solve
-        it. That keeps it honest — a 🌶️🌶️🌶️ today is comparable to a
-        🌶️🌶️🌶️ a year ago.
+        it. The same layout always gets the same score, so ratings are
+        comparable across days and across players.
       </p>
 
       <div className="bg-white rounded-md border border-stone-300 p-3 mb-2
                       text-sm text-stone-800 tabular-nums text-center overflow-x-auto"
            style={{ fontFamily: '"Menlo", monospace' }}>
-        score = ((raw − 1.028) / 3.792) × 10
+        score = (raw / 5.5) × 10
       </div>
       <p className="text-xs text-stone-500 mb-5 text-center leading-relaxed">
-        where <span className="font-mono">raw = avgVars + 0.5 × decoys − 0.4 × membershipStd</span>.{' '}
-        The raw composite is normalized against the empirical min (1.028) and max
-        (4.820) observed across ~46,500 sampled valid 6-set puzzles, so the
-        easiest possible puzzle scores ~0 and the hardest ~10.
+        where <span className="font-mono">raw = 0.75 × avgVars + 1.0 × decoys − 0.25 × nCompact</span>.{' '}
+        The raw composite spans roughly 0–5.5 across all valid 6-set layouts,
+        so the easiest possible puzzle scores ~0 and the hardest ~10.
       </p>
 
       <section className="mb-4">
@@ -1758,7 +1780,9 @@ function ScoringContent({ onBack }) {
         </h3>
         <p className="text-sm text-stone-700 leading-relaxed">
           Cards that don't belong to any set still have to be visually
-          evaluated and dismissed. More decoys means more wasted scanning.{' '}
+          evaluated and dismissed — wasted scanning. In this site's real solve
+          data, decoys are by far the strongest single predictor of how long
+          a puzzle takes, which is why they carry the largest weight.{' '}
           <strong>Higher = harder.</strong>
         </p>
       </section>
@@ -1766,72 +1790,88 @@ function ScoringContent({ onBack }) {
       <section className="mb-5">
         <h3 className="font-semibold text-stone-800 mb-1"
             style={{ fontFamily: '"Georgia", serif' }}>
-          membershipStd
+          nCompact
           <span className="text-stone-400 font-normal text-sm ml-1">
-            — how clustered the sets are
+            — sets whose cards sit close together
           </span>
         </h3>
         <p className="text-sm text-stone-700 leading-relaxed">
-          The standard deviation of "how many sets each card belongs to." If a
-          few "hub" cards appear in many sets, finding one set tends to reveal
-          several others — your eye is already on those cards. Even spread =
-          no shortcuts. <strong>Higher = easier</strong> (so it's subtracted).
+          Counts the sets whose three cards land near each other in the
+          4-column grid. Your eye naturally compares neighboring cards first,
+          so tightly clustered sets tend to get found sooner.{' '}
+          <strong>Higher = easier</strong> (so it's subtracted).
         </p>
       </section>
 
       <h3 className="text-[11px] uppercase tracking-wider text-stone-500 mb-2 px-1 font-semibold">
-        Thresholds
+        Tiers
       </h3>
       <p className="text-xs text-stone-500 mb-2 leading-relaxed">
-        Set at the empirical tertiles across ~46,500 sampled valid 6-set
-        puzzles, so each level contains roughly a third of all possible puzzles.
+        Cut points are set against the distribution of all valid 6-set
+        layouts, shaped like a bell: the extreme tiers are rare (~10% each),
+        the middle three cover the rest.
       </p>
-      <div className="bg-white rounded-md border border-stone-300 divide-y divide-stone-200 mb-4">
+      <div className="bg-white rounded-md border border-stone-300 divide-y divide-stone-200 mb-5">
         <div className="px-4 py-1.5 flex items-center gap-3 bg-stone-50
                         text-[10px] uppercase tracking-wider text-stone-500 font-semibold">
           <span className="flex-1">Level</span>
-          <span className="w-20 text-right">Range</span>
-          <span className="w-28 text-right">Threshold</span>
+          <span className="w-24 text-right">Score range</span>
+          <span className="w-16 text-right">Share</span>
         </div>
-        <div className="px-4 py-2.5 flex items-center gap-3">
-          <span className="text-sm flex-1">🌶️ <span className="ml-1">Easy</span></span>
-          <span className="text-stone-700 tabular-nums text-sm font-medium w-20 text-right"
-                style={{ fontFamily: '"Menlo", monospace' }}>
-            0.0 – 4.4
-          </span>
-          <span className="text-stone-400 tabular-nums text-xs w-28 text-right"
-                style={{ fontFamily: '"Menlo", monospace' }}>
-            score &lt; 4.4
-          </span>
-        </div>
-        <div className="px-4 py-2.5 flex items-center gap-3">
-          <span className="text-sm flex-1">🌶️🌶️ <span className="ml-1">Medium</span></span>
-          <span className="text-stone-700 tabular-nums text-sm font-medium w-20 text-right"
-                style={{ fontFamily: '"Menlo", monospace' }}>
-            4.4 – 5.7
-          </span>
-          <span className="text-stone-400 tabular-nums text-xs w-28 text-right"
-                style={{ fontFamily: '"Menlo", monospace' }}>
-            4.4 ≤ score &lt; 5.7
-          </span>
-        </div>
-        <div className="px-4 py-2.5 flex items-center gap-3">
-          <span className="text-sm flex-1">🌶️🌶️🌶️ <span className="ml-1">Hard</span></span>
-          <span className="text-stone-700 tabular-nums text-sm font-medium w-20 text-right"
-                style={{ fontFamily: '"Menlo", monospace' }}>
-            5.7 – 10.0
-          </span>
-          <span className="text-stone-400 tabular-nums text-xs w-28 text-right"
-                style={{ fontFamily: '"Menlo", monospace' }}>
-            score ≥ 5.7
-          </span>
-        </div>
+        {[
+          ['🌶️', 'Very Easy', '0.0 – 2.7', '~9%'],
+          ['🌶️🌶️', 'Easy', '2.7 – 4.1', '~28%'],
+          ['🌶️🌶️🌶️', 'Medium', '4.1 – 5.2', '~28%'],
+          ['🌶️🌶️🌶️🌶️', 'Hard', '5.2 – 7.7', '~25%'],
+          ['🌶️🌶️🌶️🌶️🌶️', 'Very Hard', '7.7 – 10.0', '~10%'],
+        ].map(([peppers, label, range, share]) => (
+          <div key={label} className="px-4 py-2.5 flex items-center gap-3">
+            <span className="text-sm flex-1 min-w-0">
+              <span style={{ whiteSpace: 'nowrap' }}>{peppers}</span>
+              <span className="ml-1.5">{label}</span>
+            </span>
+            <span className="text-stone-700 tabular-nums text-sm font-medium w-24 text-right flex-shrink-0"
+                  style={{ fontFamily: '"Menlo", monospace' }}>
+              {range}
+            </span>
+            <span className="text-stone-400 tabular-nums text-xs w-16 text-right flex-shrink-0"
+                  style={{ fontFamily: '"Menlo", monospace' }}>
+              {share}
+            </span>
+          </div>
+        ))}
+      </div>
+
+      <h3 className="text-[11px] uppercase tracking-wider text-stone-500 mb-2 px-1 font-semibold">
+        What this score can — and can't — tell you
+      </h3>
+      <div className="bg-stone-100 border border-stone-200 rounded-md p-4 text-sm
+                      text-stone-700 leading-relaxed space-y-3 mb-4">
+        <p>
+          Read the peppers as <strong>"structural complexity, roughly"</strong>{' '}
+          — not a promise about how your solve will go.
+        </p>
+        <p>
+          The formula was recalibrated in June 2026 against 150 real solves
+          from this site's own leaderboard. Even after recalibration, the
+          score's correlation with (player-adjusted) solve times is about
+          0.3 — meaning the layout's structure explains only around{' '}
+          <strong>10% of the variance</strong> in how long a puzzle takes.
+          The rest is everything a layout metric can't see: which set your
+          eye happens to land on first, focus, luck.
+        </p>
+        <p>
+          The extremes are the most trustworthy part. Very Easy days really
+          do get solved noticeably faster and Very Hard days slower, while
+          the middle tiers overlap a lot — a 🌶️🌶️ day can absolutely fight
+          you harder than a 🌶️🌶️🌶️🌶️ one. The same puzzle also routinely
+          splits the leaderboard: fast for one player, brutal for another.
+        </p>
       </div>
 
       <p className="text-xs text-stone-500 italic leading-relaxed">
-        The coefficients (0.5, 0.4) and thresholds are first-pass estimates.
-        As solve-time data accumulates, they'll be recalibrated against what
-        actually predicts how hard humans find each puzzle.
+        The coefficients and tier cuts will be re-fit periodically as more
+        solve data accumulates.
       </p>
     </main>
   );
