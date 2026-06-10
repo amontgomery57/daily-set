@@ -36,6 +36,17 @@ function findAllSets(cards) {
   return sets;
 }
 
+// 4-char mask of which attributes are all-different in a set, in the order
+// color,shape,shading,number ('1' = all-differ, '0' = all-same). E.g. three
+// red solid ovals in counts 1/2/3 -> "0001".
+function setDiffMask(a, b, c) {
+  let m = '';
+  for (const attr of ['color', 'shape', 'shading', 'number']) {
+    m += new Set([a[attr], b[attr], c[attr]]).size === 3 ? '1' : '0';
+  }
+  return m;
+}
+
 // ===== Puzzle difficulty scoring =====
 // Structural metrics, independent of the player:
 //   avgVars: average number of varying attributes across the 6 sets (1.0-4.0).
@@ -349,8 +360,9 @@ const Storage = {
     }
     return lsListResults();
   },
-  async saveResult(dateKey, name, time) {
+  async saveResult(dateKey, name, time, splits) {
     const payload = { time, completedAt: Date.now() };
+    if (splits && splits.length) payload.splits = splits;
     if (USE_SUPABASE) {
       lsSetResult(dateKey, payload);
       try {
@@ -360,6 +372,7 @@ const Storage = {
           body: JSON.stringify({
             date: dateKey, name,
             time_seconds: time, completed_at: payload.completedAt,
+            splits: payload.splits || null,
           }),
         });
       } catch (e) { console.error('saveResult:', e); }
@@ -428,6 +441,7 @@ const Storage = {
               date, name: playerName,
               time_seconds: payload.time,
               completed_at: payload.completedAt || Date.now(),
+              splits: payload.splits || null,
             }),
           });
           pushed++;
@@ -2439,6 +2453,7 @@ export default function App() {
   const flashTimer = useRef(null);
   const startTimeRef = useRef(null);
   const accumulatedMsRef = useRef(0);
+  const splitsRef = useRef([]);   // per-set {t, idx, mask} for the active puzzle
 
   // Timer is running unless the user actively pressed Pause.
   const [userPaused, setUserPaused] = useState(false);
@@ -2496,6 +2511,7 @@ export default function App() {
     setUserPaused(false);  // fresh puzzle: ready to play
     accumulatedMsRef.current = 0;
     startTimeRef.current = null;
+    splitsRef.current = [];
 
     // Persist the puzzle cards (idempotent in Supabase; useful for any future
     // analysis even if no one finishes today's puzzle).
@@ -2587,6 +2603,17 @@ export default function App() {
         setFlash('dup');
         flashTimer.current = setTimeout(() => { setSelected([]); setFlash(null); }, 900);
       } else {
+        // Record the split for this set: elapsed active solve time (same
+        // pause-aware clock as the final time), card indices, and the set's
+        // differing-attribute mask. Stored with the result for later
+        // analysis of find-order vs set type.
+        const elapsedMs = accumulatedMsRef.current +
+          (startTimeRef.current !== null ? Date.now() - startTimeRef.current : 0);
+        splitsRef.current.push({
+          t: Math.round(elapsedMs / 10) / 100,
+          idx: sorted,
+          mask: setDiffMask(puzzle.cards[i], puzzle.cards[j], puzzle.cards[k]),
+        });
         const next = [...foundSets, { key, indices: sorted }];
         setFoundSets(next);
         setSelected([]);
@@ -2600,8 +2627,9 @@ export default function App() {
           const finalTime = Math.round(accumulatedMsRef.current / 10) / 100;
           setTime(finalTime);
           const newResult = { time: finalTime, completedAt: Date.now() };
+          const splits = splitsRef.current;
           (async () => {
-            await Storage.saveResult(activeDate, name, finalTime);
+            await Storage.saveResult(activeDate, name, finalTime, splits);
             setCurrentResult(newResult);
             setMyResults((prev) => ({ ...prev, [activeDate]: newResult }));
             const lb = await Storage.loadLeaderboard(activeDate);
