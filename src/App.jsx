@@ -80,6 +80,21 @@ function survivorPoisonSet(board) {
 }
 const SURVIVOR_MAX_PASSES = 10;
 
+// ===== Weekly Puzzle rotation =====
+// One puzzle type per ISO week. Add new types here as they ship (e.g.
+// 'fourteen', 'magic-plane', 'needle', 'hub') and they enter the cycle.
+// NOTE: the (y*53+w) index is fine while the rotation has one entry; when
+// it grows, switch to a Monday-epoch week count so the cycle is seamless
+// across year boundaries.
+const WEEKLY_ROTATION = ['survivor'];
+const WEEKLY_TYPE_META = {
+  survivor: { title: 'Survivor', unit: 'cards' },
+};
+function weeklyTypeForKey(weekKey) {
+  const [y, w] = weekKey.split('-W').map(Number);
+  return WEEKLY_ROTATION[(y * 53 + w) % WEEKLY_ROTATION.length];
+}
+
 // 4-char mask of which attributes are all-different in a set, in the order
 // color,shape,shading,number ('1' = all-differ, '0' = all-same). E.g. three
 // red solid ovals in counts 1/2/3 -> "0001".
@@ -777,7 +792,7 @@ function TabBar({ activeTab, onChange }) {
   const tabs = [
     { id: 'game', label: "Today's Puzzle" },
     { id: 'archives', label: 'Archives' },
-    { id: 'survivor', label: 'Survivor' },
+    { id: 'survivor', label: 'Weekly Puzzle' },
     { id: 'stats', label: 'Stats' },
   ];
   return (
@@ -1817,9 +1832,11 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
         <>
           <div className="flex items-baseline justify-between mb-1.5 px-1">
             <span className="text-[11px] uppercase tracking-wider text-stone-500 font-semibold">
-              Weekly Survivor · {weekKey}
+              Weekly Puzzle · {weekKey}
             </span>
-            <span className="text-[10px] text-stone-400">best of unlimited tries · resets Mon UTC</span>
+            <span className="text-[10px] text-stone-400">
+              this week: {WEEKLY_TYPE_META[weeklyTypeForKey(weekKey)].title} · resets Mon UTC
+            </span>
           </div>
           <div className="bg-white rounded-md shadow-sm overflow-hidden mb-4">
             {survivorWeek === null ? (
@@ -1872,8 +1889,9 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
               survivorPast.map((c) => (
                 <div key={c.week}
                      className="flex items-center justify-between px-3 py-2 border-t border-stone-100 first:border-t-0">
-                  <span className="text-[12px] text-stone-500 font-mono" style={{ fontFamily: '"Menlo", monospace' }}>
-                    {c.week}
+                  <span className="text-[12px] text-stone-500 min-w-0">
+                    <span className="font-mono" style={{ fontFamily: '"Menlo", monospace' }}>{c.week}</span>
+                    <span className="text-stone-400 text-[10px]"> · {WEEKLY_TYPE_META[weeklyTypeForKey(c.week)].title}</span>
                   </span>
                   <span className="text-sm">
                     🏆{' '}
@@ -2429,12 +2447,18 @@ function SurvivorContent({ name, onPlayerClick }) {
     <main className="flex-1 p-3 max-w-md w-full mx-auto">
       <div className="text-center mb-3">
         <h2 className="text-xl font-bold text-stone-900" style={{ fontFamily: '"Georgia", serif' }}>
-          Weekly <span className="text-red-700 italic">Survivor</span>
+          Weekly <span className="text-red-700 italic">Puzzle</span>
         </h2>
+        <div className="mt-1.5 mb-1">
+          <span className="inline-block bg-red-700 text-white text-[10px] uppercase tracking-widest
+                           font-bold px-2.5 py-1 rounded-full">
+            This week: Survivor
+          </span>
+        </div>
         <p className="text-[11.5px] text-stone-500 mt-1 leading-snug">
           Build the biggest board with <strong>no set</strong>. Keep or pass each
           card; a kept card that completes a set ends the run. Unlimited tries —
-          your best this week counts. Resets Monday 00:00 UTC
+          your best this week counts. A new puzzle type arrives Monday 00:00 UTC
           ({daysLeft} {daysLeft === 1 ? 'day' : 'days'} left).
         </p>
       </div>
