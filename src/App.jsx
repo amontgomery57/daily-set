@@ -36,6 +36,50 @@ function findAllSets(cards) {
   return sets;
 }
 
+// ===== Weekly Survivor helpers =====
+// Cards as ints 0..80 (base-3 digits = color,shape,shading,number) with a
+// precomputed pair-completion table: SURV_THIRD[a][b] = the unique card
+// completing a set with a and b. decodeCard maps an int to the card-object
+// shape the visual components already use.
+const SURV_DIGITS = [];
+for (let c = 0; c < 81; c++) {
+  let x = c; const d = [];
+  for (let i = 0; i < 4; i++) { d.push(x % 3); x = (x / 3) | 0; }
+  SURV_DIGITS.push(d);
+}
+const SURV_THIRD = Array.from({ length: 81 }, () => new Int8Array(81));
+for (let a = 0; a < 81; a++) for (let b = 0; b < 81; b++) {
+  if (a === b) continue;
+  let code = 0, mul = 1;
+  for (let i = 0; i < 4; i++) {
+    const t = (6 - SURV_DIGITS[a][i] - SURV_DIGITS[b][i]) % 3;
+    code += t * mul; mul *= 3;
+  }
+  SURV_THIRD[a][b] = code;
+}
+function decodeCard(c) {
+  const d = SURV_DIGITS[c];
+  return { color: COLOR_KEYS[d[0]], shape: SHAPES[d[1]], shading: SHADINGS[d[2]], number: NUMBERS[d[3]] };
+}
+function survivorShuffledDeck() {
+  const a = Array.from({ length: 81 }, (_, i) => i);
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+// every card that would complete a set with some pair on the board
+function survivorPoisonSet(board) {
+  const p = new Set();
+  for (let i = 0; i < board.length; i++)
+    for (let j = i + 1; j < board.length; j++)
+      p.add(SURV_THIRD[board[i]][board[j]]);
+  for (const c of board) p.delete(c);
+  return p;
+}
+const SURVIVOR_MAX_PASSES = 10;
+
 // 4-char mask of which attributes are all-different in a set, in the order
 // color,shape,shading,number ('1' = all-differ, '0' = all-same). E.g. three
 // red solid ovals in counts 1/2/3 -> "0001".
@@ -229,6 +273,25 @@ function shortWeekday(dateKey, upper = false) {
     weekday: 'short', timeZone: 'UTC',
   });
   return upper ? s.toUpperCase() : s;
+}
+
+// ISO-8601 week key in UTC (weeks run Mon 00:00 UTC to Sun 24:00 UTC),
+// e.g. '2026-W24'. Used to bucket Weekly Survivor scores.
+function utcIsoWeekKey(d = new Date()) {
+  const date = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  const day = date.getUTCDay() || 7;             // Mon=1..Sun=7
+  date.setUTCDate(date.getUTCDate() + 4 - day);  // shift to nearest Thursday
+  const yearStart = new Date(Date.UTC(date.getUTCFullYear(), 0, 1));
+  const week = Math.ceil(((date - yearStart) / 86400000 + 1) / 7);
+  return `${date.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
+}
+function msUntilNextUtcMonday() {
+  const now = new Date();
+  const day = now.getUTCDay() || 7;              // Mon=1..Sun=7
+  const next = new Date(now);
+  next.setUTCDate(now.getUTCDate() + (8 - day));
+  next.setUTCHours(0, 0, 0, 0);
+  return next.getTime() - now.getTime();
 }
 
 // ===== Storage backend =====
@@ -456,6 +519,60 @@ const Storage = {
       return { pushed: 0 };
     }
   },
+  // --- Weekly Survivor ---
+  async saveSurvivorResult(week, name, score, passesUsed, board) {
+    if (!USE_SUPABASE) return;
+    try {
+      await sbFetch('/survivor_results', {
+        method: 'POST',
+        headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify({
+          week, name, score, passes_used: passesUsed,
+          board, completed_at: Date.now(),
+        }),
+      });
+    } catch (e) { console.error('saveSurvivorResult:', e); }
+  },
+  // Best score per player for one week, with attempt counts.
+  async loadSurvivorWeek(week) {
+    if (!USE_SUPABASE) return [];
+    try {
+      const rows = await sbFetch(
+        `/survivor_results?week=eq.${encodeURIComponent(week)}&select=name,score,passes_used,completed_at`
+      );
+      const byName = {};
+      for (const r of rows || []) {
+        const cur = byName[r.name];
+        if (!cur) byName[r.name] = { name: r.name, best: r.score, attempts: 1, bestAt: r.completed_at };
+        else {
+          cur.attempts++;
+          if (r.score > cur.best || (r.score === cur.best && r.completed_at < cur.bestAt)) {
+            cur.best = r.score; cur.bestAt = r.completed_at;
+          }
+        }
+      }
+      // rank: score desc, earlier best wins ties
+      return Object.values(byName).sort((a, b) => b.best - a.best || a.bestAt - b.bestAt);
+    } catch { return []; }
+  },
+  // Past champions: winner per week (excluding the given current week).
+  async loadSurvivorChampions(excludeWeek) {
+    if (!USE_SUPABASE) return [];
+    try {
+      const rows = await sbFetch(
+        '/survivor_results?select=week,name,score,completed_at&order=week.desc&limit=5000'
+      );
+      const byWeek = {};
+      for (const r of rows || []) {
+        if (r.week === excludeWeek) continue;
+        const cur = byWeek[r.week];
+        if (!cur || r.score > cur.score || (r.score === cur.score && r.completed_at < cur.completed_at)) {
+          byWeek[r.week] = r;
+        }
+      }
+      return Object.values(byWeek).sort((a, b) => b.week.localeCompare(a.week));
+    } catch { return []; }
+  },
   async loadLeaderboard(dateKey) {
     if (USE_SUPABASE) {
       try {
@@ -660,6 +777,7 @@ function TabBar({ activeTab, onChange }) {
   const tabs = [
     { id: 'game', label: "Today's Puzzle" },
     { id: 'archives', label: 'Archives' },
+    { id: 'survivor', label: 'Survivor' },
     { id: 'stats', label: 'Stats' },
   ];
   return (
@@ -1471,7 +1589,16 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
   const [showVisitors, setShowVisitors] = useState(false);
   const [daysShown, setDaysShown] = useState(DAYS_PAGE);
   const [expandedDays, setExpandedDays] = useState(() => new Set());
+  // Weekly Survivor standings (lazy: fetched when the tab is first opened)
+  const [survivorWeek, setSurvivorWeek] = useState(null);
+  const [survivorPast, setSurvivorPast] = useState(null);
+  const weekKey = utcIsoWeekKey();
   useEffect(() => { Storage.loadAllHistory().then(setHistory); }, []);
+  useEffect(() => {
+    if (tab !== 'weekly' || survivorWeek !== null) return;
+    Storage.loadSurvivorWeek(weekKey).then(setSurvivorWeek);
+    Storage.loadSurvivorChampions(weekKey).then(setSurvivorPast);
+  }, [tab, survivorWeek, weekKey]);
 
   const dates = useMemo(
     () => (history ? Object.keys(history).sort().reverse() : []),
@@ -1586,6 +1713,7 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
         {[
           { id: 'days', label: 'Day by day' },
           { id: 'players', label: 'Players' },
+          { id: 'weekly', label: 'Weekly' },
         ].map((t) => (
           <button key={t.id} onClick={() => setTab(t.id)}
             className={`flex-1 py-1.5 rounded-md text-sm font-semibold transition-colors
@@ -1682,6 +1810,85 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
           <p className="text-[10px] text-stone-400 text-center mt-2 px-2">
             sparkline = last 7 solves, lower is better · pills = your average by difficulty
           </p>
+        </>
+      )}
+
+      {tab === 'weekly' && (
+        <>
+          <div className="flex items-baseline justify-between mb-1.5 px-1">
+            <span className="text-[11px] uppercase tracking-wider text-stone-500 font-semibold">
+              Weekly Survivor · {weekKey}
+            </span>
+            <span className="text-[10px] text-stone-400">best of unlimited tries · resets Mon UTC</span>
+          </div>
+          <div className="bg-white rounded-md shadow-sm overflow-hidden mb-4">
+            {survivorWeek === null ? (
+              <div className="text-center text-stone-400 text-sm py-4">Loading…</div>
+            ) : survivorWeek.length === 0 ? (
+              <div className="text-center text-stone-400 text-sm italic py-4">
+                No Survivor runs yet this week.
+              </div>
+            ) : (
+              survivorWeek.map((r, i) => {
+                const isMe = r.name === currentName;
+                const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : null;
+                return (
+                  <div key={r.name}
+                       className={`flex items-center justify-between px-3 py-2 border-t border-stone-100 first:border-t-0
+                                  ${isMe ? 'bg-red-50' : ''}`}>
+                    <span className="flex items-center gap-2 min-w-0">
+                      <span className="text-base w-5 inline-block text-center flex-shrink-0">
+                        {medal || <span className="text-stone-400 text-sm">{i + 1}</span>}
+                      </span>
+                      <button onClick={() => onPlayerClick(r.name)}
+                              className={`text-sm font-medium truncate hover:underline underline-offset-2 text-left
+                                         ${isMe ? 'text-red-800' : 'text-stone-800'}`}>
+                        {r.name}{isMe && <span className="text-stone-400 font-normal"> (you)</span>}
+                      </button>
+                    </span>
+                    <span className="text-sm flex-shrink-0 ml-2">
+                      <span className="font-bold text-stone-800 tabular-nums">{r.best}</span>
+                      <span className="text-stone-400 text-[11px]"> cards · {r.attempts} {r.attempts === 1 ? 'try' : 'tries'}</span>
+                    </span>
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          <div className="flex items-baseline justify-between mb-1.5 px-1">
+            <span className="text-[11px] uppercase tracking-wider text-stone-500 font-semibold">
+              Past champions
+            </span>
+          </div>
+          <div className="bg-white rounded-md shadow-sm overflow-hidden">
+            {survivorPast === null ? (
+              <div className="text-center text-stone-400 text-sm py-4">Loading…</div>
+            ) : survivorPast.length === 0 ? (
+              <div className="text-center text-stone-400 text-sm italic py-4">
+                No completed weeks yet — this is week one.
+              </div>
+            ) : (
+              survivorPast.map((c) => (
+                <div key={c.week}
+                     className="flex items-center justify-between px-3 py-2 border-t border-stone-100 first:border-t-0">
+                  <span className="text-[12px] text-stone-500 font-mono" style={{ fontFamily: '"Menlo", monospace' }}>
+                    {c.week}
+                  </span>
+                  <span className="text-sm">
+                    🏆{' '}
+                    <button onClick={() => onPlayerClick(c.name)}
+                            className={`font-medium hover:underline underline-offset-2
+                                       ${c.name === currentName ? 'text-red-800' : 'text-stone-800'}`}>
+                      {c.name}
+                    </button>{' '}
+                    <span className="font-bold text-stone-800 tabular-nums">{c.score}</span>
+                    <span className="text-stone-400 text-[11px]"> cards</span>
+                  </span>
+                </div>
+              ))
+            )}
+          </div>
         </>
       )}
 
@@ -2135,6 +2342,271 @@ function buildDiffHistogramSvg() {
 
 const SETCOUNT_SVG = buildSetCountSvg();
 const DIFF_HISTOGRAM_SVG = buildDiffHistogramSvg();
+
+// ===== Weekly Survivor =====
+// Arcade weekly: build the biggest set-free board from a freshly shuffled
+// deck (random each attempt — a fixed weekly deck would reward memorizing
+// the order). Keep or pass each dealt card; 10 passes per run; keeping a
+// card that completes a set with two board cards ends the run. Scores
+// bucket into ISO weeks (Mon 00:00 UTC reset); leaderboard takes each
+// player's best. Every attempt is stored for later analysis.
+function SurvivorContent({ name, onPlayerClick }) {
+  const week = utcIsoWeekKey();
+  const [deck, setDeck] = useState(() => survivorShuffledDeck());
+  const [pos, setPos] = useState(0);
+  const [board, setBoard] = useState([]);
+  const [passes, setPasses] = useState(SURVIVOR_MAX_PASSES);
+  const [dead, setDead] = useState(null);        // { card, sets }
+  const [saving, setSaving] = useState(false);
+  const [weekBoard, setWeekBoard] = useState(null);  // weekly leaderboard rows
+
+  const current = pos < deck.length ? deck[pos] : null;
+  const poison = useMemo(() => survivorPoisonSet(board), [board]);
+  const remaining = deck.length - pos - (current !== null ? 1 : 0);
+  const poisonLeft = useMemo(() => {
+    let n = 0;
+    for (let i = pos + 1; i < deck.length; i++) if (poison.has(deck[i])) n++;
+    return n;
+  }, [deck, pos, poison]);
+
+  const refreshWeek = () => { Storage.loadSurvivorWeek(week).then(setWeekBoard); };
+  useEffect(refreshWeek, [week]);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  const deckExhausted = current === null && !dead;
+  const runOver = Boolean(dead) || deckExhausted;
+
+  // Persist the attempt exactly once when a run ends.
+  const savedRef = useRef(false);
+  useEffect(() => {
+    if (!runOver || savedRef.current || !name) return;
+    savedRef.current = true;
+    setSaving(true);
+    (async () => {
+      await Storage.saveSurvivorResult(week, name, board.length, SURVIVOR_MAX_PASSES - passes, board);
+      const rows = await Storage.loadSurvivorWeek(week);
+      setWeekBoard(rows);
+      setSaving(false);
+    })();
+  }, [runOver, name, week, board, passes]);
+
+  const keep = () => {
+    if (current === null || dead) return;
+    if (poison.has(current)) {
+      const sets = [];
+      for (let i = 0; i < board.length; i++)
+        for (let j = i + 1; j < board.length; j++)
+          if (SURV_THIRD[board[i]][board[j]] === current) sets.push([board[i], board[j], current]);
+      setDead({ card: current, sets });
+      return;
+    }
+    setBoard((b) => [...b, current]);
+    setPos((p) => p + 1);
+  };
+
+  const pass = () => {
+    if (current === null || dead || passes <= 0) return;
+    setPasses((p) => p - 1);
+    setPos((p) => p + 1);
+  };
+
+  const reset = () => {
+    setDeck(survivorShuffledDeck());
+    setPos(0); setBoard([]); setPasses(SURVIVOR_MAX_PASSES); setDead(null);
+    savedRef.current = false;
+  };
+
+  const killCards = useMemo(() => {
+    if (!dead) return new Set();
+    const s = new Set();
+    for (const trio of dead.sets) for (const c of trio) s.add(c);
+    return s;
+  }, [dead]);
+
+  const myBest = weekBoard ? weekBoard.find((r) => r.name === name) : null;
+  const daysLeft = Math.ceil(msUntilNextUtcMonday() / 86400000);
+
+  return (
+    <main className="flex-1 p-3 max-w-md w-full mx-auto">
+      <div className="text-center mb-3">
+        <h2 className="text-xl font-bold text-stone-900" style={{ fontFamily: '"Georgia", serif' }}>
+          Weekly <span className="text-red-700 italic">Survivor</span>
+        </h2>
+        <p className="text-[11.5px] text-stone-500 mt-1 leading-snug">
+          Build the biggest board with <strong>no set</strong>. Keep or pass each
+          card; a kept card that completes a set ends the run. Unlimited tries —
+          your best this week counts. Resets Monday 00:00 UTC
+          ({daysLeft} {daysLeft === 1 ? 'day' : 'days'} left).
+        </p>
+      </div>
+
+      {/* status strip */}
+      <div className="bg-white rounded-md shadow-sm flex divide-x divide-stone-100 text-center mb-3">
+        <div className="flex-1 py-2">
+          <div className="text-lg font-bold text-stone-800 tabular-nums leading-none">{board.length}</div>
+          <div className="text-[8.5px] uppercase tracking-wider text-stone-500 font-bold mt-0.5">on board</div>
+        </div>
+        <div className="flex-1 py-2">
+          <div className={`text-lg font-bold tabular-nums leading-none ${passes <= 2 ? 'text-red-700' : 'text-stone-800'}`}>{passes}</div>
+          <div className="text-[8.5px] uppercase tracking-wider text-stone-500 font-bold mt-0.5">passes left</div>
+        </div>
+        <div className="flex-1 py-2">
+          <div className="text-lg font-bold text-stone-800 tabular-nums leading-none">
+            {poisonLeft}<span className="text-[11px] text-stone-400 font-normal">/{remaining}</span>
+          </div>
+          <div className="text-[8.5px] uppercase tracking-wider text-stone-500 font-bold mt-0.5">poison in deck</div>
+        </div>
+        <div className="flex-1 py-2">
+          <div className="text-lg font-bold text-stone-800 tabular-nums leading-none">{myBest ? myBest.best : '—'}</div>
+          <div className="text-[8.5px] uppercase tracking-wider text-stone-500 font-bold mt-0.5">week best</div>
+        </div>
+      </div>
+
+      {/* dealt card / end states */}
+      {dead ? (
+        <div className="bg-white rounded-xl shadow-md border-2 border-red-200 p-4 text-center mb-3">
+          <div className="text-3xl mb-1">💀</div>
+          <h3 className="text-lg font-bold text-stone-900" style={{ fontFamily: '"Georgia", serif' }}>
+            That card made a set.
+          </h3>
+          <p className="text-sm text-stone-600 mt-1 mb-2">
+            You survived to <strong className="text-red-700">{board.length}</strong> cards
+            {dead.sets.length > 1 && ` — and it completed ${dead.sets.length} sets at once`}.
+          </p>
+          <div className="inline-block mb-1" style={{ width: '84px' }}>
+            <div style={{ aspectRatio: '4 / 3' }}
+                 className="relative w-full rounded-lg border-2 border-red-500 ring-2 ring-red-300 bg-white overflow-hidden shadow">
+              <CardBody card={decodeCard(dead.card)} />
+            </div>
+          </div>
+          <p className="text-[11px] text-stone-400 mb-3">
+            {saving ? 'saving score…' : `the killing set${dead.sets.length > 1 ? 's are' : ' is'} highlighted below`}
+          </p>
+          <button onClick={reset}
+            className="px-7 py-2.5 bg-red-700 hover:bg-red-800 text-white rounded-md font-semibold transition-colors">
+            Play again
+          </button>
+        </div>
+      ) : deckExhausted ? (
+        <div className="bg-white rounded-xl shadow-md border-2 border-green-200 p-4 text-center mb-3">
+          <div className="text-3xl mb-1">🏆</div>
+          <h3 className="text-lg font-bold text-stone-900" style={{ fontFamily: '"Georgia", serif' }}>
+            Deck exhausted — you out-survived it!
+          </h3>
+          <p className="text-sm text-stone-600 mt-1 mb-3">
+            {board.length} cards, no set. {saving ? 'Saving…' : 'Remarkable.'}
+          </p>
+          <button onClick={reset}
+            className="px-7 py-2.5 bg-red-700 hover:bg-red-800 text-white rounded-md font-semibold transition-colors">
+            Play again
+          </button>
+        </div>
+      ) : (
+        <div className="bg-white rounded-xl shadow-md p-4 mb-3">
+          <div className="text-[10px] uppercase tracking-wider text-stone-400 font-bold text-center mb-2">
+            Card {pos + 1} of {deck.length} — keep it or pass?
+          </div>
+          <div className="flex items-center justify-center gap-3">
+            <button onClick={pass} disabled={passes <= 0}
+              className="px-4 py-2.5 rounded-md font-semibold text-sm bg-stone-100 text-stone-600
+                         hover:bg-stone-200 disabled:opacity-35 disabled:cursor-not-allowed transition-colors">
+              Pass ({passes})
+            </button>
+            <div style={{ width: '104px' }} className="flex-shrink-0">
+              <div style={{ aspectRatio: '4 / 3' }}
+                   className="relative w-full rounded-lg border-2 border-stone-300 bg-white overflow-hidden shadow">
+                <CardBody card={decodeCard(current)} />
+              </div>
+            </div>
+            <button onClick={keep}
+              className="px-4 py-2.5 rounded-md font-semibold text-sm bg-red-700 text-white hover:bg-red-800 transition-colors">
+              Keep it
+            </button>
+          </div>
+          <p className="text-[10px] text-stone-400 text-center mt-2 italic">
+            no warnings — you have to spot the danger yourself
+          </p>
+        </div>
+      )}
+
+      {/* board */}
+      <div className="flex items-baseline justify-between mb-1.5 px-1">
+        <span className="text-[11px] uppercase tracking-wider text-stone-500 font-semibold">Your board</span>
+        <span className="text-[10px] text-stone-400">{board.length} / 20 possible</span>
+      </div>
+      <div className="bg-white rounded-md border border-stone-200 shadow-sm p-2 min-h-[80px] mb-4">
+        {board.length === 0 && !dead ? (
+          <div className="text-center text-stone-300 italic text-sm py-5">empty — keep your first card</div>
+        ) : (
+          <div className="grid grid-cols-5 gap-1.5">
+            {board.map((c) => (
+              <div key={c} style={{ aspectRatio: '4 / 3' }}
+                   className={`relative w-full rounded border bg-white overflow-hidden shadow-sm transition-all
+                              ${killCards.has(c) ? 'border-red-500 ring-2 ring-red-300' : 'border-stone-200'}
+                              ${dead && !killCards.has(c) ? 'opacity-35' : ''}`}>
+                <CardBody card={decodeCard(c)} />
+              </div>
+            ))}
+            {dead && (
+              <div style={{ aspectRatio: '4 / 3' }}
+                   className="relative w-full rounded border-2 border-red-500 ring-2 ring-red-300 bg-red-50 overflow-hidden shadow">
+                <CardBody card={decodeCard(dead.card)} />
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* weekly leaderboard */}
+      <div className="flex items-baseline justify-between mb-1.5 px-1">
+        <span className="text-[11px] uppercase tracking-wider text-stone-500 font-semibold">
+          This week's leaderboard
+        </span>
+        <span className="text-[10px] text-stone-400">{week} · best of unlimited tries</span>
+      </div>
+      <div className="bg-white rounded-md shadow-sm overflow-hidden mb-3">
+        {weekBoard === null ? (
+          <div className="text-center text-stone-400 text-sm py-4">Loading…</div>
+        ) : weekBoard.length === 0 ? (
+          <div className="text-center text-stone-400 text-sm italic py-4">
+            No runs yet this week — set the bar!
+          </div>
+        ) : (
+          weekBoard.slice(0, 10).map((r, i) => {
+            const isMe = r.name === name;
+            const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : null;
+            return (
+              <div key={r.name}
+                   className={`flex items-center justify-between px-3 py-2 border-t border-stone-100 first:border-t-0
+                              ${isMe ? 'bg-red-50' : ''}`}>
+                <span className="flex items-center gap-2 min-w-0">
+                  <span className="text-base w-5 inline-block text-center flex-shrink-0">
+                    {medal || <span className="text-stone-400 text-sm">{i + 1}</span>}
+                  </span>
+                  <button onClick={() => onPlayerClick(r.name)}
+                          className={`text-sm font-medium truncate hover:underline underline-offset-2 text-left
+                                     ${isMe ? 'text-red-800' : 'text-stone-800'}`}>
+                    {r.name}{isMe && <span className="text-stone-400 font-normal"> (you)</span>}
+                  </button>
+                </span>
+                <span className="text-sm flex-shrink-0 ml-2">
+                  <span className="font-bold text-stone-800 tabular-nums">{r.best}</span>
+                  <span className="text-stone-400 text-[11px]"> cards · {r.attempts} {r.attempts === 1 ? 'try' : 'tries'}</span>
+                </span>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      <p className="text-[10px] text-stone-400 text-center leading-relaxed px-2">
+        "Poison in deck" counts the undealt cards that would complete a set with a
+        pair on your board right now. The mathematical ceiling is 20 cards
+        (Pellegrino, 1971) — any 21 must contain a set. Even a perfect player
+        averages ~14.
+      </p>
+    </main>
+  );
+}
 
 // ===== Scoring explanation page =====
 function ScoringContent({ onBack }) {
@@ -2701,6 +3173,7 @@ export default function App() {
 
   // Tab navigation
   const activeTab = view === 'archives' ? 'archives'
+                  : view === 'survivor' ? 'survivor'
                   : (view === 'stats' || view === 'playerStats') ? 'stats'
                   : view === 'scoring' ? (scoringFrom === 'archives' ? 'archives'
                       : (scoringFrom === 'stats' || scoringFrom === 'playerStats') ? 'stats'
@@ -2714,6 +3187,8 @@ export default function App() {
       setView('game');
     } else if (tab === 'archives') {
       setView('archives');
+    } else if (tab === 'survivor') {
+      setView('survivor');
     } else if (tab === 'stats') {
       setViewingPlayer(null);
       setView('stats');
@@ -2779,6 +3254,10 @@ export default function App() {
           }}
           onOpenScoring={openScoring}
         />
+      )}
+
+      {view === 'survivor' && (
+        <SurvivorContent name={name} onPlayerClick={openPlayerStats} />
       )}
 
       {view === 'stats' && (
