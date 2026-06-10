@@ -1423,10 +1423,104 @@ function ArchiveDetailStrip({ dateKey, info, MEDAL, RANK_WORD,
   );
 }
 
-// ===== Stats content (overall players + daily log) =====
-function StatsContent({ onPlayerClick, currentName }) {
+// ===== Stats content (Option C: segmented Players / Day-by-day) =====
+// Design rule: no element's size depends on player count. Regulars (3+
+// solves) get rich ranked rows; drive-by visitors collapse behind a toggle.
+// The old dates-x-players matrix is replaced by constant-width day rows
+// that expand on tap.
+
+const REGULAR_MIN_SOLVES = 3;
+const DAYS_PAGE = 14;
+
+// Tiny trend line of a player's last few solves (chronological; lower =
+// better, so a falling line means improvement).
+function Sparkline({ times, accent }) {
+  if (!times || times.length < 2) return null;
+  const W = 92, H = 22, P = 3;
+  const min = Math.min(...times), max = Math.max(...times);
+  const span = max - min || 1;
+  const xs = times.map((_, i) => P + (i * (W - 2 * P)) / (times.length - 1));
+  const ys = times.map((t) => P + ((t - min) / span) * (H - 2 * P));
+  const pts = xs.map((x, i) => `${x.toFixed(1)},${ys[i].toFixed(1)}`).join(' ');
+  const color = accent ? '#b91c1c' : '#78716c';
+  return (
+    <svg width={W} height={H} className="flex-shrink-0" aria-hidden="true">
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.8" />
+      <circle cx={xs[xs.length - 1]} cy={ys[ys.length - 1]} r="2.2" fill={color} />
+    </svg>
+  );
+}
+
+function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
   const [history, setHistory] = useState(null);
+  const [tab, setTab] = useState('players');           // 'players' | 'days'
+  const [showVisitors, setShowVisitors] = useState(false);
+  const [daysShown, setDaysShown] = useState(DAYS_PAGE);
+  const [expandedDays, setExpandedDays] = useState(() => new Set());
   useEffect(() => { Storage.loadAllHistory().then(setHistory); }, []);
+
+  const dates = useMemo(
+    () => (history ? Object.keys(history).sort().reverse() : []),
+    [history]
+  );
+
+  // Difficulty for every date with results (deterministic from the date).
+  // ~50ms worst case per date, runs once when history arrives.
+  const difficulties = useMemo(() => {
+    const map = {};
+    for (const d of dates) map[d] = computePuzzleDifficulty(generateDailyPuzzle(d));
+    return map;
+  }, [dates]);
+
+  // Per-player aggregates, ranked by average time.
+  const players = useMemo(() => {
+    if (!history) return [];
+    const byName = {};
+    for (const d of dates) {
+      for (const [n, r] of Object.entries(history[d])) {
+        (byName[n] ??= []).push({ date: d, time: r.time });
+      }
+    }
+    const out = [];
+    for (const [n, rows] of Object.entries(byName)) {
+      rows.sort((a, b) => a.date.localeCompare(b.date));
+      const times = rows.map((r) => r.time);
+      const played = times.length;
+      const best = Math.min(...times);
+      const avg = Math.round((times.reduce((s, t) => s + t, 0) / played) * 100) / 100;
+      const playedSet = new Set(rows.map((r) => r.date));
+      let streak = 0;
+      let cursor = todayKey;
+      if (!playedSet.has(cursor)) {
+        cursor = utcDateKey(new Date(dateKeyToUTC(cursor) - 86400000));
+      }
+      while (playedSet.has(cursor)) {
+        streak++;
+        cursor = utcDateKey(new Date(dateKeyToUTC(cursor) - 86400000));
+      }
+      out.push({ name: n, played, best, avg, streak, last7: times.slice(-7) });
+    }
+    out.sort((a, b) => a.avg - b.avg);
+    return out;
+  }, [history, dates, todayKey]);
+
+  // Current player's avg by difficulty tier (the pills on their row).
+  const myTierPills = useMemo(() => {
+    if (!history || !currentName) return null;
+    const mine = [];
+    for (const d of dates) {
+      const r = history[d][currentName];
+      if (r) mine.push({ d, t: r.time });
+    }
+    if (mine.length === 0) return null;
+    const pills = DIFFICULTY_ORDER.map((level) => {
+      const ts = mine.filter((m) => difficulties[m.d]?.level === level).map((m) => m.t);
+      return ts.length
+        ? { level, n: ts.length, avg: Math.round((ts.reduce((s, t) => s + t, 0) / ts.length) * 100) / 100 }
+        : { level, n: 0 };
+    }).filter((p) => p.n > 0);
+    return pills.length ? pills : null;
+  }, [history, dates, difficulties, currentName]);
 
   if (history === null) {
     return (
@@ -1436,115 +1530,234 @@ function StatsContent({ onPlayerClick, currentName }) {
     );
   }
 
-  const dates = Object.keys(history).sort().reverse();
-  const allNames = Array.from(new Set(dates.flatMap((d) => Object.keys(history[d]))));
-  allNames.sort((a, b) => {
-    if (a === currentName) return -1;
-    if (b === currentName) return 1;
-    return a.localeCompare(b);
-  });
-
-  const stats = {};
-  for (const n of allNames) {
-    const times = dates.map((d) => history[d][n]?.time).filter((t) => t != null);
-    if (times.length === 0) continue;
-    stats[n] = {
-      played: times.length,
-      best: Math.min(...times),
-      avg: Math.round(times.reduce((s, t) => s + t, 0) / times.length * 100) / 100,
-    };
-  }
-
-  return (
-    <main className="flex-1 p-3 max-w-3xl w-full mx-auto">
-      {dates.length === 0 ? (
+  if (dates.length === 0) {
+    return (
+      <main className="flex-1 p-3 max-w-2xl w-full mx-auto">
         <div className="text-center text-stone-500 italic mt-10">
           No games yet. Finish a puzzle to start tracking.
         </div>
-      ) : (
-        <>
-          <div className="bg-white rounded-md shadow-sm p-3 mb-3">
-            <div className="flex items-center justify-between mb-2">
-              <h3 className="text-sm font-semibold text-stone-700">Players</h3>
-              <span className="text-[11px] text-stone-400">Tap a name for details</span>
-            </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-              {Object.entries(stats).map(([n, s]) => (
-                <button key={n}
-                  onClick={() => onPlayerClick(n)}
-                  className={`flex items-center justify-between px-3 py-2 rounded text-left
-                             transition-colors
-                             ${n === currentName
-                               ? 'bg-red-50 border border-red-100 hover:bg-red-100'
-                               : 'bg-stone-50 hover:bg-stone-100'}`}>
-                  <span className={`text-sm font-medium ${n === currentName ? 'text-red-800' : 'text-stone-800'}`}>
-                    {n}{n === currentName && <span className="text-stone-400 font-normal"> (you)</span>}
-                  </span>
-                  <span className="text-xs text-stone-600 font-mono tabular-nums"
-                        style={{ fontFamily: '"Menlo", monospace' }}>
-                    best {formatMmSs(s.best)} · avg {formatMmSs(s.avg)} · {s.played}d
-                  </span>
-                </button>
-              ))}
-            </div>
-          </div>
+      </main>
+    );
+  }
 
-          <h3 className="text-xs uppercase tracking-wider text-stone-500 mb-2 px-1 font-semibold">
-            Daily log
-          </h3>
+  const regulars = players.filter((p) => p.played >= REGULAR_MIN_SOLVES);
+  const visitors = players.filter((p) => p.played < REGULAR_MIN_SOLVES);
+  // Rank among regulars only — a visitor's single lucky solve shouldn't top
+  // the board. Visitors are listed unranked.
+  const rankOf = (p) => regulars.indexOf(p) + 1;
+
+  const toggleDay = (date) => {
+    setExpandedDays((prev) => {
+      const next = new Set(prev);
+      if (next.has(date)) next.delete(date);
+      else next.add(date);
+      return next;
+    });
+  };
+
+  const starsFor = (level) => {
+    const tier = DIFFICULTY_TIERS[level];
+    if (!tier) return null;
+    return (
+      <span className="text-red-600" style={{ whiteSpace: 'nowrap', letterSpacing: '0.05em' }}>
+        {'★'.repeat(tier.stars)}<span className="text-stone-300">{'★'.repeat(3 - tier.stars)}</span>
+      </span>
+    );
+  };
+
+  return (
+    <main className="flex-1 p-3 max-w-2xl w-full mx-auto">
+      {/* segmented control */}
+      <div className="flex bg-stone-200 rounded-lg p-0.5 mb-3">
+        {[
+          { id: 'players', label: 'Players' },
+          { id: 'days', label: 'Day by day' },
+        ].map((t) => (
+          <button key={t.id} onClick={() => setTab(t.id)}
+            className={`flex-1 py-1.5 rounded-md text-sm font-semibold transition-colors
+                       ${tab === t.id ? 'bg-white text-red-700 shadow-sm' : 'text-stone-500 hover:text-stone-700'}`}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'players' && (
+        <>
+          <div className="flex items-baseline justify-between mb-1.5 px-1">
+            <span className="text-[11px] uppercase tracking-wider text-stone-500 font-semibold">
+              Ranked by average
+            </span>
+            <span className="text-[10px] text-stone-400">tap a player for details</span>
+          </div>
           <div className="bg-white rounded-md shadow-sm overflow-hidden">
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead className="bg-stone-100">
-                  <tr>
-                    <th className="px-3 py-2 text-left font-semibold text-stone-700">Date</th>
-                    {allNames.map((n) => (
-                      <th key={n}
-                          className={`px-3 py-2 text-right font-semibold whitespace-nowrap
-                                     ${n === currentName ? 'text-red-700' : 'text-stone-700'}`}>
-                        <button onClick={() => onPlayerClick(n)}
-                          className="hover:underline underline-offset-2">
-                          {n}
-                        </button>
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {dates.map((date, i) => {
-                    const dateTimes = Object.values(history[date]).map((r) => r.time);
-                    const minTime = dateTimes.length ? Math.min(...dateTimes) : null;
-                    return (
-                      <tr key={date} className={i % 2 === 0 ? 'bg-white' : 'bg-stone-50'}>
-                        <td className="px-3 py-2 font-medium text-stone-800 whitespace-nowrap">
-                          {formatShortDate(date)}
-                        </td>
-                        {allNames.map((n) => {
-                          const r = history[date][n];
-                          const isWinner = r && r.time === minTime && dateTimes.length > 1;
-                          return (
-                            <td key={n}
-                                className={`px-3 py-2 text-right font-mono tabular-nums whitespace-nowrap
-                                           ${n === currentName ? 'text-red-700' : 'text-stone-700'}
-                                           ${isWinner ? 'font-bold' : ''}`}
-                                style={{ fontFamily: '"Menlo", monospace' }}>
-                              {r ? (
-                                <span>
-                                  {isWinner && <span className="mr-1">🥇</span>}
-                                  {formatMmSs(r.time)}
-                                </span>
-                              ) : (
-                                <span className="text-stone-300">—</span>
-                              )}
-                            </td>
-                          );
-                        })}
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+            {regulars.map((p) => {
+              const isMe = p.name === currentName;
+              return (
+                <button key={p.name} onClick={() => onPlayerClick(p.name)}
+                  className={`w-full text-left px-3 py-2.5 block border-t border-stone-100 first:border-t-0
+                             transition-colors
+                             ${isMe ? 'bg-red-50 hover:bg-red-100' : 'hover:bg-stone-50'}`}
+                  style={isMe ? { boxShadow: 'inset 3px 0 0 #b91c1c' } : undefined}>
+                  <div className="flex items-baseline justify-between gap-2">
+                    <span className={`text-sm font-semibold truncate ${isMe ? 'text-red-800' : 'text-stone-800'}`}>
+                      {rankOf(p)} · {p.name}
+                      {isMe && <span className="text-stone-400 font-normal text-[11px]"> (you)</span>}
+                    </span>
+                    <span className="text-[11px] text-stone-600 font-mono tabular-nums flex-shrink-0"
+                          style={{ fontFamily: '"Menlo", monospace' }}>
+                      avg <span className="font-bold text-stone-800">{formatMmSs(p.avg)}</span>
+                    </span>
+                  </div>
+                  <div className="flex items-end justify-between gap-2 mt-1">
+                    <span className="text-[10.5px] text-stone-500 min-w-0">
+                      {p.played} played · best{' '}
+                      <span className="font-mono" style={{ fontFamily: '"Menlo", monospace' }}>
+                        {formatMmSs(p.best)}
+                      </span>
+                      {p.streak >= 2 && <span> · 🔥 {p.streak}-day streak</span>}
+                    </span>
+                    <Sparkline times={p.last7} accent={isMe} />
+                  </div>
+                  {isMe && myTierPills && (
+                    <div className="flex flex-wrap gap-1.5 mt-1.5">
+                      {myTierPills.map((pill) => (
+                        <span key={pill.level}
+                              className="text-[10px] bg-white border border-red-200 rounded-full px-2 py-0.5 text-stone-600">
+                          {starsFor(pill.level)}{' '}
+                          <span className="font-mono tabular-nums" style={{ fontFamily: '"Menlo", monospace' }}>
+                            avg {formatMmSs(pill.avg)}
+                          </span>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </button>
+              );
+            })}
+
+            {visitors.length > 0 && (
+              <>
+                {showVisitors && visitors.map((p) => {
+                  const isMe = p.name === currentName;
+                  return (
+                    <button key={p.name} onClick={() => onPlayerClick(p.name)}
+                      className={`w-full flex items-center justify-between px-3 py-2 border-t border-stone-100
+                                 transition-colors text-left
+                                 ${isMe ? 'bg-red-50 hover:bg-red-100' : 'hover:bg-stone-50'}`}>
+                      <span className={`text-sm font-medium ${isMe ? 'text-red-800' : 'text-stone-700'}`}>
+                        {p.name}
+                        {isMe && <span className="text-stone-400 font-normal text-[11px]"> (you)</span>}
+                      </span>
+                      <span className="text-[10.5px] text-stone-500 font-mono tabular-nums"
+                            style={{ fontFamily: '"Menlo", monospace' }}>
+                        {p.played}d · avg {formatMmSs(p.avg)}
+                      </span>
+                    </button>
+                  );
+                })}
+                <button onClick={() => setShowVisitors((v) => !v)}
+                  className="w-full py-2 bg-stone-50 hover:bg-stone-100 text-stone-500 text-[11px]
+                             font-medium border-t border-stone-100 transition-colors">
+                  {showVisitors
+                    ? 'Hide occasional players ▴'
+                    : `Show ${visitors.length} more player${visitors.length === 1 ? '' : 's'} (under ${REGULAR_MIN_SOLVES} solves) ▾`}
+                </button>
+              </>
+            )}
+          </div>
+          <p className="text-[10px] text-stone-400 text-center mt-2 px-2">
+            sparkline = last 7 solves, lower is better · pills = your average by difficulty
+          </p>
+        </>
+      )}
+
+      {tab === 'days' && (
+        <>
+          <div className="flex items-baseline justify-between mb-1.5 px-1">
+            <span className="text-[11px] uppercase tracking-wider text-stone-500 font-semibold">
+              Most recent first
+            </span>
+            <span className="text-[10px] text-stone-400">tap a day to expand</span>
+          </div>
+          <div className="bg-white rounded-md shadow-sm overflow-hidden">
+            {dates.slice(0, daysShown).map((date) => {
+              const entries = Object.entries(history[date])
+                .map(([n, r]) => ({ name: n, time: r.time }))
+                .sort((a, b) => a.time - b.time);
+              const winner = entries[0];
+              const others = entries.length - 1;
+              const open = expandedDays.has(date);
+              const diff = difficulties[date];
+              return (
+                <div key={date} className={`border-t border-stone-100 first:border-t-0 ${open ? 'bg-stone-50' : ''}`}>
+                  <div role={others > 0 ? 'button' : undefined}
+                       tabIndex={others > 0 ? 0 : undefined}
+                       onClick={others > 0 ? () => toggleDay(date) : undefined}
+                       onKeyDown={others > 0 ? (e) => {
+                         if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleDay(date); }
+                       } : undefined}
+                       className={`flex items-center px-3 py-2.5 ${others > 0 ? 'cursor-pointer hover:bg-stone-50' : ''}`}>
+                    <span className="w-20 flex-shrink-0" style={{ whiteSpace: 'nowrap' }}>
+                      <span className="text-[9px] text-stone-400 font-bold tracking-wider">
+                        {shortWeekday(date, true)}
+                      </span>{' '}
+                      <span className="text-[12px] font-semibold text-stone-800">
+                        {formatShortDate(date)}
+                      </span>
+                    </span>
+                    <span className="mx-2 text-[10px]">
+                      {diff && <DifficultyBadge difficulty={diff} onClick={onOpenScoring} />}
+                    </span>
+                    <span className="flex-1 text-[12px] text-stone-700 truncate">
+                      🥇{' '}
+                      <button onClick={(e) => { e.stopPropagation(); onPlayerClick(winner.name); }}
+                              className={`font-medium hover:underline underline-offset-2
+                                         ${winner.name === currentName ? 'text-red-800' : ''}`}>
+                        {winner.name}
+                      </button>{' '}
+                      <span className="font-mono text-[11px] text-stone-500 tabular-nums"
+                            style={{ fontFamily: '"Menlo", monospace' }}>
+                        {formatMmSs(winner.time)}
+                      </span>
+                    </span>
+                    <span className="text-[11px] text-stone-400 flex-shrink-0 ml-1">
+                      {others > 0 ? (open ? '⌄' : `+${others} ›`) : ''}
+                    </span>
+                  </div>
+                  {open && others > 0 && (
+                    <div className="pb-2.5" style={{ paddingLeft: '6.25rem', paddingRight: '0.75rem' }}>
+                      {entries.slice(1).map((e, i) => {
+                        const rank = i + 2;
+                        const medal = rank === 2 ? '🥈' : rank === 3 ? '🥉' : `#${rank}`;
+                        return (
+                          <div key={e.name} className="flex items-center justify-between py-0.5">
+                            <span className="text-[12px] text-stone-600">
+                              {medal}{' '}
+                              <button onClick={() => onPlayerClick(e.name)}
+                                      className={`hover:underline underline-offset-2
+                                                 ${e.name === currentName ? 'text-red-800 font-medium' : ''}`}>
+                                {e.name}
+                              </button>
+                            </span>
+                            <span className="font-mono text-[11px] text-stone-500 tabular-nums"
+                                  style={{ fontFamily: '"Menlo", monospace' }}>
+                              {formatMmSs(e.time)}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            {dates.length > daysShown && (
+              <button onClick={() => setDaysShown((n) => n + DAYS_PAGE)}
+                className="w-full py-2 bg-stone-50 hover:bg-stone-100 text-stone-500 text-[11px]
+                           font-medium border-t border-stone-100 transition-colors">
+                Show {Math.min(DAYS_PAGE, dates.length - daysShown)} more days ▾
+              </button>
+            )}
           </div>
         </>
       )}
@@ -2526,6 +2739,8 @@ export default function App() {
         <StatsContent
           onPlayerClick={openPlayerStats}
           currentName={name}
+          todayKey={todayKey}
+          onOpenScoring={openScoring}
         />
       )}
 
