@@ -1467,7 +1467,7 @@ function Sparkline({ times, accent }) {
 
 function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
   const [history, setHistory] = useState(null);
-  const [tab, setTab] = useState('players');           // 'players' | 'days'
+  const [tab, setTab] = useState('days');              // 'days' | 'players'
   const [showVisitors, setShowVisitors] = useState(false);
   const [daysShown, setDaysShown] = useState(DAYS_PAGE);
   const [expandedDays, setExpandedDays] = useState(() => new Set());
@@ -1584,8 +1584,8 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
       {/* segmented control */}
       <div className="flex bg-stone-200 rounded-lg p-0.5 mb-3">
         {[
-          { id: 'players', label: 'Players' },
           { id: 'days', label: 'Day by day' },
+          { id: 'players', label: 'Players' },
         ].map((t) => (
           <button key={t.id} onClick={() => setTab(t.id)}
             className={`flex-1 py-1.5 rounded-md text-sm font-semibold transition-colors
@@ -1698,8 +1698,7 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
               const entries = Object.entries(history[date])
                 .map(([n, r]) => ({ name: n, time: r.time }))
                 .sort((a, b) => a.time - b.time);
-              const winner = entries[0];
-              const others = entries.length - 1;
+              const others = Math.max(0, entries.length - 3);  // beyond the podium
               const open = expandedDays.has(date);
               const diff = difficulties[date];
               return (
@@ -1710,39 +1709,58 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
                        onKeyDown={others > 0 ? (e) => {
                          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleDay(date); }
                        } : undefined}
-                       className={`flex items-center px-3 py-2.5 ${others > 0 ? 'cursor-pointer hover:bg-stone-50' : ''}`}>
-                    <span className="w-20 flex-shrink-0" style={{ whiteSpace: 'nowrap' }}>
-                      <span className="text-[9px] text-stone-400 font-bold tracking-wider">
-                        {shortWeekday(date, true)}
-                      </span>{' '}
-                      <span className="text-[12px] font-semibold text-stone-800">
-                        {formatShortDate(date)}
+                       className={`px-3 py-2 ${others > 0 ? 'cursor-pointer hover:bg-stone-50' : ''}`}>
+                    <div className="flex items-center justify-between mb-1">
+                      <span style={{ whiteSpace: 'nowrap' }}>
+                        <span className="text-[9px] text-stone-400 font-bold tracking-wider">
+                          {shortWeekday(date, true)}
+                        </span>{' '}
+                        <span className="text-[12px] font-semibold text-stone-800">
+                          {formatShortDate(date)}
+                        </span>
+                        <span className="ml-2 text-[10px]">
+                          {diff && <DifficultyBadge difficulty={diff} onClick={onOpenScoring} />}
+                        </span>
                       </span>
-                    </span>
-                    <span className="mx-2 text-[10px]">
-                      {diff && <DifficultyBadge difficulty={diff} onClick={onOpenScoring} />}
-                    </span>
-                    <span className="flex-1 text-[12px] text-stone-700 truncate">
-                      🥇{' '}
-                      <button onClick={(e) => { e.stopPropagation(); onPlayerClick(winner.name); }}
-                              className={`font-medium hover:underline underline-offset-2
-                                         ${winner.name === currentName ? 'text-red-800' : ''}`}>
-                        {winner.name}
-                      </button>{' '}
-                      <span className="font-mono text-[11px] text-stone-500 tabular-nums"
-                            style={{ fontFamily: '"Menlo", monospace' }}>
-                        {formatMmSs(winner.time)}
+                      <span className="text-[11px] text-stone-400 flex-shrink-0 ml-1">
+                        {others > 0 ? (open ? '⌄' : `+${others} ›`) : ''}
                       </span>
-                    </span>
-                    <span className="text-[11px] text-stone-400 flex-shrink-0 ml-1">
-                      {others > 0 ? (open ? '⌄' : `+${others} ›`) : ''}
-                    </span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {[0, 1, 2].map((slot) => {
+                        const e = entries[slot];
+                        const medal = slot === 0 ? '🥇' : slot === 1 ? '🥈' : '🥉';
+                        if (!e) {
+                          return (
+                            <span key={slot} className="text-[11px] text-stone-300 text-center py-0.5">
+                              {medal} —
+                            </span>
+                          );
+                        }
+                        return (
+                          <span key={slot} className="min-w-0 text-center leading-tight">
+                            <span className="block text-[11.5px] text-stone-700 truncate">
+                              {medal}{' '}
+                              <button onClick={(ev) => { ev.stopPropagation(); onPlayerClick(e.name); }}
+                                      className={`font-medium hover:underline underline-offset-2
+                                                 ${e.name === currentName ? 'text-red-800' : ''}`}>
+                                {e.name}
+                              </button>
+                            </span>
+                            <span className="block font-mono text-[10.5px] text-stone-500 tabular-nums"
+                                  style={{ fontFamily: '"Menlo", monospace' }}>
+                              {formatMmSs(e.time)}
+                            </span>
+                          </span>
+                        );
+                      })}
+                    </div>
                   </div>
                   {open && others > 0 && (
-                    <div className="pb-2.5" style={{ paddingLeft: '6.25rem', paddingRight: '0.75rem' }}>
-                      {entries.slice(1).map((e, i) => {
-                        const rank = i + 2;
-                        const medal = rank === 2 ? '🥈' : rank === 3 ? '🥉' : `#${rank}`;
+                    <div className="pb-2.5 px-3">
+                      {entries.slice(3).map((e, i) => {
+                        const rank = i + 4;
+                        const medal = `#${rank}`;
                         return (
                           <div key={e.name} className="flex items-center justify-between py-0.5">
                             <span className="text-[12px] text-stone-600">
