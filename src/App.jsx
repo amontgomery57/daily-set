@@ -1553,7 +1553,7 @@ function StatsContent({ onPlayerClick, currentName }) {
 }
 
 // ===== Player detail stats =====
-function PlayerStatsContent({ player, todayKey, currentName, onBack }) {
+function PlayerStatsContent({ player, todayKey, currentName, onBack, onOpenScoring }) {
   const [history, setHistory] = useState(null);
   useEffect(() => { Storage.loadAllHistory().then(setHistory); }, []);
 
@@ -1604,6 +1604,26 @@ function PlayerStatsContent({ player, todayKey, currentName, onBack }) {
   const median = sortedTimes.length % 2 === 0
     ? Math.round((sortedTimes[sortedTimes.length / 2 - 1] + sortedTimes[sortedTimes.length / 2]) / 2 * 100) / 100
     : sortedTimes[Math.floor(sortedTimes.length / 2)];
+
+  // Difficulty of each played puzzle (deterministic from the date) and
+  // per-tier time stats. ~50ms worst case per date; runs only on the rare
+  // re-renders of this view.
+  const difficultyByDate = {};
+  for (const e of entries) {
+    difficultyByDate[e.date] = computePuzzleDifficulty(generateDailyPuzzle(e.date));
+  }
+  const tierStats = DIFFICULTY_ORDER.map((level) => {
+    const ts = entries
+      .filter((e) => difficultyByDate[e.date]?.level === level)
+      .map((e) => e.time);
+    if (ts.length === 0) return { level, n: 0 };
+    return {
+      level,
+      n: ts.length,
+      best: Math.min(...ts),
+      avg: Math.round(ts.reduce((s, t) => s + t, 0) / ts.length * 100) / 100,
+    };
+  });
 
   const multiPlayerEntries = entries.filter(e => e.total > 1);
   const wins = multiPlayerEntries.filter(e => e.rank === 1).length;
@@ -1660,6 +1680,35 @@ function PlayerStatsContent({ player, todayKey, currentName, onBack }) {
                   sub={bestStreak === 1 ? 'day' : 'days'} />
       </div>
 
+      <div className="bg-white rounded-md shadow-sm p-3 mb-3">
+        <div className="text-[10px] text-stone-500 uppercase tracking-wider font-semibold mb-1.5">
+          Times by difficulty
+        </div>
+        <div className="divide-y divide-stone-100">
+          {tierStats.map(({ level, n, best: tBest, avg: tAvg }) => {
+            const tier = DIFFICULTY_TIERS[level];
+            return (
+              <div key={level} className="flex items-center justify-between py-1.5 gap-2">
+                <span className="text-sm flex items-baseline gap-1.5 min-w-0">
+                  <span className="text-red-600" style={{ whiteSpace: 'nowrap', letterSpacing: '0.05em' }}>
+                    {'★'.repeat(tier.stars)}<span className="text-stone-300">{'★'.repeat(3 - tier.stars)}</span>
+                  </span>
+                  <span className="text-stone-700 font-medium">{tier.label}</span>
+                </span>
+                {n === 0 ? (
+                  <span className="text-xs text-stone-300 italic">not played</span>
+                ) : (
+                  <span className="text-xs text-stone-600 font-mono tabular-nums text-right flex-shrink-0"
+                        style={{ fontFamily: '"Menlo", monospace' }}>
+                    best {formatMmSs(tBest)} · avg {formatMmSs(tAvg)} · {n}d
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
       {multiPlayerEntries.length > 0 && (
         <div className="bg-white rounded-md shadow-sm p-3 mb-3">
           <div className="text-[10px] text-stone-500 uppercase tracking-wider font-semibold mb-1">
@@ -1697,6 +1746,11 @@ function PlayerStatsContent({ player, todayKey, currentName, onBack }) {
                 <span className="text-sm text-stone-800 font-medium">
                   {formatShortDate(e.date)}
                 </span>
+                {difficultyByDate[e.date] && (
+                  <DifficultyBadge difficulty={difficultyByDate[e.date]}
+                                   onClick={onOpenScoring}
+                                   className="text-[11px]" />
+                )}
                 {e.total > 1 && (
                   <span className="text-[11px] text-stone-500">
                     {e.rank === 1 ? '🥇'
@@ -2389,7 +2443,9 @@ export default function App() {
   // Tab navigation
   const activeTab = view === 'archives' ? 'archives'
                   : (view === 'stats' || view === 'playerStats') ? 'stats'
-                  : view === 'scoring' ? (scoringFrom === 'archives' ? 'archives' : 'game')
+                  : view === 'scoring' ? (scoringFrom === 'archives' ? 'archives'
+                      : (scoringFrom === 'stats' || scoringFrom === 'playerStats') ? 'stats'
+                      : 'game')
                   : playingDate ? 'archives'  // archived puzzle in game view
                   : 'game';
 
@@ -2479,6 +2535,7 @@ export default function App() {
           todayKey={todayKey}
           currentName={name}
           onBack={() => setView('stats')}
+          onOpenScoring={openScoring}
         />
       )}
 
