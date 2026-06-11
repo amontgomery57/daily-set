@@ -792,7 +792,7 @@ function TabBar({ activeTab, onChange }) {
   const tabs = [
     { id: 'game', label: "Today's Puzzle" },
     { id: 'archives', label: 'Archives' },
-    { id: 'survivor', label: 'Weekly Puzzle' },
+    // { id: 'survivor', label: 'Weekly Puzzle' },  // hidden — WIP, re-enable to restore
     { id: 'stats', label: 'Stats' },
   ];
   return (
@@ -1728,7 +1728,7 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
         {[
           { id: 'days', label: 'Day by day' },
           { id: 'players', label: 'Players' },
-          { id: 'weekly', label: 'Weekly' },
+          // { id: 'weekly', label: 'Weekly' },  // hidden with Weekly Puzzle
         ].map((t) => (
           <button key={t.id} onClick={() => setTab(t.id)}
             className={`flex-1 py-1.5 rounded-md text-sm font-semibold transition-colors
