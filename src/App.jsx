@@ -1101,6 +1101,7 @@ function GameContent({ puzzle, targetSets, time, foundSets, selected, flash,
 // ===== Completed content =====
 function CompletedContent({ result, leaderboard, name, isPlayingToday, dateKey,
                             msUntilTomorrow, puzzle, onPlayToday, onPlayerClick,
+                            nextUnplayedDate, onPlayDate,
                             onRefresh, refreshing, onRename, onOpenScoring }) {
   const difficulty = useMemo(() => computePuzzleDifficulty(puzzle), [puzzle]);
   return (
@@ -1155,16 +1156,37 @@ function CompletedContent({ result, leaderboard, name, isPlayingToday, dateKey,
 
         <div className="flex flex-col items-center gap-3 mt-4">
           {isPlayingToday ? (
-            <div className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full
-                            bg-stone-100 text-stone-600 text-xs font-medium">
-              <span>⏱</span>
-              <span>Next puzzle in {formatCountdown(msUntilTomorrow)}</span>
-            </div>
+            <>
+              <div className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full
+                              bg-stone-100 text-stone-600 text-xs font-medium">
+                <span>⏱</span>
+                <span>Next puzzle in {formatCountdown(msUntilTomorrow)}</span>
+              </div>
+              {nextUnplayedDate && (
+                <button onClick={() => onPlayDate(nextUnplayedDate)}
+                  className="px-4 py-2 bg-red-700 hover:bg-red-800 text-white rounded-md
+                             text-sm font-medium transition-colors">
+                  Play another from the archives →
+                </button>
+              )}
+            </>
           ) : (
-            <button onClick={onPlayToday}
-              className="px-4 py-2 bg-red-700 hover:bg-red-800 text-white rounded-md text-sm font-medium transition-colors">
-              Play today's puzzle →
-            </button>
+            <>
+              {nextUnplayedDate && (
+                <button onClick={() => onPlayDate(nextUnplayedDate)}
+                  className="px-4 py-2 bg-red-700 hover:bg-red-800 text-white rounded-md
+                             text-sm font-medium transition-colors">
+                  Play another from the archives →
+                </button>
+              )}
+              <button onClick={onPlayToday}
+                className={`px-4 py-2 rounded-md text-sm font-medium transition-colors
+                           ${nextUnplayedDate
+                             ? 'bg-stone-100 hover:bg-stone-200 text-stone-700'
+                             : 'bg-red-700 hover:bg-red-800 text-white'}`}>
+                Play today's puzzle →
+              </button>
+            </>
           )}
           <button onClick={onRename}
             className="text-xs text-stone-400 hover:text-stone-600">
@@ -3222,6 +3244,19 @@ export default function App() {
   // Derived
   const msUntilTomorrow = msUntilNextUtcMidnight();
 
+  // Most recent archived puzzle the player hasn't finished yet: walk backward
+  // from yesterday until we hit a date with no result. Bounded so we never
+  // loop forever if someone has somehow solved a long unbroken run. Drives
+  // the "play another" shortcut on the completion screen.
+  const nextUnplayedDate = useMemo(() => {
+    let cursor = utcDateKey(new Date(dateKeyToUTC(todayKey) - 86400000));
+    for (let i = 0; i < 400; i++) {
+      if (!myResults[cursor]) return cursor;
+      cursor = utcDateKey(new Date(dateKeyToUTC(cursor) - 86400000));
+    }
+    return null;  // unbroken 400-day streak — nothing recent to suggest
+  }, [todayKey, myResults]);
+
   // === Render ===
   if (loadingName) {
     return (
@@ -3317,6 +3352,8 @@ export default function App() {
           msUntilTomorrow={msUntilTomorrow}
           puzzle={puzzle}
           onPlayToday={() => handleTabChange('game')}
+          nextUnplayedDate={nextUnplayedDate}
+          onPlayDate={(date) => { setPlayingDate(date); setView('game'); }}
           onPlayerClick={openPlayerStats}
           onRefresh={refreshLeaderboard}
           refreshing={refreshing}
