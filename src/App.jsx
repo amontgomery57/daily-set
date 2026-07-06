@@ -435,6 +435,36 @@ async function sbFetch(path, opts = {}) {
   return res.json();
 }
 
+// Tiny cached-fetch helper for the broad, whole-table-ish queries
+// (loadAllHistory, loadFieldSplits). Archives, Stats, and every player
+// profile each call these independently on mount with no coordination —
+// browsing Archives -> Stats -> two player profiles fires the same
+// multi-hundred-row fetch four times in a few seconds with no caching.
+// This dedupes concurrent calls and reuses a recent result for `ttlMs`,
+// so a normal browsing burst costs one network round trip instead of one
+// per component. Each consumer gets its own slot, keyed by name, so they
+// don't collide. Not used for anything that intentionally polls for
+// freshness (e.g. the completion screen's 15s leaderboard refresh) —
+// this is only for the broad historical queries.
+const HISTORY_CACHE_TTL_MS = 60_000;
+const _cache = {};
+function cachedFetch(key, ttlMs, fetchFn) {
+  const now = Date.now();
+  const slot = _cache[key];
+  if (slot?.data !== undefined && now - slot.ts < ttlMs) return Promise.resolve(slot.data);
+  if (slot?.inFlight) return slot.inFlight;
+  const p = fetchFn().then((data) => {
+    _cache[key] = { data, ts: Date.now(), inFlight: null };
+    return data;
+  }).catch((e) => {
+    delete _cache[key]; // don't cache failures
+    throw e;
+  });
+  _cache[key] = { ...(slot || {}), inFlight: p };
+  return p;
+}
+function invalidateCache(key) { delete _cache[key]; }
+
 const Storage = {
   async getName() {
     if (USE_SUPABASE) return lsGetName();
@@ -512,6 +542,12 @@ const Storage = {
     return lsListResults();
   },
   async saveResult(dateKey, name, time, splits) {
+    // A fresh solve changes the shared history query's answer — invalidate
+    // so the player sees their own result immediately instead of waiting out
+    // the cache TTL. (fieldSplits is left to expire on its own; one solve
+    // barely moves a field-wide median, and it's an expensive query to
+    // refetch on every single save across every player.)
+    invalidateCache('allHistory');
     const payload = { time, completedAt: Date.now() };
     if (splits && splits.length) payload.splits = splits;
     if (USE_SUPABASE) {
@@ -693,17 +729,19 @@ const Storage = {
   },
   async loadAllHistory() {
     if (USE_SUPABASE) {
-      try {
-        const rows = await sbFetch(
-          '/results?select=date,name,time_seconds,completed_at&order=date.desc&limit=10000'
-        );
-        const history = {};
-        for (const row of rows || []) {
-          if (!history[row.date]) history[row.date] = {};
-          history[row.date][row.name] = { time: row.time_seconds, completedAt: row.completed_at };
-        }
-        return history;
-      } catch { return {}; }
+      return cachedFetch('allHistory', HISTORY_CACHE_TTL_MS, async () => {
+        try {
+          const rows = await sbFetch(
+            '/results?select=date,name,time_seconds,completed_at&order=date.desc&limit=10000'
+          );
+          const history = {};
+          for (const row of rows || []) {
+            if (!history[row.date]) history[row.date] = {};
+            history[row.date][row.name] = { time: row.time_seconds, completedAt: row.completed_at };
+          }
+          return history;
+        } catch { return {}; }
+      });
     }
     if (hasStorage()) {
       try {
@@ -747,10 +785,12 @@ const Storage = {
   // already cleared MIN_SPLITS_FOR_PACE_CHART on its own scoped query above.
   async loadFieldSplits() {
     if (USE_SUPABASE) {
-      try {
-        const rows = await sbFetch('/results?splits=not.is.null&select=splits&limit=5000');
-        return rows || [];
-      } catch { return []; }
+      return cachedFetch('fieldSplits', HISTORY_CACHE_TTL_MS, async () => {
+        try {
+          const rows = await sbFetch('/results?splits=not.is.null&select=splits&limit=5000');
+          return rows || [];
+        } catch { return []; }
+      });
     }
     return [];
   },
