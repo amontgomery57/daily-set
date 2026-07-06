@@ -271,6 +271,43 @@ function formatMmSs(s) {
   return `${m}:${remaining.toFixed(2).padStart(5, '0')}`;
 }
 
+// "3rd", "24th", "1st" — used only for the personal-history callouts below.
+function ordinal(n) {
+  const s = ['th', 'st', 'nd', 'rd'], v = n % 100;
+  return `${n}${s[(v - 20) % 10] || s[v] || s[0]}`;
+}
+
+// A player needs at least this many completed puzzles before we show the
+// "vs your own history" panel — below this a histogram is too sparse to be
+// meaningful and just looks like noise.
+const MIN_HISTORY_FOR_PANEL = 5;
+
+// Buckets a player's own times into `binCount` equal-width bins for the
+// completion-screen histogram, and locates which bin this puzzle's time
+// falls in. Returns null if there isn't enough history (caller checks
+// MIN_HISTORY_FOR_PANEL first, but this also guards directly).
+function buildPersonalHistogram(times, thisTime, binCount = 7) {
+  if (!times.length) return null;
+  const min = Math.min(...times), max = Math.max(...times);
+  if (max - min < 0.01) {
+    // Every game finished in essentially the same time — one flat bin.
+    return { bins: [times.length], min, max, thisIdx: 0, thisPct: 50, flat: true };
+  }
+  const width = (max - min) / binCount;
+  const bins = new Array(binCount).fill(0);
+  for (const t of times) {
+    let idx = Math.floor((t - min) / width);
+    if (idx >= binCount) idx = binCount - 1;
+    if (idx < 0) idx = 0;
+    bins[idx]++;
+  }
+  let thisIdx = Math.floor((thisTime - min) / width);
+  if (thisIdx >= binCount) thisIdx = binCount - 1;
+  if (thisIdx < 0) thisIdx = 0;
+  const thisPct = Math.max(3, Math.min(97, ((thisTime - min) / (max - min)) * 100));
+  return { bins, min, max, thisIdx, thisPct, flat: false };
+}
+
 function formatLongDate(dateKey) {
   return new Date(dateKeyToUTC(dateKey)).toLocaleDateString(undefined, {
     weekday: 'long', month: 'long', day: 'numeric', timeZone: 'UTC',
@@ -1098,12 +1135,105 @@ function GameContent({ puzzle, targetSets, time, foundSets, selected, flash,
   );
 }
 
+// ===== Personal history panel (completion screen) =====
+// Shows how this puzzle's time compares to the player's own track record —
+// a histogram of their own times with this one marked, plus a plain-language
+// callout. Renders nothing below MIN_HISTORY_FOR_PANEL games: a histogram of
+// three points isn't a distribution, it's noise, and would just confuse a
+// new player rather than orient them.
+function PersonalHistoryCard({ myResults, thisTime, thisDateKey }) {
+  // Exclude this puzzle's own entry from the comparison set by date, not by
+  // matching its time value — matching by value would let today's row tie
+  // with itself and silently inflate "faster than X%" past 100%.
+  const { totalN, otherTimes, allTimes } = useMemo(() => {
+    const entries = Object.entries(myResults || {});
+    const all = entries.map(([, r]) => r.time).filter((t) => typeof t === 'number');
+    const other = entries
+      .filter(([d]) => d !== thisDateKey)
+      .map(([, r]) => r.time)
+      .filter((t) => typeof t === 'number');
+    return { totalN: all.length, otherTimes: other, allTimes: all };
+  }, [myResults, thisDateKey]);
+
+  const stats = useMemo(() => {
+    if (totalN < MIN_HISTORY_FOR_PANEL) return null;
+    const slower = otherTimes.filter((t) => t > thisTime + 0.005).length;
+    const faster = otherTimes.filter((t) => t < thisTime - 0.005).length;
+    const tied = otherTimes.length - slower - faster;
+    // "Faster than X% of your games" — measured against every OTHER game,
+    // so today doesn't count itself. Ties split credit between the two sides.
+    const fasterThanPct = otherTimes.length > 0
+      ? Math.round(((slower + tied / 2) / otherTimes.length) * 100)
+      : 100;
+    const rank = faster + Math.ceil(tied / 2) + 1; // 1 = personal best
+    const hist = buildPersonalHistogram(allTimes, thisTime, 7);
+    return { fasterThanPct, rank, hist };
+  }, [otherTimes, allTimes, thisTime, totalN]);
+
+  if (!stats) return null;
+  const { fasterThanPct, rank, hist } = stats;
+  const n = totalN;
+
+  return (
+    <div className="border-t border-stone-200 pt-4 mt-4">
+      <h3 className="text-sm font-semibold text-stone-700 mb-2">
+        Vs. your own history <span className="text-stone-400 font-normal">· {n} games</span>
+      </h3>
+      <div className="bg-stone-50 rounded-md p-3 pt-5">
+        <div className="relative" style={{ height: '56px' }}>
+          {!hist.flat && (
+            <>
+              <div className="absolute w-px bg-red-600" style={{ left: `${hist.thisPct}%`, top: 0, bottom: 0 }} />
+              <div className="absolute text-[9px] font-semibold text-red-700 whitespace-nowrap"
+                   style={{ left: `${hist.thisPct}%`, top: '-15px', transform: 'translateX(-50%)' }}>
+                this {formatMmSs(thisTime)}
+              </div>
+            </>
+          )}
+          <div className="absolute inset-0 flex items-end gap-1">
+            {hist.bins.map((count, i) => {
+              const maxCount = Math.max(...hist.bins, 1);
+              const heightPct = count === 0 ? 0 : Math.max(10, Math.round((count / maxCount) * 100));
+              const isThisBin = i === hist.thisIdx;
+              return (
+                <div key={i}
+                     className={`flex-1 rounded-t transition-all ${isThisBin ? 'bg-red-300' : 'bg-stone-300'}`}
+                     style={{ height: `${heightPct}%` }} />
+              );
+            })}
+          </div>
+        </div>
+        {!hist.flat && (
+          <div className="flex justify-between text-[10px] text-stone-400 mt-1 font-mono"
+               style={{ fontFamily: '"Menlo", monospace' }}>
+            <span>{formatMmSs(hist.min)}</span>
+            <span>{formatMmSs(hist.max)}</span>
+          </div>
+        )}
+      </div>
+      <p className="text-sm text-stone-700 mt-2">
+        <span className="text-red-700 font-semibold">Faster than {fasterThanPct}%</span> of your games
+        <span className="text-stone-400"> · </span>
+        your <span className="font-semibold">{ordinal(rank)}-best</span> ever
+      </p>
+    </div>
+  );
+}
+
 // ===== Completed content =====
 function CompletedContent({ result, leaderboard, name, isPlayingToday, dateKey,
-                            msUntilTomorrow, puzzle, onPlayToday, onPlayerClick,
+                            msUntilTomorrow, puzzle, myResults, onPlayToday, onPlayerClick,
                             nextUnplayedDate, onPlayDate,
                             onRefresh, refreshing, onRename, onOpenScoring }) {
   const difficulty = useMemo(() => computePuzzleDifficulty(puzzle), [puzzle]);
+  // Rank within today's field, derived from the same leaderboard data already
+  // being fetched — no extra query, just a small header callout.
+  const rankInfo = useMemo(() => {
+    const entries = Object.entries(leaderboard).sort((a, b) => a[1].time - b[1].time);
+    const idx = entries.findIndex(([n]) => n === name);
+    if (idx === -1 || entries.length < 2) return null;
+    return { rank: idx + 1, total: entries.length };
+  }, [leaderboard, name]);
   return (
     <main className="flex-1 flex items-start justify-center p-4">
       <div className="max-w-md w-full bg-white rounded-xl shadow-md p-6">
@@ -1145,7 +1275,14 @@ function CompletedContent({ result, leaderboard, name, isPlayingToday, dateKey,
 
         <div className="border-t border-stone-200 pt-4 mb-4">
           <div className="flex items-center justify-between mb-2">
-            <h3 className="text-sm font-semibold text-stone-700">Leaderboard</h3>
+            <h3 className="text-sm font-semibold text-stone-700">
+              Leaderboard
+              {rankInfo && (
+                <span className="text-stone-400 font-normal">
+                  {' '}· you're {ordinal(rankInfo.rank)} of {rankInfo.total}
+                </span>
+              )}
+            </h3>
             <button onClick={onRefresh} disabled={refreshing}
               className="text-xs text-stone-500 hover:text-stone-700 disabled:opacity-50">
               {refreshing ? 'Refreshing…' : '↻ Refresh'}
@@ -1153,6 +1290,8 @@ function CompletedContent({ result, leaderboard, name, isPlayingToday, dateKey,
           </div>
           <Leaderboard results={leaderboard} currentName={name} onPlayerClick={onPlayerClick} />
         </div>
+
+        <PersonalHistoryCard myResults={myResults} thisTime={result.time} thisDateKey={dateKey} />
 
         <div className="flex flex-col items-center gap-3 mt-4">
           {isPlayingToday ? (
@@ -3351,6 +3490,7 @@ export default function App() {
           dateKey={activeDate}
           msUntilTomorrow={msUntilTomorrow}
           puzzle={puzzle}
+          myResults={myResults}
           onPlayToday={() => handleTabChange('game')}
           nextUnplayedDate={nextUnplayedDate}
           onPlayDate={(date) => { setPlayingDate(date); setView('game'); }}
