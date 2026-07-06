@@ -308,6 +308,42 @@ function buildPersonalHistogram(times, thisTime, binCount = 7) {
   return { bins, min, max, thisIdx, thisPct, flat: false };
 }
 
+// A player needs at least this many split-recorded solves before the
+// "where your time goes" pace chart is worth showing — fewer than this and
+// per-position medians are too noisy to read as a real pattern. Lower than
+// the private analytics dashboard's own n>=10 bar, since this is a smaller,
+// friendlier readout rather than a statistical claim.
+const MIN_SPLITS_FOR_PACE_CHART = 5;
+
+// A splits array holds cumulative seconds per set, in find order. Convert
+// to per-position gaps: how long each individual set took to find, timed
+// from the previous find (or from puzzle start, for the first set).
+function splitsToGaps(splits) {
+  return splits.map((s, i) => (i === 0 ? s.t : s.t - splits[i - 1].t));
+}
+
+function computeMedian(arr) {
+  if (!arr.length) return null;
+  const sorted = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
+// Builds per-set-position median gaps across a set of solves (each with a
+// `splits` array). Returns one entry per position (0 = 1st set found) with
+// its median gap and sample size. A handful of historical puzzles with
+// fewer than 6 sets just contribute nothing to the later positions rather
+// than skewing or crashing them.
+function buildPaceByPosition(solves, maxPositions = 6) {
+  const byPos = Array.from({ length: maxPositions }, () => []);
+  for (const row of solves) {
+    if (!row.splits || !row.splits.length) continue;
+    const gaps = splitsToGaps(row.splits);
+    gaps.forEach((g, i) => { if (i < maxPositions) byPos[i].push(g); });
+  }
+  return byPos.map((gaps) => ({ median: computeMedian(gaps), n: gaps.length }));
+}
+
 function formatLongDate(dateKey) {
   return new Date(dateKeyToUTC(dateKey)).toLocaleDateString(undefined, {
     weekday: 'long', month: 'long', day: 'numeric', timeZone: 'UTC',
@@ -691,6 +727,32 @@ const Storage = {
       } catch { return {}; }
     }
     return {};
+  },
+  // Fetch one player's own split-recorded solves — scoped by name, so most
+  // profile views (players below the pace-chart threshold) never trigger
+  // the heavier field-wide query below.
+  async loadPlayerSplits(playerName) {
+    if (USE_SUPABASE && playerName) {
+      try {
+        const rows = await sbFetch(
+          `/results?name=eq.${encodeURIComponent(playerName)}&splits=not.is.null&select=date,splits&order=date.desc&limit=2000`
+        );
+        return rows || [];
+      } catch { return []; }
+    }
+    return [];
+  },
+  // Fetch every split-recorded solve across all players, to compute the
+  // field's median pace per set position. Only called once a profile has
+  // already cleared MIN_SPLITS_FOR_PACE_CHART on its own scoped query above.
+  async loadFieldSplits() {
+    if (USE_SUPABASE) {
+      try {
+        const rows = await sbFetch('/results?splits=not.is.null&select=splits&limit=5000');
+        return rows || [];
+      } catch { return []; }
+    }
+    return [];
   },
 };
 
@@ -2188,6 +2250,21 @@ function PlayerStatsContent({ player, todayKey, currentName, onBack, onOpenScori
   const [history, setHistory] = useState(null);
   useEffect(() => { Storage.loadAllHistory().then(setHistory); }, []);
 
+  // Pace-chart data: scoped fetch first (cheap), then the wider field-wide
+  // fetch only if this player actually clears the threshold to show it.
+  const [mySplits, setMySplits] = useState(null);
+  const [fieldSplits, setFieldSplits] = useState(null);
+  useEffect(() => {
+    setMySplits(null);
+    setFieldSplits(null);
+    Storage.loadPlayerSplits(player).then(setMySplits);
+  }, [player]);
+  useEffect(() => {
+    if (mySplits && mySplits.length >= MIN_SPLITS_FOR_PACE_CHART && fieldSplits === null) {
+      Storage.loadFieldSplits().then(setFieldSplits);
+    }
+  }, [mySplits, fieldSplits]);
+
   if (history === null) {
     return (
       <main className="flex-1 flex items-center justify-center text-stone-500">
@@ -2285,6 +2362,33 @@ function PlayerStatsContent({ player, todayKey, currentName, onBack, onOpenScori
     cursor = utcDateKey(new Date(dateKeyToUTC(cursor) - 86400000));
   }
 
+  // Pace chart: only ready once this player clears the threshold AND the
+  // field-wide comparison data has loaded. Below the threshold, or while
+  // still loading, paceReady is false and the card just doesn't render.
+  const paceReady = mySplits && mySplits.length >= MIN_SPLITS_FOR_PACE_CHART && fieldSplits;
+  let myPace = null, fieldPace = null, paceMax = 1, paceTakeaway = null;
+  if (paceReady) {
+    myPace = buildPaceByPosition(mySplits);
+    fieldPace = buildPaceByPosition(fieldSplits);
+    const allVals = [...myPace, ...fieldPace].map((p) => p.median).filter((v) => v != null);
+    paceMax = allVals.length ? Math.max(...allVals) : 1;
+    let bestIdx = -1, bestAbsGap = -Infinity, bestGap = 0;
+    for (let i = 0; i < myPace.length; i++) {
+      if (myPace[i].median != null && fieldPace[i].median != null) {
+        const gap = myPace[i].median - fieldPace[i].median;
+        if (Math.abs(gap) > bestAbsGap) { bestAbsGap = Math.abs(gap); bestIdx = i; bestGap = gap; }
+      }
+    }
+    if (bestIdx >= 0) {
+      const label = bestIdx === myPace.length - 1 ? 'last-set hunt' : `${ordinal(bestIdx + 1)}-set find`;
+      const mine = myPace[bestIdx].median.toFixed(1);
+      const field = fieldPace[bestIdx].median.toFixed(1);
+      paceTakeaway = bestGap > 0
+        ? <>Your <b>{label}</b> costs you the most — {mine}s vs field {field}s.</>
+        : <>Your <b>{label}</b> is where you gain the most ground — {mine}s vs field {field}s.</>;
+    }
+  }
+
   return (
     <main className="flex-1 p-3 max-w-2xl w-full mx-auto">
       <button onClick={onBack}
@@ -2339,6 +2443,51 @@ function PlayerStatsContent({ player, todayKey, currentName, onBack, onOpenScori
           })}
         </div>
       </div>
+
+      {paceReady && (
+        <div className="bg-white rounded-md shadow-sm p-3 mb-3">
+          <div className="text-[10px] text-stone-500 uppercase tracking-wider font-semibold mb-1.5">
+            Where your time goes
+            <span className="normal-case font-normal text-stone-400"> · {mySplits.length} timed solves</span>
+          </div>
+          <div className="flex items-center gap-3 text-[11px] text-stone-500 mb-2">
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-sm bg-red-600 inline-block" /> You
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="w-2.5 h-2.5 rounded-sm bg-stone-300 inline-block" /> Field median
+            </span>
+          </div>
+          <div className="flex items-end gap-2">
+            {myPace.map((mine, i) => {
+              const field = fieldPace[i];
+              const mineH = mine.median != null ? Math.max(4, Math.round((mine.median / paceMax) * 100)) : 0;
+              const fieldH = field.median != null ? Math.max(4, Math.round((field.median / paceMax) * 100)) : 0;
+              return (
+                <div key={i} className="flex-1 flex flex-col items-center">
+                  <div className="text-[8px] text-red-700 font-semibold h-3 leading-3">
+                    {mine.median != null ? mine.median.toFixed(1) : ''}
+                  </div>
+                  <div className="flex items-end gap-0.5 w-full justify-center" style={{ height: '84px' }}>
+                    <div className="w-2.5 rounded-t bg-red-600" style={{ height: `${mineH}%` }}
+                         title={mine.median != null ? `You: ${mine.median.toFixed(1)}s` : 'no data'} />
+                    <div className="w-2.5 rounded-t bg-stone-300" style={{ height: `${fieldH}%` }}
+                         title={field.median != null ? `Field: ${field.median.toFixed(1)}s` : 'no data'} />
+                  </div>
+                  <div className="text-[9px] text-stone-400 mt-1">
+                    {i === myPace.length - 1 ? 'last' : ordinal(i + 1)}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          {paceTakeaway && (
+            <p className="text-xs text-stone-600 mt-3 pt-2 border-t border-stone-100 leading-relaxed">
+              {paceTakeaway}
+            </p>
+          )}
+        </div>
+      )}
 
       {multiPlayerEntries.length > 0 && (
         <div className="bg-white rounded-md shadow-sm p-3 mb-3">
