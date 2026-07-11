@@ -395,10 +395,36 @@ const hasStorage = () =>
   typeof window.storage.get === 'function';
 
 const LS_NAME = 'daily-set:player-name';
+const LS_SECRET = 'daily-set:player-secret';
 const LS_MINE_PREFIX = 'daily-set:mine:';
 
 const lsGetName = () => { try { return localStorage.getItem(LS_NAME); } catch { return null; } };
 const lsSetName = (n) => { try { localStorage.setItem(LS_NAME, n); } catch {} };
+
+// --- Ownership secret ---------------------------------------------------
+// Each player's name is protected by a long random secret held on their
+// device. It's created silently the first time they play (or the first time
+// an existing player opens a build that has this code), registered against
+// their name server-side, and sent with every result submission. Nobody ever
+// has to see or type it in the normal case — but it IS the only proof that
+// you're you, so it's surfaced as a copyable "sync code" for moving devices.
+const lsGetSecret = () => { try { return localStorage.getItem(LS_SECRET); } catch { return null; } };
+const lsSetSecret = (s) => { try { localStorage.setItem(LS_SECRET, s); } catch {} };
+
+function generateSecret() {
+  try {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+      return `${crypto.randomUUID()}-${crypto.randomUUID()}`.replace(/-/g, '').slice(0, 40);
+    }
+    if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+      const a = new Uint8Array(20);
+      crypto.getRandomValues(a);
+      return Array.from(a, (b) => b.toString(16).padStart(2, '0')).join('');
+    }
+  } catch {}
+  // Last-resort fallback; only reached on ancient browsers with no crypto.
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`.slice(0, 40);
+}
 const lsGetResult = (d) => {
   try { const v = localStorage.getItem(LS_MINE_PREFIX + d); return v ? JSON.parse(v) : null; }
   catch { return null; }
@@ -432,6 +458,23 @@ async function sbFetch(path, opts = {}) {
   });
   if (!res.ok) throw new Error(`Supabase ${res.status}: ${await res.text()}`);
   if (res.status === 204) return null;
+  return res.json();
+}
+
+// Call a security-definer Postgres function. Writes go through these rather
+// than straight table POSTs, so the server can verify the caller actually
+// owns the name they're submitting under.
+async function sbRpc(fn, args) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${fn}`, {
+    method: 'POST',
+    headers: {
+      apikey: SUPABASE_KEY,
+      Authorization: `Bearer ${SUPABASE_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(args),
+  });
+  if (!res.ok) throw new Error(`Supabase rpc ${fn} ${res.status}: ${await res.text()}`);
   return res.json();
 }
 
@@ -481,6 +524,40 @@ const Storage = {
       return;
     }
     lsSetName(name);
+  },
+
+  // --- Identity / ownership ---------------------------------------------
+  getSecret() { return lsGetSecret(); },
+  setSecret(s) { lsSetSecret(s); },
+
+  // Ensure this device has a secret, creating one if needed. Returns it.
+  ensureSecret() {
+    let s = lsGetSecret();
+    if (!s) { s = generateSecret(); lsSetSecret(s); }
+    return s;
+  },
+
+  // Try to own `name` with `secret`. Server returns one of:
+  //   'claimed'      - the name was unowned; it's ours now
+  //   'ok'           - already ours (secret matches) — normal returning player
+  //   'taken'        - owned by someone else's secret
+  //   'invalid'      - malformed name/secret
+  //   'unavailable'  - network/server problem (we fail OPEN, see below)
+  //
+  // We deliberately fail OPEN on network errors: if Supabase is unreachable
+  // we let the player keep playing under their existing local name rather
+  // than locking them out of a puzzle over a flaky connection. The server is
+  // still the thing that enforces writes, so a spoofer gains nothing by
+  // forcing this path.
+  async claimName(name, secret) {
+    if (!USE_SUPABASE) return 'claimed';
+    try {
+      const r = await sbRpc('claim_name', { p_name: name, p_secret: secret });
+      return typeof r === 'string' ? r : 'unavailable';
+    } catch (e) {
+      console.error('claimName:', e);
+      return 'unavailable';
+    }
   },
   async getMyResult(dateKey, playerName) {
     if (USE_SUPABASE && playerName) {
@@ -553,15 +630,19 @@ const Storage = {
     if (USE_SUPABASE) {
       lsSetResult(dateKey, payload);
       try {
-        await sbFetch('/results', {
-          method: 'POST',
-          headers: { Prefer: 'resolution=ignore-duplicates,return=minimal' },
-          body: JSON.stringify({
-            date: dateKey, name,
-            time_seconds: time, completed_at: payload.completedAt,
-            splits: payload.splits || null,
-          }),
+        // Verified write: the server checks name+secret before inserting.
+        // The result is always kept locally first (above), so even if this
+        // fails the player still sees their time and syncLocalToCloud will
+        // retry the push on next load.
+        const r = await sbRpc('submit_result', {
+          p_name: name,
+          p_secret: Storage.ensureSecret(),
+          p_date: dateKey,
+          p_time_seconds: time,
+          p_completed_at: payload.completedAt,
+          p_splits: payload.splits || null,
         });
+        if (r !== 'ok') console.error('saveResult rejected:', r);
       } catch (e) { console.error('saveResult:', e); }
       return;
     }
@@ -618,20 +699,20 @@ const Storage = {
       const missing = Object.entries(local).filter(([d]) => !cloudDates.has(d));
       if (missing.length === 0) return { pushed: 0 };
       let pushed = 0;
+      const secret = Storage.ensureSecret();
       for (const [date, payload] of missing) {
         if (!payload || typeof payload.time !== 'number') continue;
         try {
-          await sbFetch('/results', {
-            method: 'POST',
-            headers: { Prefer: 'resolution=ignore-duplicates,return=minimal' },
-            body: JSON.stringify({
-              date, name: playerName,
-              time_seconds: payload.time,
-              completed_at: payload.completedAt || Date.now(),
-              splits: payload.splits || null,
-            }),
+          const r = await sbRpc('submit_result', {
+            p_name: playerName,
+            p_secret: secret,
+            p_date: date,
+            p_time_seconds: payload.time,
+            p_completed_at: payload.completedAt || Date.now(),
+            p_splits: payload.splits || null,
           });
-          pushed++;
+          if (r === 'ok') pushed++;
+          else console.error(`syncLocalToCloud: rejected for ${date}:`, r);
         } catch (e) {
           console.error(`syncLocalToCloud: failed for ${date}:`, e);
         }
@@ -647,14 +728,15 @@ const Storage = {
   async saveSurvivorResult(week, name, score, passesUsed, board) {
     if (!USE_SUPABASE) return;
     try {
-      await sbFetch('/survivor_results', {
-        method: 'POST',
-        headers: { Prefer: 'return=minimal' },
-        body: JSON.stringify({
-          week, name, score, passes_used: passesUsed,
-          board, completed_at: Date.now(),
-        }),
+      const r = await sbRpc('submit_survivor', {
+        p_name: name,
+        p_secret: Storage.ensureSecret(),
+        p_week: week,
+        p_score: score,
+        p_passes_used: passesUsed,
+        p_board: board || null,
       });
+      if (r !== 'ok') console.error('saveSurvivorResult rejected:', r);
     } catch (e) { console.error('saveSurvivorResult:', e); }
   },
   // Best score per player for one week, with attempt counts.
@@ -959,10 +1041,41 @@ function TabBar({ activeTab, onChange }) {
 }
 
 // ===== Name entry (own screen, no chrome) =====
-function NameEntry({ initial, onSubmit, onCancel }) {
+// onSubmit(name, syncCode) resolves to a status string: 'ok' | 'taken' |
+// 'invalid' | 'unavailable'. On 'taken' we reveal the sync-code field, which
+// is how someone reclaims their own name on a new device (or after clearing
+// their browser). mySecret, when present, is shown as this device's own sync
+// code so it can be copied to another phone.
+function NameEntry({ initial, onSubmit, onCancel, mySecret }) {
   const [input, setInput] = useState(initial || '');
+  const [syncCode, setSyncCode] = useState('');
+  const [showSync, setShowSync] = useState(false);
+  const [status, setStatus] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+
   const trimmed = input.trim();
   const valid = trimmed.length > 0 && trimmed.length <= 20;
+
+  const submit = async () => {
+    if (!valid || busy) return;
+    setBusy(true);
+    setStatus(null);
+    const res = await onSubmit(trimmed, showSync ? syncCode.trim() : '');
+    setBusy(false);
+    if (res === 'taken') { setStatus('taken'); setShowSync(true); }
+    else if (res === 'invalid') setStatus('invalid');
+    else if (res === 'unavailable') setStatus('unavailable');
+  };
+
+  const copySecret = async () => {
+    try {
+      await navigator.clipboard.writeText(mySecret);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch {}
+  };
+
   return (
     <div className="min-h-screen bg-stone-50 flex items-center justify-center p-4"
          style={{ fontFamily: '"Inter", system-ui, sans-serif' }}>
@@ -974,17 +1087,57 @@ function NameEntry({ initial, onSubmit, onCancel }) {
         <p className="text-stone-600 text-sm text-center mb-5">
           A fresh 6-set puzzle every day. Same puzzle for everyone.
         </p>
+
         <label className="block text-sm font-medium text-stone-700 mb-1">Your name</label>
         <input
           type="text" value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Enter' && valid) onSubmit(trimmed); }}
+          onChange={(e) => { setInput(e.target.value); setStatus(null); }}
+          onKeyDown={(e) => { if (e.key === 'Enter') submit(); }}
           maxLength={20}
           placeholder="e.g. Aaron"
           autoFocus
-          className="w-full px-3 py-2 border border-stone-300 rounded-md
-                     focus:outline-none focus:ring-2 focus:ring-red-500"
+          className={`w-full px-3 py-2 border rounded-md focus:outline-none focus:ring-2
+                     ${status === 'taken'
+                       ? 'border-red-400 focus:ring-red-500'
+                       : 'border-stone-300 focus:ring-red-500'}`}
         />
+
+        {status === 'taken' && (
+          <div className="mt-2 text-sm text-red-700 bg-red-50 border border-red-200
+                          rounded-md px-3 py-2">
+            <strong>That name's taken.</strong> Pick a different one — or, if it's
+            yours, paste your sync code below to claim it on this device.
+          </div>
+        )}
+        {status === 'invalid' && (
+          <p className="mt-2 text-sm text-red-700">That name can't be used. Try another.</p>
+        )}
+        {status === 'unavailable' && (
+          <p className="mt-2 text-sm text-amber-700">
+            Couldn't reach the server. Check your connection and try again.
+          </p>
+        )}
+
+        {showSync && (
+          <div className="mt-3">
+            <label className="block text-sm font-medium text-stone-700 mb-1">
+              Sync code <span className="text-stone-400 font-normal">(optional)</span>
+            </label>
+            <input
+              type="text" value={syncCode}
+              onChange={(e) => setSyncCode(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') submit(); }}
+              placeholder="Paste the code from your other device"
+              className="w-full px-3 py-2 border border-stone-300 rounded-md text-sm
+                         focus:outline-none focus:ring-2 focus:ring-red-500"
+              style={{ fontFamily: '"Menlo", monospace' }}
+            />
+            <p className="text-xs text-stone-400 mt-1">
+              Find it under “Change name” on the device you normally play on.
+            </p>
+          </div>
+        )}
+
         <div className="flex gap-2 mt-3">
           {onCancel && (
             <button onClick={onCancel}
@@ -994,16 +1147,43 @@ function NameEntry({ initial, onSubmit, onCancel }) {
             </button>
           )}
           <button
-            onClick={() => onSubmit(trimmed)}
-            disabled={!valid}
+            onClick={submit}
+            disabled={!valid || busy}
             className="flex-1 px-4 py-2 bg-red-700 hover:bg-red-800 text-white
                        rounded-md font-medium
                        disabled:opacity-50 disabled:cursor-not-allowed
                        transition-colors"
           >
-            {initial ? 'Save' : 'Start playing'}
+            {busy ? 'Checking…' : initial ? 'Save' : 'Start playing'}
           </button>
         </div>
+
+        {mySecret && (
+          <div className="mt-5 pt-4 border-t border-stone-200">
+            <div className="text-[11px] uppercase tracking-wider text-stone-500 font-semibold mb-1">
+              Your sync code
+            </div>
+            <p className="text-xs text-stone-500 mb-2 leading-relaxed">
+              This is what proves this name is yours. Paste it into another device
+              to play as <strong>{initial}</strong> there. Keep it to yourself.
+            </p>
+            <div className="flex gap-2">
+              <input
+                readOnly value={mySecret}
+                onFocus={(e) => e.target.select()}
+                className="flex-1 min-w-0 px-2 py-1.5 bg-stone-50 border border-stone-200
+                           rounded text-xs text-stone-600"
+                style={{ fontFamily: '"Menlo", monospace' }}
+              />
+              <button onClick={copySecret}
+                className="px-3 py-1.5 bg-stone-100 hover:bg-stone-200 rounded
+                           text-xs font-medium text-stone-700 transition-colors flex-shrink-0">
+                {copied ? 'Copied ✓' : 'Copy'}
+              </button>
+            </div>
+          </div>
+        )}
+
         <p className="text-xs text-stone-400 mt-3 text-center">
           Your name and times will be visible to others playing this puzzle.
         </p>
@@ -3337,12 +3517,38 @@ export default function App() {
   const lastActiveDateRef = useRef(null);
 
   // === Load name on mount ===
+  // Existing players arrive here with a name in localStorage but no secret
+  // (they predate the ownership system). We silently mint a secret and claim
+  // their name for them — so the ~60 people already playing get grandfathered
+  // in without ever seeing a prompt. If someone else got there first, the name
+  // comes back 'taken' and we send them to the name screen to sort it out;
+  // that should be rare, and only for names that were dormant.
   useEffect(() => {
-    Storage.getName().then((n) => {
+    (async () => {
+      const n = await Storage.getName();
+      if (!n) {
+        setNameState(null);
+        setLoadingName(false);
+        setView('firstname');
+        return;
+      }
+      if (!Storage.getSecret()) {
+        const secret = Storage.ensureSecret();
+        const res = await Storage.claimName(n, secret);
+        if (res === 'taken') {
+          // Someone else owns this name. Drop the unusable secret so the
+          // name screen starts clean, and make them pick/reclaim.
+          Storage.setSecret('');
+          setNameState(null);
+          setLoadingName(false);
+          setView('firstname');
+          return;
+        }
+        // 'claimed' | 'ok' | 'unavailable' -> carry on as this player.
+      }
       setNameState(n);
       setLoadingName(false);
-      if (!n) setView('firstname');
-    });
+    })();
   }, []);
 
   // === Bulk-load all personal results once name is set ===
@@ -3521,10 +3727,25 @@ export default function App() {
     else if (selected.length < 3) setSelected([...selected, idx]);
   };
 
-  const handleNameSubmit = async (n) => {
+  // Claim `n` before accepting it. If the player supplied a sync code, we try
+  // that secret instead of this device's — that's how you reclaim your own
+  // name on a new phone. Returns a status the NameEntry screen renders.
+  const handleNameSubmit = async (n, syncCode) => {
+    const secret = (syncCode && syncCode.length >= 16)
+      ? syncCode
+      : Storage.ensureSecret();
+
+    const res = await Storage.claimName(n, secret);
+
+    if (res === 'taken' || res === 'invalid') return res;
+
+    // 'claimed' (new name), 'ok' (already ours / valid sync code), or
+    // 'unavailable' (offline — fail open, the server still gates writes).
+    if (syncCode && res === 'ok') Storage.setSecret(secret);  // adopt the synced identity
     await Storage.setName(n);
     setNameState(n);
     setView('game');
+    return 'ok';
   };
 
   const refreshLeaderboard = async () => {
@@ -3613,7 +3834,8 @@ export default function App() {
         <PreviewModeBanner />
         <NameEntry initial={name}
                    onSubmit={handleNameSubmit}
-                   onCancel={() => setView('game')} />
+                   onCancel={() => setView('game')}
+                   mySecret={Storage.getSecret() || undefined} />
       </>
     );
   }
