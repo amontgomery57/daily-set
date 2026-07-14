@@ -271,6 +271,16 @@ function formatMmSs(s) {
   return `${m}:${remaining.toFixed(2).padStart(5, '0')}`;
 }
 
+// Compact variant for dense tables (e.g. the Players standings), where six
+// numeric columns have to fit a 400px phone. One decimal instead of two:
+// 123.45 -> "2:03.4". Averages don't need hundredths to be comparable.
+function formatMmSs1(s) {
+  const safe = typeof s === 'number' && isFinite(s) ? s : 0;
+  const m = Math.floor(safe / 60);
+  const remaining = safe - m * 60;
+  return `${m}:${remaining.toFixed(1).padStart(4, '0')}`;
+}
+
 // "3rd", "24th", "1st" — used only for the personal-history callouts below.
 function ordinal(n) {
   const s = ['th', 'st', 'nd', 'rd'], v = n % 100;
@@ -2211,7 +2221,17 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
       {tab === 'players' && (
         <>
           <div className="bg-white rounded-md shadow-sm overflow-hidden">
-            <table className="w-full border-collapse">
+            <table className="w-full table-fixed border-collapse">
+              {/* Fixed widths: the name column absorbs the slack (and truncates)
+                  so the numeric columns can never be pushed off a narrow phone. */}
+              <colgroup>
+                <col style={{ width: '30%' }} />
+                <col style={{ width: '15%' }} />
+                <col style={{ width: '15%' }} />
+                <col style={{ width: '15%' }} />
+                <col style={{ width: '15%' }} />
+                <col style={{ width: '10%' }} />
+              </colgroup>
               <thead>
                 <tr>
                   {[
@@ -2220,7 +2240,7 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
                     { k: 'medium', node: <TierStars stars={2} />, align: 'right' },
                     { k: 'hard',   node: <TierStars stars={3} />, align: 'right' },
                     { k: 'avg',    node: 'Avg', align: 'right' },
-                    { k: 'played', node: 'Solves', align: 'right' },
+                    { k: 'played', node: '#', align: 'right' },
                   ].map(({ k, node, align }) => {
                     const active = sortKey === k;
                     return (
@@ -2230,11 +2250,12 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
                           // times & name sort ascending first; counts descending first
                           else { setSortKey(k); setSortAsc(k !== 'played'); }
                         }}
-                        className={`px-1 py-2 bg-stone-50 border-b border-stone-200
-                                   text-[10px] uppercase tracking-wide font-bold whitespace-nowrap
+                        className={`px-0.5 py-2 bg-stone-50 border-b border-stone-200
+                                   text-[10px] uppercase tracking-tight font-bold whitespace-nowrap
                                    cursor-pointer select-none transition-colors
                                    hover:bg-stone-100
                                    ${align === 'left' ? 'text-left pl-2.5' : 'text-right'}
+                                   ${k === 'played' ? 'pr-2' : ''}
                                    ${active ? 'text-red-700' : 'text-stone-400'}`}>
                         {node}
                         {active && (
@@ -2249,19 +2270,19 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
                 {sortedRegulars.map((p, i) => {
                   const isMe = p.name === currentName;
                   const cell = (v) => v == null
-                    ? <td className="px-1 py-2 text-right text-stone-300 border-b border-stone-100">—</td>
-                    : <td className="px-1 py-2 text-right border-b border-stone-100 tabular-nums
-                                     text-stone-600 text-[12.5px]"
-                          style={{ fontFamily: '"Menlo", monospace' }}>{formatMmSs(v)}</td>;
+                    ? <td className="px-0.5 py-2 text-right text-stone-300 border-b border-stone-100">—</td>
+                    : <td className="px-0.5 py-2 text-right border-b border-stone-100 tabular-nums
+                                     text-stone-600 text-[12px]"
+                          style={{ fontFamily: '"Menlo", monospace' }}>{formatMmSs1(v)}</td>;
                   return (
                     <tr key={p.name}
                         onClick={() => onPlayerClick(p.name)}
                         className={`cursor-pointer transition-colors
                                    ${isMe ? 'bg-red-50 hover:bg-red-100' : 'hover:bg-stone-50'}`}>
-                      <td className={`px-1 pl-2.5 py-2 border-b border-stone-100 text-[13px]
-                                     font-semibold whitespace-nowrap
+                      <td className={`px-0.5 pl-2.5 py-2 border-b border-stone-100 text-[12.5px]
+                                     font-semibold whitespace-nowrap overflow-hidden text-ellipsis
                                      ${isMe ? 'text-red-800' : 'text-stone-800'}`}>
-                        <span className="inline-block w-4 text-stone-400 font-normal text-[11px]">
+                        <span className="inline-block w-3.5 text-stone-400 font-normal text-[10.5px]">
                           {i + 1}
                         </span>
                         {p.name}
@@ -2270,13 +2291,13 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
                       {cell(p.tiers.easy)}
                       {cell(p.tiers.medium)}
                       {cell(p.tiers.hard)}
-                      <td className={`px-1 py-2 text-right border-b border-stone-100 tabular-nums
-                                     text-[12.5px] font-bold ${isMe ? 'text-red-700' : 'text-stone-800'}`}
+                      <td className={`px-0.5 py-2 text-right border-b border-stone-100 tabular-nums
+                                     text-[12px] font-bold ${isMe ? 'text-red-700' : 'text-stone-800'}`}
                           style={{ fontFamily: '"Menlo", monospace' }}>
-                        {formatMmSs(p.avg)}
+                        {formatMmSs1(p.avg)}
                       </td>
-                      <td className="px-1 py-2 text-right border-b border-stone-100 tabular-nums
-                                     text-stone-400 text-[12px]"
+                      <td className="px-0.5 pr-2 py-2 text-right border-b border-stone-100 tabular-nums
+                                     text-stone-400 text-[11.5px]"
                           style={{ fontFamily: '"Menlo", monospace' }}>
                         {p.played}
                       </td>
@@ -2317,7 +2338,7 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
             )}
           </div>
           <p className="text-[10px] text-stone-400 text-center mt-2 px-3 leading-relaxed">
-            Average solve time by puzzle difficulty. Tap any column to sort.
+            Average solve time by puzzle difficulty (# = solves). Tap any column to sort.
             A tier needs {TIER_MIN_SOLVES}+ solves to show a time — otherwise “—”.
           </p>
         </>
