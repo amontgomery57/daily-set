@@ -109,37 +109,48 @@ function setDiffMask(a, b, c) {
 // ===== Puzzle difficulty scoring =====
 // Structural metrics, independent of the player:
 //   avgVars: average number of varying attributes across the 6 sets (1.0-4.0).
-//     A set varying in only 1 attribute (e.g. three red solid ovals, just
-//     1/2/3 of them) is trivially easy to spot; one varying in all 4 looks
-//     maximally different and is the hardest to recognize.
-//   decoys: cards that belong to no set at all. Decoys force players to
-//     actively dismiss cards, which costs scan time. Empirically the
-//     strongest single predictor of real solve times.
-//   nCompact: number of sets whose three cards sit near each other in the
-//     4-column grid (sum of pairwise Chebyshev distances <= 4). Neighboring
-//     cards get compared more often, so compact sets are found sooner;
-//     subtracted.
+//     A set varying in only 1 attribute (three red solid ovals, just 1/2/3 of
+//     them) is a "gimme"; one varying in all 4 looks maximally different and
+//     is the hardest to recognize. Empirically the strongest single predictor.
+//   decoys: cards that belong to no set at all. They still have to be
+//     visually evaluated and dismissed, which costs scan time. Real but weak.
 //
-// v2 (June 2026): recalibrated against 150 real solves (98 puzzle days,
-// players with 8+ plays, per-player normalized log solve times):
-//   raw = 0.75*avgVars + 1.0*decoys - 0.25*nCompact
-// Coefficients follow the fitted regression ratios. v1's membershipStd term
-// was dropped: its empirical sign was the opposite of the design assumption.
-// Correlation with normalized solve times is ~0.3 (v1 scored ~0.27), i.e.
-// layout structure explains roughly 10% of the variance in how long a puzzle
-// takes. ScoringContent carries the honest framing of that limit.
-const RAW_SCORE_MIN = 0.0;  // empirical min raw composite (n=30,000 sampled)
-const RAW_SCORE_MAX = 5.5;  // empirical max raw composite
-// Three buckets -> 1/2/3 stars. Cut points on the 0-10 scale are the
-// population quartiles (p25 / p75), so ~20% of layouts land in 1-star,
-// ~55% in 2-star, ~25% in 3-star. This is deliberately the only split of
-// the score that separates *monotonically* on real solve time: in our data
-// 1-star days are genuinely faster (mean z -0.48), 3-star genuinely slower
-// (+0.38), and the big 2-star middle sits at average (+0.03). Finer splits
-// (e.g. 5 tiers) put the middle out of order, because layout structure just
-// doesn't distinguish medium-hard puzzles reliably.
-const SCORE_CUT_EASY = 3.6;  // < this -> 1 star
-const SCORE_CUT_HARD = 5.7;  // >= this -> 3 stars; between -> 2 stars
+// v3 (July 2026): refit against 1,338 solves over 368 multi-player puzzle
+// days (7 players with 20+ plays; within-player standardized log solve times;
+// puzzle difficulty = mean standardized residual across that day's solvers).
+//   raw = 1.0*avgVars + 0.141*decoys
+//
+// What changed from v2 and why:
+//   - v2 used raw = 0.75*avgVars + 1.0*decoys - 0.25*nCompact. Those weights
+//     were fit on ~98 puzzle days, and nearly every conclusion from that
+//     sample turned out to be noise. With ~4x the data:
+//       avgVars   r = +0.374  (v2-era estimate said ~0.02 — "dead". It is not
+//                              dead; it is the dominant term.)
+//       decoys    r = +0.111  (v2-era estimate said +0.35 — overstated.)
+//       nCompact  r = -0.006  (no signal at all; dropped.)
+//   - The v2 weights were also miscalibrated in *raw units*: decoys spans 0-6
+//     while avgVars spans ~2-4, so weighting decoys at 1.0 let the weakest
+//     term dominate the composite. That is why the v2 score only reached
+//     r=0.212 against real difficulty despite containing the right variables.
+//
+// Result: score-vs-difficulty correlation 0.212 -> 0.395, i.e. variance
+// explained 4.5% -> 15.6%. Star tiers now separate ~3x more strongly:
+//     1-star mean z = -0.416   (v2: -0.113)
+//     2-star mean z = -0.025   (v2: -0.026)
+//     3-star mean z = +0.325   (v2: +0.158)
+// For a player who averages ~83s, that is roughly 69s / 82s / 96s by tier.
+//
+// The honest limit: 15.6% is a real improvement but still leaves ~84% of the
+// variance unexplained by board structure. The same puzzle has produced a
+// 181s solve and a 451s solve from two different people. The score is
+// directionally useful, not precise. ScoringContent says so plainly.
+const RAW_SCORE_MIN = 1.808;  // min raw composite over all real daily puzzles
+const RAW_SCORE_MAX = 3.808;  // max raw composite over all real daily puzzles
+// Cut points on the 0-10 scale, set at the p20 / p75 of real daily puzzles so
+// the mix stays ~18% / 54% / 28% (unchanged from v2's feel — the tiers keep
+// their proportions, they just finally track real solve times).
+const SCORE_CUT_EASY = 3.46;  // < this -> 1 star
+const SCORE_CUT_HARD = 6.67;  // >= this -> 3 stars; between -> 2 stars
 
 function computePuzzleDifficulty(puzzle) {
   if (!puzzle || !puzzle.sets || !puzzle.cards) return null;
@@ -158,32 +169,21 @@ function computePuzzleDifficulty(puzzle) {
   }
   const avgVars = totalVars / sets.length;
 
-  // 2. Per-card memberships -> decoys
+  // 2. Per-card memberships -> decoys (cards in zero sets)
   const memberships = new Array(cards.length).fill(0);
   for (const [i, j, k] of sets) { memberships[i]++; memberships[j]++; memberships[k]++; }
   const decoys = memberships.filter(m => m === 0).length;
 
-  // 3. Spatial compactness: card index i renders at grid (row i/4, col i%4).
-  // A set's spread = sum of pairwise Chebyshev distances between its cards;
-  // spread <= 4 means the three cards are roughly adjacent on screen.
-  const pos = (i) => [Math.floor(i / 4), i % 4];
-  const cheb = (p, q) => Math.max(Math.abs(p[0] - q[0]), Math.abs(p[1] - q[1]));
-  let nCompact = 0;
-  for (const [i, j, k] of sets) {
-    const [a, b, c] = [pos(i), pos(j), pos(k)];
-    if (cheb(a, b) + cheb(a, c) + cheb(b, c) <= 4) nCompact++;
-  }
-
-  // Raw composite, then normalize to 0-10 using empirical population bounds.
-  // Clamp in case a puzzle scores slightly outside the sampled range.
-  const rawScore = 0.75 * avgVars + 1.0 * decoys - 0.25 * nCompact;
+  // Raw composite, then normalize to 0-10 using the real-puzzle bounds.
+  // Clamp in case a puzzle lands slightly outside the observed range.
+  const rawScore = 1.0 * avgVars + 0.141 * decoys;
   const normalized = ((rawScore - RAW_SCORE_MIN) / (RAW_SCORE_MAX - RAW_SCORE_MIN)) * 10;
   const score = Math.max(0, Math.min(10, normalized));
   const level = score < SCORE_CUT_EASY ? 'easy'
               : score < SCORE_CUT_HARD ? 'medium'
               :                          'hard';
 
-  return { avgVars, decoys, nCompact, rawScore, score, level };
+  return { avgVars, decoys, rawScore, score, level };
 }
 
 // ===== Seeded RNG =====
@@ -2020,10 +2020,24 @@ function ArchiveDetailStrip({ dateKey, info, MEDAL, RANK_WORD,
 // that expand on tap.
 
 const REGULAR_MIN_SOLVES = 3;
+// Minimum solves in a difficulty tier before we show that tier's average.
+const TIER_MIN_SOLVES = 5;
 const DAYS_PAGE = 14;
 
 // Tiny trend line of a player's last few solves (chronological; lower =
 // better, so a falling line means improvement).
+// Compact 1-3 star glyph used as a column header in the Players table.
+// Filled stars stay red so they read as the same rating shown on a puzzle;
+// the header colours itself when its column is the active sort.
+function TierStars({ stars }) {
+  return (
+    <span style={{ whiteSpace: 'nowrap', letterSpacing: '-0.03em' }}>
+      <span className="text-red-600">{'★'.repeat(stars)}</span>
+      <span className="text-stone-300">{'★'.repeat(3 - stars)}</span>
+    </span>
+  );
+}
+
 function Sparkline({ times, accent }) {
   if (!times || times.length < 2) return null;
   const W = 92, H = 22, P = 3;
@@ -2045,6 +2059,9 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
   const [history, setHistory] = useState(null);
   const [tab, setTab] = useState('days');              // 'days' | 'players'
   const [showVisitors, setShowVisitors] = useState(false);
+  // Players table sorting. Default: fastest overall average first.
+  const [sortKey, setSortKey] = useState('avg');   // 'name'|'easy'|'medium'|'hard'|'avg'|'played'
+  const [sortAsc, setSortAsc] = useState(true);
   const [daysShown, setDaysShown] = useState(DAYS_PAGE);
   const [expandedDays, setExpandedDays] = useState(() => new Set());
   // Weekly Survivor standings (lazy: fetched when the tab is first opened)
@@ -2071,7 +2088,9 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
     return map;
   }, [dates]);
 
-  // Per-player aggregates, ranked by average time.
+  // Per-player aggregates, including average time per difficulty tier.
+  // A tier needs TIER_MIN_SOLVES samples before we show a number — below that
+  // the "average" is one or two puzzles and reads as false precision.
   const players = useMemo(() => {
     if (!history) return [];
     const byName = {};
@@ -2087,6 +2106,18 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
       const played = times.length;
       const best = Math.min(...times);
       const avg = Math.round((times.reduce((s, t) => s + t, 0) / played) * 100) / 100;
+
+      // per-tier averages (null when too few solves to be meaningful)
+      const tiers = {};
+      for (const level of DIFFICULTY_ORDER) {
+        const ts = rows
+          .filter((r) => difficulties[r.date]?.level === level)
+          .map((r) => r.time);
+        tiers[level] = ts.length >= TIER_MIN_SOLVES
+          ? Math.round((ts.reduce((s, t) => s + t, 0) / ts.length) * 100) / 100
+          : null;
+      }
+
       const playedSet = new Set(rows.map((r) => r.date));
       let streak = 0;
       let cursor = todayKey;
@@ -2097,29 +2128,35 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
         streak++;
         cursor = utcDateKey(new Date(dateKeyToUTC(cursor) - 86400000));
       }
-      out.push({ name: n, played, best, avg, streak, last7: times.slice(-7) });
+      out.push({ name: n, played, best, avg, streak, tiers });
     }
     out.sort((a, b) => a.avg - b.avg);
     return out;
-  }, [history, dates, todayKey]);
+  }, [history, dates, difficulties, todayKey]);
 
-  // Current player's avg by difficulty tier (the pills on their row).
-  const myTierPills = useMemo(() => {
-    if (!history || !currentName) return null;
-    const mine = [];
-    for (const d of dates) {
-      const r = history[d][currentName];
-      if (r) mine.push({ d, t: r.time });
-    }
-    if (mine.length === 0) return null;
-    const pills = DIFFICULTY_ORDER.map((level) => {
-      const ts = mine.filter((m) => difficulties[m.d]?.level === level).map((m) => m.t);
-      return ts.length
-        ? { level, n: ts.length, avg: Math.round((ts.reduce((s, t) => s + t, 0) / ts.length) * 100) / 100 }
-        : { level, n: 0 };
-    }).filter((p) => p.n > 0);
-    return pills.length ? pills : null;
-  }, [history, dates, difficulties, currentName]);
+  // Sorted view of the regulars for the table. Nulls always sink to the
+  // bottom regardless of direction, so an empty tier never wins a sort.
+  const sortedRegulars = useMemo(() => {
+    const regs = players.filter((p) => p.played >= REGULAR_MIN_SOLVES);
+    const val = (p) => {
+      if (sortKey === 'name') return null;
+      if (sortKey === 'played') return p.played;
+      if (sortKey === 'avg') return p.avg;
+      return p.tiers[sortKey];  // 'easy' | 'medium' | 'hard'
+    };
+    const arr = [...regs];
+    arr.sort((a, b) => {
+      if (sortKey === 'name') {
+        return sortAsc ? a.name.localeCompare(b.name) : b.name.localeCompare(a.name);
+      }
+      const av = val(a), bv = val(b);
+      if (av == null && bv == null) return a.avg - b.avg;
+      if (av == null) return 1;   // nulls last, always
+      if (bv == null) return -1;
+      return sortAsc ? av - bv : bv - av;
+    });
+    return arr;
+  }, [players, sortKey, sortAsc]);
 
   if (history === null) {
     return (
@@ -2154,16 +2191,6 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
     });
   };
 
-  const starsFor = (level) => {
-    const tier = DIFFICULTY_TIERS[level];
-    if (!tier) return null;
-    return (
-      <span className="text-red-600" style={{ whiteSpace: 'nowrap', letterSpacing: '0.05em' }}>
-        {'★'.repeat(tier.stars)}<span className="text-stone-300">{'★'.repeat(3 - tier.stars)}</span>
-      </span>
-    );
-  };
-
   return (
     <main className="flex-1 p-3 max-w-2xl w-full mx-auto">
       {/* segmented control */}
@@ -2183,57 +2210,81 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
 
       {tab === 'players' && (
         <>
-          <div className="flex items-baseline justify-between mb-1.5 px-1">
-            <span className="text-[11px] uppercase tracking-wider text-stone-500 font-semibold">
-              Ranked by average
-            </span>
-            <span className="text-[10px] text-stone-400">tap a player for details</span>
-          </div>
           <div className="bg-white rounded-md shadow-sm overflow-hidden">
-            {regulars.map((p) => {
-              const isMe = p.name === currentName;
-              return (
-                <button key={p.name} onClick={() => onPlayerClick(p.name)}
-                  className={`w-full text-left px-3 py-2.5 block border-t border-stone-100 first:border-t-0
-                             transition-colors
-                             ${isMe ? 'bg-red-50 hover:bg-red-100' : 'hover:bg-stone-50'}`}
-                  style={isMe ? { boxShadow: 'inset 3px 0 0 #b91c1c' } : undefined}>
-                  <div className="flex items-baseline justify-between gap-2">
-                    <span className={`text-sm font-semibold truncate ${isMe ? 'text-red-800' : 'text-stone-800'}`}>
-                      {rankOf(p)} · {p.name}
-                      {isMe && <span className="text-stone-400 font-normal text-[11px]"> (you)</span>}
-                    </span>
-                    <span className="text-[11px] text-stone-600 font-mono tabular-nums flex-shrink-0"
-                          style={{ fontFamily: '"Menlo", monospace' }}>
-                      avg <span className="font-bold text-stone-800">{formatMmSs(p.avg)}</span>
-                    </span>
-                  </div>
-                  <div className="flex items-end justify-between gap-2 mt-1">
-                    <span className="text-[10.5px] text-stone-500 min-w-0">
-                      {p.played} played · best{' '}
-                      <span className="font-mono" style={{ fontFamily: '"Menlo", monospace' }}>
-                        {formatMmSs(p.best)}
-                      </span>
-                      {p.streak >= 2 && <span> · 🔥 {p.streak}-day streak</span>}
-                    </span>
-                    <Sparkline times={p.last7} accent={isMe} />
-                  </div>
-                  {isMe && myTierPills && (
-                    <div className="flex flex-wrap gap-1.5 mt-1.5">
-                      {myTierPills.map((pill) => (
-                        <span key={pill.level}
-                              className="text-[10px] bg-white border border-red-200 rounded-full px-2 py-0.5 text-stone-600">
-                          {starsFor(pill.level)}{' '}
-                          <span className="font-mono tabular-nums" style={{ fontFamily: '"Menlo", monospace' }}>
-                            avg {formatMmSs(pill.avg)}
-                          </span>
+            <table className="w-full border-collapse">
+              <thead>
+                <tr>
+                  {[
+                    { k: 'name',   node: 'Player', align: 'left' },
+                    { k: 'easy',   node: <TierStars stars={1} />, align: 'right' },
+                    { k: 'medium', node: <TierStars stars={2} />, align: 'right' },
+                    { k: 'hard',   node: <TierStars stars={3} />, align: 'right' },
+                    { k: 'avg',    node: 'Avg', align: 'right' },
+                    { k: 'played', node: 'Solves', align: 'right' },
+                  ].map(({ k, node, align }) => {
+                    const active = sortKey === k;
+                    return (
+                      <th key={k}
+                        onClick={() => {
+                          if (sortKey === k) setSortAsc((v) => !v);
+                          // times & name sort ascending first; counts descending first
+                          else { setSortKey(k); setSortAsc(k !== 'played'); }
+                        }}
+                        className={`px-1 py-2 bg-stone-50 border-b border-stone-200
+                                   text-[10px] uppercase tracking-wide font-bold whitespace-nowrap
+                                   cursor-pointer select-none transition-colors
+                                   hover:bg-stone-100
+                                   ${align === 'left' ? 'text-left pl-2.5' : 'text-right'}
+                                   ${active ? 'text-red-700' : 'text-stone-400'}`}>
+                        {node}
+                        {active && (
+                          <span className="ml-0.5 text-[8px]">{sortAsc ? '▲' : '▼'}</span>
+                        )}
+                      </th>
+                    );
+                  })}
+                </tr>
+              </thead>
+              <tbody>
+                {sortedRegulars.map((p, i) => {
+                  const isMe = p.name === currentName;
+                  const cell = (v) => v == null
+                    ? <td className="px-1 py-2 text-right text-stone-300 border-b border-stone-100">—</td>
+                    : <td className="px-1 py-2 text-right border-b border-stone-100 tabular-nums
+                                     text-stone-600 text-[12.5px]"
+                          style={{ fontFamily: '"Menlo", monospace' }}>{formatMmSs(v)}</td>;
+                  return (
+                    <tr key={p.name}
+                        onClick={() => onPlayerClick(p.name)}
+                        className={`cursor-pointer transition-colors
+                                   ${isMe ? 'bg-red-50 hover:bg-red-100' : 'hover:bg-stone-50'}`}>
+                      <td className={`px-1 pl-2.5 py-2 border-b border-stone-100 text-[13px]
+                                     font-semibold whitespace-nowrap
+                                     ${isMe ? 'text-red-800' : 'text-stone-800'}`}>
+                        <span className="inline-block w-4 text-stone-400 font-normal text-[11px]">
+                          {i + 1}
                         </span>
-                      ))}
-                    </div>
-                  )}
-                </button>
-              );
-            })}
+                        {p.name}
+                        {isMe && <span className="text-stone-400 font-normal text-[10.5px]"> (you)</span>}
+                      </td>
+                      {cell(p.tiers.easy)}
+                      {cell(p.tiers.medium)}
+                      {cell(p.tiers.hard)}
+                      <td className={`px-1 py-2 text-right border-b border-stone-100 tabular-nums
+                                     text-[12.5px] font-bold ${isMe ? 'text-red-700' : 'text-stone-800'}`}
+                          style={{ fontFamily: '"Menlo", monospace' }}>
+                        {formatMmSs(p.avg)}
+                      </td>
+                      <td className="px-1 py-2 text-right border-b border-stone-100 tabular-nums
+                                     text-stone-400 text-[12px]"
+                          style={{ fontFamily: '"Menlo", monospace' }}>
+                        {p.played}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
 
             {visitors.length > 0 && (
               <>
@@ -2257,16 +2308,17 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
                 })}
                 <button onClick={() => setShowVisitors((v) => !v)}
                   className="w-full py-2 bg-stone-50 hover:bg-stone-100 text-stone-500 text-[11px]
-                             font-medium border-t border-stone-100 transition-colors">
+                             font-medium border-t border-stone-200 transition-colors">
                   {showVisitors
                     ? 'Hide occasional players ▴'
-                    : `Show ${visitors.length} more player${visitors.length === 1 ? '' : 's'} (under ${REGULAR_MIN_SOLVES} solves) ▾`}
+                    : `+ ${visitors.length} occasional player${visitors.length === 1 ? '' : 's'} (under ${REGULAR_MIN_SOLVES} solves) ▾`}
                 </button>
               </>
             )}
           </div>
-          <p className="text-[10px] text-stone-400 text-center mt-2 px-2">
-            sparkline = last 7 solves, lower is better · pills = your average by difficulty
+          <p className="text-[10px] text-stone-400 text-center mt-2 px-3 leading-relaxed">
+            Average solve time by puzzle difficulty. Tap any column to sort.
+            A tier needs {TIER_MIN_SOLVES}+ solves to show a time — otherwise “—”.
           </p>
         </>
       )}
@@ -3185,12 +3237,12 @@ function ScoringContent({ onBack }) {
       <div className="bg-white rounded-md border border-stone-300 p-3 mb-2
                       text-sm text-stone-800 tabular-nums text-center overflow-x-auto"
            style={{ fontFamily: '"Menlo", monospace' }}>
-        score = (raw / 5.5) × 10
+        score = ((raw − 1.808) / 2.0) × 10
       </div>
       <p className="text-xs text-stone-500 mb-5 text-center leading-relaxed">
-        where <span className="font-mono">raw = 0.75 × avgVars + 1.0 × decoys − 0.25 × nCompact</span>.{' '}
-        The raw composite spans roughly 0–5.5 across all valid 6-set layouts,
-        so the easiest possible puzzle scores ~0 and the hardest ~10.
+        where <span className="font-mono">raw = avgVars + 0.141 × decoys</span>.{' '}
+        The raw composite spans 1.81–3.81 across the puzzles this site actually
+        serves, so the easiest possible daily puzzle scores ~0 and the hardest ~10.
       </p>
 
       <section className="mb-4">
@@ -3205,7 +3257,9 @@ function ScoringContent({ onBack }) {
           Each set varies in 1–4 of its attributes (color, shape, shading,
           number). A set with 1 varying attribute looks nearly identical
           (e.g. three red solid ovals — just the count differs); a set with
-          all 4 varying looks maximally different and is the hardest to spot.{' '}
+          all 4 varying looks maximally different and is the hardest to spot.
+          Across 1,338 real solves this is comfortably the strongest structural
+          predictor of how long a puzzle takes, so it carries the most weight.{' '}
           <strong>Higher = harder.</strong>
         </p>
       </section>
@@ -3220,26 +3274,10 @@ function ScoringContent({ onBack }) {
         </h3>
         <p className="text-sm text-stone-700 leading-relaxed">
           Cards that don't belong to any set still have to be visually
-          evaluated and dismissed — wasted scanning. In this site's real solve
-          data, decoys are by far the strongest single predictor of how long
-          a puzzle takes, which is why they carry the largest weight.{' '}
+          evaluated and dismissed — wasted scanning. Decoys do slow people
+          down in our data, but only mildly, which is why they carry a small
+          weight next to avgVars.{' '}
           <strong>Higher = harder.</strong>
-        </p>
-      </section>
-
-      <section className="mb-5">
-        <h3 className="font-semibold text-stone-800 mb-1"
-            style={{ fontFamily: '"Georgia", serif' }}>
-          nCompact
-          <span className="text-stone-400 font-normal text-sm ml-1">
-            — sets whose cards sit close together
-          </span>
-        </h3>
-        <p className="text-sm text-stone-700 leading-relaxed">
-          Counts the sets whose three cards land near each other in the
-          4-column grid. Your eye naturally compares neighboring cards first,
-          so tightly clustered sets tend to get found sooner.{' '}
-          <strong>Higher = easier</strong> (so it's subtracted).
         </p>
       </section>
 
@@ -3247,10 +3285,11 @@ function ScoringContent({ onBack }) {
         Star ratings
       </h3>
       <p className="text-xs text-stone-500 mb-2 leading-relaxed">
-        The 0–10 score is bucketed into three star ratings at the population
-        quartiles, so 1★ and 3★ are the rarer ends (~20% and ~25% of all
-        layouts) and 2★ is the broad middle. These are the only cuts that line
-        up in the right order against real solve times — see below.
+        The 0–10 score is bucketed into three star ratings, cut so that 1★ and
+        3★ are the rarer ends and 2★ is the broad middle. For a player who
+        averages around 1:23, the tiers work out to roughly{' '}
+        <strong>1:09 / 1:22 / 1:36</strong> — a real spread of about 40% from
+        an easy board to a hard one.
       </p>
       <div className="bg-white rounded-md border border-stone-300 divide-y divide-stone-200 mb-5">
         <div className="px-4 py-1.5 flex items-center gap-3 bg-stone-50
@@ -3260,9 +3299,9 @@ function ScoringContent({ onBack }) {
           <span className="w-16 text-right">Share</span>
         </div>
         {[
-          [1, 'Easy', '0.0 – 3.6', '~20%'],
-          [2, 'Medium', '3.6 – 5.7', '~55%'],
-          [3, 'Hard', '5.7 – 10.0', '~25%'],
+          [1, 'Easy', '0.0 – 3.5', '~18%'],
+          [2, 'Medium', '3.5 – 6.7', '~54%'],
+          [3, 'Hard', '6.7 – 10.0', '~28%'],
         ].map(([stars, label, range, share]) => (
           <div key={label} className="px-4 py-2.5 flex items-center gap-3">
             <span className="text-sm flex-1 min-w-0">
@@ -3293,23 +3332,28 @@ function ScoringContent({ onBack }) {
           — not a promise about how your solve will go.
         </p>
         <p>
-          The formula was recalibrated in June 2026 against 150 real solves
-          from this site's own leaderboard. Even after recalibration, the
-          underlying score's correlation with (player-adjusted) solve times is
-          about 0.3 — meaning the layout's structure explains only around{' '}
-          <strong>10% of the variance</strong> in how long a puzzle takes.
-          The rest is everything a layout metric can't see: which set your
-          eye happens to land on first, focus, luck.
+          The formula was refit in July 2026 against{' '}
+          <strong>1,338 real solves</strong> across 368 puzzle days from this
+          site's own leaderboard — comparing each solve against that player's
+          own baseline, so a fast player's easy day doesn't get mistaken for an
+          easy puzzle. The refit roughly doubled the score's accuracy: its
+          correlation with player-adjusted solve times went from 0.21 to{' '}
+          <strong>0.40</strong>.
         </p>
         <p>
-          That's exactly why there are only three buckets instead of a precise
-          number. The good news: across our data the three ratings line up in
-          the right order — 1★ days really do get solved faster on average,
-          3★ days slower, and 2★ sits in between. The honest caveat: it's an
-          average, and 2★ is the big middle where structure says the least. A
-          2★ puzzle can absolutely fight you harder than a 3★ one, and the
-          same puzzle routinely splits the leaderboard — fast for one player,
-          brutal for another.
+          Which still means the layout explains only about{' '}
+          <strong>16% of the variance</strong> in how long a puzzle takes. The
+          other 84% is everything a structural metric can't see: which set your
+          eye lands on first, focus, luck. The same puzzle here has produced a
+          3-minute solve and a 7½-minute solve from two different people.
+        </p>
+        <p>
+          That's exactly why there are three buckets and not a precise number.
+          The three ratings do line up in the right order — 1★ days genuinely
+          get solved faster, 3★ days genuinely slower — but it's an average,
+          and 2★ is the big middle where structure says the least. A 2★ puzzle
+          can absolutely fight you harder than a 3★ one. Read the stars as{' '}
+          <strong>a tendency, not a prediction.</strong>
         </p>
       </div>
 
