@@ -471,6 +471,37 @@ async function sbFetch(path, opts = {}) {
   return res.json();
 }
 
+// PostgREST caps every response at a fixed number of rows server-side (1000
+// by default). A large `limit=` in the URL can only make a page SMALLER than
+// that cap, never larger — so a single request silently truncates any table
+// with more than ~1000 rows. This walks the whole result set in pages using
+// the Range header and concatenates them. `path` must already include its
+// select/order; do NOT put a limit on it.
+async function sbFetchAll(path, pageSize = 1000) {
+  const all = [];
+  let from = 0;
+  // hard stop so a bug can never spin forever (100 pages = 100k rows)
+  for (let guard = 0; guard < 100; guard++) {
+    const to = from + pageSize - 1;
+    const res = await fetch(`${SUPABASE_URL}/rest/v1${path}`, {
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        'Content-Type': 'application/json',
+        Range: `${from}-${to}`,
+        'Range-Unit': 'items',
+      },
+    });
+    if (!res.ok) throw new Error(`Supabase ${res.status}: ${await res.text()}`);
+    const page = res.status === 204 ? [] : await res.json();
+    all.push(...page);
+    // Short page (or empty) means we've reached the end.
+    if (!page.length || page.length < pageSize) break;
+    from += pageSize;
+  }
+  return all;
+}
+
 // Call a security-definer Postgres function. Writes go through these rather
 // than straight table POSTs, so the server can verify the caller actually
 // owns the name they're submitting under.
@@ -775,8 +806,8 @@ const Storage = {
   async loadSurvivorChampions(excludeWeek) {
     if (!USE_SUPABASE) return [];
     try {
-      const rows = await sbFetch(
-        '/survivor_results?select=week,name,score,completed_at&order=week.desc&limit=5000'
+      const rows = await sbFetchAll(
+        '/survivor_results?select=week,name,score,completed_at&order=week.desc'
       );
       const byWeek = {};
       for (const r of rows || []) {
@@ -823,8 +854,10 @@ const Storage = {
     if (USE_SUPABASE) {
       return cachedFetch('allHistory', HISTORY_CACHE_TTL_MS, async () => {
         try {
-          const rows = await sbFetch(
-            '/results?select=date,name,time_seconds,completed_at&order=date.desc&limit=10000'
+          // Paginated: PostgREST caps single responses ~1000 rows, which was
+          // silently truncating history to only the most recent dates.
+          const rows = await sbFetchAll(
+            '/results?select=date,name,time_seconds,completed_at&order=date.desc'
           );
           const history = {};
           for (const row of rows || []) {
@@ -879,7 +912,7 @@ const Storage = {
     if (USE_SUPABASE) {
       return cachedFetch('fieldSplits', HISTORY_CACHE_TTL_MS, async () => {
         try {
-          const rows = await sbFetch('/results?splits=not.is.null&select=splits&limit=5000');
+          const rows = await sbFetchAll('/results?splits=not.is.null&select=splits');
           return rows || [];
         } catch { return []; }
       });
