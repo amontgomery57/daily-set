@@ -281,6 +281,17 @@ function formatMmSs1(s) {
   return `${m}:${remaining.toFixed(1).padStart(4, '0')}`;
 }
 
+// Ultra-compact for dense/scrolling tables. Drops the "0:" on sub-minute
+// times so a 9.5s split reads "9.5" not "0:09.5"; times a minute or over
+// switch to m:ss with no decimal ("1:17", "6:29"). Keeps every value short.
+function formatCompact(s) {
+  if (typeof s !== 'number' || !isFinite(s)) return '—';
+  if (s < 60) return s.toFixed(1);
+  const m = Math.floor(s / 60);
+  const sec = Math.round(s - m * 60);
+  return `${m}:${String(sec).padStart(2, '0')}`;
+}
+
 // "3rd", "24th", "1st" — used only for the personal-history callouts below.
 function ordinal(n) {
   const s = ['th', 'st', 'nd', 'rd'], v = n % 100;
@@ -913,6 +924,20 @@ const Storage = {
       return cachedFetch('fieldSplits', HISTORY_CACHE_TTL_MS, async () => {
         try {
           const rows = await sbFetchAll('/results?splits=not.is.null&select=splits');
+          return rows || [];
+        } catch { return []; }
+      });
+    }
+    return [];
+  },
+  // Fetch name + splits for every split-recorded solve, so the Players table
+  // can show each player's average time to find the 1st..6th set. Paginated
+  // and cached like the other broad reads.
+  async loadAllSplits() {
+    if (USE_SUPABASE) {
+      return cachedFetch('allSplits', HISTORY_CACHE_TTL_MS, async () => {
+        try {
+          const rows = await sbFetchAll('/results?splits=not.is.null&select=name,splits');
           return rows || [];
         } catch { return []; }
       });
@@ -2065,6 +2090,8 @@ function ArchiveDetailStrip({ dateKey, info, MEDAL, RANK_WORD,
 const REGULAR_MIN_SOLVES = 3;
 // Minimum solves in a difficulty tier before we show that tier's average.
 const TIER_MIN_SOLVES = 5;
+// Minimum split-recorded solves before we show a player's per-set pace.
+const SPLIT_MIN_SOLVES = 5;
 const DAYS_PAGE = 14;
 
 // Tiny trend line of a player's last few solves (chronological; lower =
@@ -2112,6 +2139,10 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
   const [survivorPast, setSurvivorPast] = useState(null);
   const weekKey = utcIsoWeekKey();
   useEffect(() => { Storage.loadAllHistory().then(setHistory); }, []);
+  // Splits (per-set find times) power the 1st..6th columns. Loaded separately
+  // so the main history object stays lean; null until it arrives.
+  const [allSplits, setAllSplits] = useState(null);
+  useEffect(() => { Storage.loadAllSplits().then(setAllSplits); }, []);
   useEffect(() => {
     if (tab !== 'weekly' || survivorWeek !== null) return;
     Storage.loadSurvivorWeek(weekKey).then(setSurvivorWeek);
@@ -2130,6 +2161,39 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
     for (const d of dates) map[d] = computePuzzleDifficulty(generateDailyPuzzle(d));
     return map;
   }, [dates]);
+
+  // Per-player average time to find each set (positions 1..6). Splits store
+  // cumulative timestamps, so the gap for position i is t[i] - t[i-1]. We
+  // average each position across all of a player's split-recorded solves.
+  // A player needs SPLIT_MIN_SOLVES recorded games before we show gaps, else
+  // one or two puzzles would masquerade as a stable pace.
+  const splitGaps = useMemo(() => {
+    if (!allSplits) return {};
+    const acc = {};  // name -> [{sum,n} x6]
+    for (const row of allSplits) {
+      const s = row.splits;
+      if (!Array.isArray(s) || s.length !== 6) continue;
+      const bucket = (acc[row.name] ??= Array.from({ length: 6 }, () => ({ sum: 0, n: 0 })));
+      let prev = 0;
+      for (let i = 0; i < 6; i++) {
+        const t = typeof s[i]?.t === 'number' ? s[i].t : null;
+        if (t == null) { prev = prev; continue; }
+        const gap = Math.max(0, t - prev);
+        prev = t;
+        bucket[i].sum += gap;
+        bucket[i].n += 1;
+      }
+    }
+    const out = {};
+    for (const [n, arr] of Object.entries(acc)) {
+      const games = Math.min(...arr.map((x) => x.n));
+      out[n] = {
+        games,
+        gaps: arr.map((x) => (x.n >= SPLIT_MIN_SOLVES ? Math.round((x.sum / x.n) * 10) / 10 : null)),
+      };
+    }
+    return out;
+  }, [allSplits]);
 
   // Per-player aggregates, including average time per difficulty tier.
   // A tier needs TIER_MIN_SOLVES samples before we show a number — below that
@@ -2171,11 +2235,12 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
         streak++;
         cursor = utcDateKey(new Date(dateKeyToUTC(cursor) - 86400000));
       }
-      out.push({ name: n, played, best, avg, streak, tiers });
+      const gaps = splitGaps[n]?.gaps || [null, null, null, null, null, null];
+      out.push({ name: n, played, best, avg, streak, tiers, gaps });
     }
     out.sort((a, b) => a.avg - b.avg);
     return out;
-  }, [history, dates, difficulties, todayKey]);
+  }, [history, dates, difficulties, todayKey, splitGaps]);
 
   // The spotlight leader: fastest regular by overall average. `players` is
   // already avg-sorted, so the first regular is the leader regardless of how
@@ -2193,6 +2258,7 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
       if (sortKey === 'name') return null;
       if (sortKey === 'played') return p.played;
       if (sortKey === 'avg') return p.avg;
+      if (sortKey.startsWith('g')) return p.gaps[Number(sortKey.slice(1))]; // g0..g5
       return p.tiers[sortKey];  // 'easy' | 'medium' | 'hard'
     };
     const arr = [...regs];
@@ -2294,92 +2360,92 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
           )}
 
           <div className="bg-white rounded-md shadow-sm overflow-hidden">
-            <table className="w-full table-fixed border-collapse">
-              {/* Fixed widths: the name column absorbs the slack (and truncates)
-                  so the numeric columns can never be pushed off a narrow phone. */}
-              <colgroup>
-                <col style={{ width: '30%' }} />
-                <col style={{ width: '12%' }} />
-                <col style={{ width: '14%' }} />
-                <col style={{ width: '14%' }} />
-                <col style={{ width: '14%' }} />
-                <col style={{ width: '16%' }} />
-              </colgroup>
-              <thead>
-                <tr>
-                  {[
-                    { k: 'name',   node: 'Player', align: 'left' },
-                    { k: 'played', node: '#', align: 'right' },
-                    { k: 'easy',   node: <TierStars stars={1} />, align: 'right' },
-                    { k: 'medium', node: <TierStars stars={2} />, align: 'right' },
-                    { k: 'hard',   node: <TierStars stars={3} />, align: 'right' },
-                    { k: 'avg',    node: 'Avg', align: 'right' },
-                  ].map(({ k, node, align }) => {
-                    const active = sortKey === k;
+            {/* Horizontal scroll: the name column is sticky-left so it stays
+                put while the difficulty + per-set columns scroll under it. */}
+            <div className="overflow-x-auto">
+              <table className="border-collapse" style={{ minWidth: '640px', width: '100%' }}>
+                <thead>
+                  <tr>
+                    {[
+                      { k: 'name',   node: 'Player' },
+                      { k: 'played', node: '#' },
+                      { k: 'easy',   node: <TierStars stars={1} /> },
+                      { k: 'medium', node: <TierStars stars={2} /> },
+                      { k: 'hard',   node: <TierStars stars={3} /> },
+                      { k: 'avg',    node: 'Avg' },
+                      { k: 'g0', node: '1st' }, { k: 'g1', node: '2nd' },
+                      { k: 'g2', node: '3rd' }, { k: 'g3', node: '4th' },
+                      { k: 'g4', node: '5th' }, { k: 'g5', node: '6th' },
+                    ].map(({ k, node }) => {
+                      const active = sortKey === k;
+                      const isName = k === 'name';
+                      return (
+                        <th key={k}
+                          onClick={() => {
+                            if (sortKey === k) setSortAsc((v) => !v);
+                            else { setSortKey(k); setSortAsc(k !== 'played'); }
+                          }}
+                          className={`py-2 bg-stone-50 border-b border-stone-200
+                                     text-[10px] uppercase tracking-tight font-bold whitespace-nowrap
+                                     cursor-pointer select-none transition-colors hover:bg-stone-100
+                                     ${isName
+                                       ? 'text-left pl-2.5 pr-2 sticky left-0 z-10'
+                                       : 'text-right px-2'}
+                                     ${k === 'g5' ? 'pr-3' : ''}
+                                     ${active ? 'text-red-700' : 'text-stone-400'}`}
+                          style={isName ? { background: '#fafaf9' } : undefined}>
+                          {node}
+                          {active && <span className="ml-0.5 text-[8px]">{sortAsc ? '▲' : '▼'}</span>}
+                        </th>
+                      );
+                    })}
+                  </tr>
+                </thead>
+                <tbody>
+                  {sortedRegulars.map((p, i) => {
+                    const isMe = p.name === currentName;
+                    const rowBg = isMe ? '#fef2f2' : '#fff';
+                    const num = (v, extra = '') => v == null
+                      ? <td className="px-2 py-2 text-right text-stone-300 border-b border-stone-100">—</td>
+                      : <td className={`px-2 py-2 text-right border-b border-stone-100 tabular-nums
+                                       text-[12px] ${extra}`}
+                            style={{ fontFamily: '"Menlo", monospace' }}>{formatCompact(v)}</td>;
                     return (
-                      <th key={k}
-                        onClick={() => {
-                          if (sortKey === k) setSortAsc((v) => !v);
-                          // times & name sort ascending first; counts descending first
-                          else { setSortKey(k); setSortAsc(k !== 'played'); }
-                        }}
-                        className={`px-0.5 py-2 bg-stone-50 border-b border-stone-200
-                                   text-[10px] uppercase tracking-tight font-bold whitespace-nowrap
-                                   cursor-pointer select-none transition-colors
-                                   hover:bg-stone-100
-                                   ${align === 'left' ? 'text-left pl-2.5' : 'text-right'}
-                                   ${k === 'played' ? 'pl-1' : ''}
-                                   ${k === 'avg' ? 'pr-2' : ''}
-                                   ${active ? 'text-red-700' : 'text-stone-400'}`}>
-                        {node}
-                        {active && (
-                          <span className="ml-0.5 text-[8px]">{sortAsc ? '▲' : '▼'}</span>
+                      <tr key={p.name}
+                          onClick={() => onPlayerClick(p.name)}
+                          className={`cursor-pointer transition-colors
+                                     ${isMe ? 'hover:bg-red-100' : 'hover:bg-stone-50'}`}
+                          style={{ background: rowBg }}>
+                        <td className={`pl-2.5 pr-2 py-2 border-b border-stone-100 text-[12.5px]
+                                       font-semibold whitespace-nowrap sticky left-0 z-10
+                                       ${isMe ? 'text-red-800' : 'text-stone-800'}`}
+                            style={{ background: rowBg }}>
+                          <span className="inline-block w-3.5 text-stone-400 font-normal text-[10.5px]">
+                            {i + 1}
+                          </span>
+                          {p.name}
+                          {isMe && <span className="text-stone-400 font-normal text-[10.5px]"> (you)</span>}
+                        </td>
+                        <td className="px-2 py-2 text-right border-b border-stone-100 tabular-nums
+                                       text-stone-400 text-[11.5px]"
+                            style={{ fontFamily: '"Menlo", monospace' }}>
+                          {p.played}
+                        </td>
+                        {num(p.tiers.easy, 'text-stone-600')}
+                        {num(p.tiers.medium, 'text-stone-600')}
+                        {num(p.tiers.hard, 'text-stone-600')}
+                        {num(p.avg, `font-bold ${isMe ? 'text-red-700' : 'text-stone-800'}`)}
+                        {p.gaps.map((g, gi) =>
+                          <React.Fragment key={gi}>
+                            {num(g, gi === 5 ? 'text-stone-500 pr-3' : 'text-stone-500')}
+                          </React.Fragment>
                         )}
-                      </th>
+                      </tr>
                     );
                   })}
-                </tr>
-              </thead>
-              <tbody>
-                {sortedRegulars.map((p, i) => {
-                  const isMe = p.name === currentName;
-                  const cell = (v) => v == null
-                    ? <td className="px-0.5 py-2 text-right text-stone-300 border-b border-stone-100">—</td>
-                    : <td className="px-0.5 py-2 text-right border-b border-stone-100 tabular-nums
-                                     text-stone-600 text-[12px]"
-                          style={{ fontFamily: '"Menlo", monospace' }}>{formatMmSs1(v)}</td>;
-                  return (
-                    <tr key={p.name}
-                        onClick={() => onPlayerClick(p.name)}
-                        className={`cursor-pointer transition-colors
-                                   ${isMe ? 'bg-red-50 hover:bg-red-100' : 'hover:bg-stone-50'}`}>
-                      <td className={`px-0.5 pl-2.5 py-2 border-b border-stone-100 text-[12.5px]
-                                     font-semibold whitespace-nowrap overflow-hidden text-ellipsis
-                                     ${isMe ? 'text-red-800' : 'text-stone-800'}`}>
-                        <span className="inline-block w-3.5 text-stone-400 font-normal text-[10.5px]">
-                          {i + 1}
-                        </span>
-                        {p.name}
-                        {isMe && <span className="text-stone-400 font-normal text-[10.5px]"> (you)</span>}
-                      </td>
-                      <td className="px-0.5 pl-1 py-2 text-right border-b border-stone-100 tabular-nums
-                                     text-stone-400 text-[11.5px]"
-                          style={{ fontFamily: '"Menlo", monospace' }}>
-                        {p.played}
-                      </td>
-                      {cell(p.tiers.easy)}
-                      {cell(p.tiers.medium)}
-                      {cell(p.tiers.hard)}
-                      <td className={`px-0.5 pr-2 py-2 text-right border-b border-stone-100 tabular-nums
-                                     text-[12px] font-bold ${isMe ? 'text-red-700' : 'text-stone-800'}`}
-                          style={{ fontFamily: '"Menlo", monospace' }}>
-                        {formatMmSs1(p.avg)}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                </tbody>
+              </table>
+            </div>
 
             {visitors.length > 0 && (
               <>
@@ -2412,8 +2478,9 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
             )}
           </div>
           <p className="text-[10px] text-stone-400 text-center mt-2 px-3 leading-relaxed">
-            Average solve time by puzzle difficulty (# = solves). Tap any column to sort.
-            A tier needs {TIER_MIN_SOLVES}+ solves to show a time — otherwise “—”.
+            Swipe the table sideways for per-difficulty averages and the time to
+            find each set (1st–6th). Times under a minute show as seconds.
+            Tap any column to sort, or a row for the full profile.
           </p>
         </>
       )}
