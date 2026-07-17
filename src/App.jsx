@@ -2087,9 +2087,11 @@ function ArchiveDetailStrip({ dateKey, info, MEDAL, RANK_WORD,
 // The old dates-x-players matrix is replaced by constant-width day rows
 // that expand on tap.
 
-const REGULAR_MIN_SOLVES = 3;
-// Minimum solves in a difficulty tier before we show that tier's average.
-const TIER_MIN_SOLVES = 5;
+// Players need at least this many total solves to appear on the leaderboard.
+const REGULAR_MIN_SOLVES = 5;
+// Per-difficulty averages show for any player with at least one solve at that
+// tier (no minimum) — the leaderboard already requires 5+ total solves.
+const TIER_MIN_SOLVES = 1;
 // Minimum split-recorded solves before we show a player's per-set pace.
 const SPLIT_MIN_SOLVES = 5;
 const DAYS_PAGE = 14;
