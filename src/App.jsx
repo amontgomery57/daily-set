@@ -1081,6 +1081,7 @@ function TabBar({ activeTab, onChange }) {
   const tabs = [
     { id: 'game', label: "Today's Puzzle" },
     { id: 'archives', label: 'Archives' },
+    { id: 'leaderboard', label: 'Leaderboard' },
     // { id: 'survivor', label: 'Weekly Puzzle' },  // hidden — WIP, re-enable to restore
     { id: 'stats', label: 'Stats' },
   ];
@@ -1092,7 +1093,7 @@ function TabBar({ activeTab, onChange }) {
           return (
             <button key={t.id}
               onClick={() => onChange(t.id)}
-              className={`flex-1 px-2 py-3 text-sm font-medium transition-colors relative
+              className={`flex-1 px-1 py-3 text-[12.5px] font-medium transition-colors relative whitespace-nowrap
                          ${isActive
                            ? 'text-red-700'
                            : 'text-stone-500 hover:text-stone-800'}`}>
@@ -2216,6 +2217,19 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
       const best = Math.min(...times);
       const avg = Math.round((times.reduce((s, t) => s + t, 0) / played) * 100) / 100;
 
+      // Win rate over CONTESTED days only — a day you were the only finisher
+      // isn't a win worth counting, and counting it would hand one-off names
+      // a free 100%.
+      let contested = 0, wins = 0;
+      for (const r of rows) {
+        const day = history[r.date];
+        const dayTimes = Object.values(day).map((x) => x.time);
+        if (dayTimes.length < 2) continue;
+        contested++;
+        if (r.time === Math.min(...dayTimes)) wins++;
+      }
+      const winPct = contested > 0 ? Math.round((1000 * wins) / contested) / 10 : null;
+
       // per-tier averages (null when too few solves to be meaningful)
       const tiers = {};
       for (const level of DIFFICULTY_ORDER) {
@@ -2238,7 +2252,7 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
         cursor = utcDateKey(new Date(dateKeyToUTC(cursor) - 86400000));
       }
       const gaps = splitGaps[n]?.gaps || [null, null, null, null, null, null];
-      out.push({ name: n, played, best, avg, streak, tiers, gaps });
+      out.push({ name: n, played, best, avg, streak, tiers, gaps, winPct, wins, contested });
     }
     out.sort((a, b) => a.avg - b.avg);
     return out;
@@ -2259,6 +2273,7 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
     const val = (p) => {
       if (sortKey === 'name') return null;
       if (sortKey === 'played') return p.played;
+      if (sortKey === 'winPct') return p.winPct;
       if (sortKey === 'avg') return p.avg;
       if (sortKey.startsWith('g')) return p.gaps[Number(sortKey.slice(1))]; // g0..g5
       return p.tiers[sortKey];  // 'easy' | 'medium' | 'hard'
@@ -2365,12 +2380,13 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
             {/* Horizontal scroll: the name column is sticky-left so it stays
                 put while the difficulty + per-set columns scroll under it. */}
             <div className="overflow-x-auto">
-              <table className="border-collapse" style={{ minWidth: '640px', width: '100%' }}>
+              <table className="border-collapse" style={{ minWidth: '700px', width: '100%' }}>
                 <thead>
                   <tr>
                     {[
                       { k: 'name',   node: 'Player' },
                       { k: 'played', node: '#' },
+                      { k: 'winPct', node: 'Win %' },
                       { k: 'easy',   node: <TierStars stars={1} /> },
                       { k: 'medium', node: <TierStars stars={2} /> },
                       { k: 'hard',   node: <TierStars stars={3} /> },
@@ -2385,7 +2401,7 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
                         <th key={k}
                           onClick={() => {
                             if (sortKey === k) setSortAsc((v) => !v);
-                            else { setSortKey(k); setSortAsc(k !== 'played'); }
+                            else { setSortKey(k); setSortAsc(k !== 'played' && k !== 'winPct'); }
                           }}
                           className={`py-2 bg-stone-50 border-b border-stone-200
                                      text-[10px] uppercase tracking-tight font-bold whitespace-nowrap
@@ -2432,6 +2448,12 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
                                        text-stone-400 text-[11.5px]"
                             style={{ fontFamily: '"Menlo", monospace' }}>
                           {p.played}
+                        </td>
+                        <td className={`px-2 py-2 text-right border-b border-stone-100 tabular-nums
+                                       text-[11.5px] ${p.winPct > 0 ? 'text-stone-700 font-semibold' : 'text-stone-300'}`}
+                            style={{ fontFamily: '"Menlo", monospace' }}
+                            title={p.contested ? `${p.wins} of ${p.contested} contested days` : 'no contested days'}>
+                          {p.winPct == null ? '—' : `${p.winPct}%`}
                         </td>
                         {num(p.tiers.easy, 'text-stone-600')}
                         {num(p.tiers.medium, 'text-stone-600')}
@@ -2480,7 +2502,7 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
             )}
           </div>
           <p className="text-[10px] text-stone-400 text-center mt-2 px-3 leading-relaxed">
-            Swipe the table sideways for per-difficulty averages and the time to
+            Win % counts only days two or more people finished. Swipe sideways for per-difficulty averages and the time to
             find each set (1st–6th). Times under a minute show as seconds.
             Tap any column to sort, or a row for the full profile.
           </p>
@@ -2671,6 +2693,233 @@ function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
           </div>
         </>
       )}
+    </main>
+  );
+}
+
+// ===== Leaderboard (Daily / Weekly / Monthly / All-Time) =====
+// Daily is deliberately different from the other three: on a single day each
+// player has exactly one time, so "average" and "median" would print the same
+// number in every row. Daily therefore shows the raw time plus the gap to the
+// winner; the other periods show average and median across the window.
+const LB_MIN_PUZZLES = 3;   // minimum finishes to qualify for week/month/all-time
+
+function mondayOf(dateKey) {
+  const t = dateKeyToUTC(dateKey);
+  const d = new Date(t);
+  const dow = (d.getUTCDay() + 6) % 7;         // 0 = Monday
+  return utcDateKey(new Date(t - dow * 86400000));
+}
+function addDaysKey(dateKey, n) {
+  return utcDateKey(new Date(dateKeyToUTC(dateKey) + n * 86400000));
+}
+function monthStartOf(dateKey) { return dateKey.slice(0, 8) + '01'; }
+function addMonthsKey(dateKey, n) {
+  const [y, m] = dateKey.split('-').map(Number);
+  const d = new Date(Date.UTC(y, m - 1 + n, 1));
+  return utcDateKey(d);
+}
+function median(nums) {
+  if (!nums.length) return null;
+  const a = [...nums].sort((x, y) => x - y);
+  const mid = a.length >> 1;
+  return a.length % 2 ? a[mid] : Math.round(((a[mid - 1] + a[mid]) / 2) * 100) / 100;
+}
+
+function LeaderboardContent({ history, todayKey, currentName, onPlayerClick }) {
+  const [period, setPeriod] = useState('daily');   // daily | weekly | monthly | all
+  const [anchorDay, setAnchorDay] = useState(todayKey);
+  const [anchorWeek, setAnchorWeek] = useState(() => mondayOf(todayKey));
+  const [anchorMonth, setAnchorMonth] = useState(() => monthStartOf(todayKey));
+  const [sortKey, setSortKey] = useState('avg');   // avg | med | n
+  const [sortAsc, setSortAsc] = useState(true);
+
+  if (history === null) {
+    return <main className="flex-1 flex items-center justify-center text-stone-500">Loading…</main>;
+  }
+
+  const allDates = Object.keys(history);
+  const earliest = allDates.length ? allDates.sort()[0] : todayKey;
+
+  // ---- window bounds for the active period ----
+  let from = null, to = null, title = '', subtitle = '';
+  if (period === 'daily') {
+    from = to = anchorDay;
+    title = formatLongDate(anchorDay).replace(/^\w+,\s*/, '');
+    subtitle = anchorDay === todayKey ? "today's puzzle" : 'archived day';
+  } else if (period === 'weekly') {
+    from = anchorWeek; to = addDaysKey(anchorWeek, 6);
+    title = `${formatShortDate(from)} – ${formatShortDate(to)}`;
+    subtitle = anchorWeek === mondayOf(todayKey) ? 'this week' : 'past week';
+  } else if (period === 'monthly') {
+    from = anchorMonth; to = addDaysKey(addMonthsKey(anchorMonth, 1), -1);
+    title = new Date(dateKeyToUTC(anchorMonth)).toLocaleDateString(undefined,
+      { month: 'long', year: 'numeric', timeZone: 'UTC' });
+    subtitle = anchorMonth === monthStartOf(todayKey) ? 'this month' : 'past month';
+  } else {
+    from = earliest; to = todayKey;
+    title = 'All time'; subtitle = `${allDates.length} puzzle days`;
+  }
+
+  // ---- gather rows in the window ----
+  const byName = {};
+  for (const d of allDates) {
+    if (d < from || d > to) continue;
+    for (const [n, r] of Object.entries(history[d])) {
+      (byName[n] ??= []).push(r.time);
+    }
+  }
+
+  const isDaily = period === 'daily';
+  let rows = Object.entries(byName).map(([name, times]) => ({
+    name,
+    n: times.length,
+    avg: Math.round((times.reduce((s, t) => s + t, 0) / times.length) * 100) / 100,
+    med: median(times),
+    time: times[0],
+  }));
+  if (!isDaily) rows = rows.filter((r) => r.n >= LB_MIN_PUZZLES);
+
+  const sortVal = (r) => (isDaily ? r.time : sortKey === 'n' ? r.n : sortKey === 'med' ? r.med : r.avg);
+  rows.sort((a, b) => {
+    const av = sortVal(a), bv = sortVal(b);
+    if (isDaily) return av - bv;
+    return sortAsc ? av - bv : bv - av;
+  });
+  const winnerTime = rows.length ? rows[0].time : null;
+
+  const step = (dir) => {
+    if (period === 'daily') setAnchorDay((d) => addDaysKey(d, dir));
+    else if (period === 'weekly') setAnchorWeek((w) => addDaysKey(w, dir * 7));
+    else if (period === 'monthly') setAnchorMonth((m) => addMonthsKey(m, dir));
+  };
+  const atNewest = period === 'daily' ? anchorDay >= todayKey
+                 : period === 'weekly' ? anchorWeek >= mondayOf(todayKey)
+                 : period === 'monthly' ? anchorMonth >= monthStartOf(todayKey)
+                 : true;
+
+  const medal = (i) => (i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : null);
+
+  return (
+    <main className="flex-1 p-3 max-w-2xl w-full mx-auto">
+      {/* period pills */}
+      <div className="flex gap-1.5 mb-2.5">
+        {[['daily','Daily'],['weekly','Weekly'],['monthly','Monthly'],['all','All-Time']].map(([id,label]) => (
+          <button key={id} onClick={() => setPeriod(id)}
+            className={`flex-1 py-1.5 rounded-full text-[11.5px] font-semibold border transition-colors
+                       ${period === id
+                         ? 'bg-red-700 border-red-700 text-white'
+                         : 'bg-white border-stone-300 text-stone-600 hover:bg-stone-50'}`}>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {/* window nav */}
+      {period !== 'all' && (
+        <div className="flex items-center justify-between mb-2.5">
+          <button onClick={() => step(-1)}
+            className="w-8 h-8 rounded-lg bg-white border border-stone-300 text-stone-600
+                       flex items-center justify-center hover:bg-stone-50">‹</button>
+          <div className="text-center leading-tight">
+            <div className="font-bold text-[15px]" style={{ fontFamily: '"Georgia", serif' }}>{title}</div>
+            <div className="text-[10.5px] text-stone-400 mt-0.5">{subtitle}</div>
+          </div>
+          <button onClick={() => step(1)} disabled={atNewest}
+            className={`w-8 h-8 rounded-lg bg-white border border-stone-300 text-stone-600
+                       flex items-center justify-center hover:bg-stone-50
+                       ${atNewest ? 'opacity-30' : ''}`}>›</button>
+        </div>
+      )}
+      {period === 'all' && (
+        <div className="text-center mb-2.5 leading-tight">
+          <div className="font-bold text-[15px]" style={{ fontFamily: '"Georgia", serif' }}>{title}</div>
+          <div className="text-[10.5px] text-stone-400 mt-0.5">{subtitle}</div>
+        </div>
+      )}
+
+      <div className="bg-white rounded-md shadow-sm overflow-hidden">
+        {rows.length === 0 ? (
+          <div className="py-10 text-center text-stone-400 text-sm italic">
+            {isDaily ? 'Nobody has finished this puzzle yet.'
+                     : `No one reached ${LB_MIN_PUZZLES} puzzles in this window.`}
+          </div>
+        ) : (
+          <table className="w-full table-fixed border-collapse">
+            <colgroup>
+              <col style={{ width: isDaily ? '46%' : '40%' }} />
+              {!isDaily && <col style={{ width: '14%' }} />}
+              <col style={{ width: isDaily ? '27%' : '23%' }} />
+              <col style={{ width: isDaily ? '27%' : '23%' }} />
+            </colgroup>
+            <thead>
+              <tr>
+                <th className="px-1 pl-2.5 py-2 bg-stone-50 border-b border-stone-200 text-left
+                               text-[10px] uppercase tracking-tight font-bold text-stone-400">Player</th>
+                {!isDaily && (
+                  <th onClick={() => { sortKey === 'n' ? setSortAsc(v => !v) : (setSortKey('n'), setSortAsc(false)); }}
+                    className={`px-1 py-2 bg-stone-50 border-b border-stone-200 text-right cursor-pointer
+                               text-[10px] uppercase tracking-tight font-bold hover:bg-stone-100
+                               ${sortKey === 'n' ? 'text-red-700' : 'text-stone-400'}`}>#</th>
+                )}
+                <th onClick={() => { if (isDaily) return; sortKey === 'avg' ? setSortAsc(v => !v) : (setSortKey('avg'), setSortAsc(true)); }}
+                  className={`px-1 py-2 bg-stone-50 border-b border-stone-200 text-right
+                             text-[10px] uppercase tracking-tight font-bold
+                             ${isDaily ? 'text-stone-400' : `cursor-pointer hover:bg-stone-100 ${sortKey === 'avg' ? 'text-red-700' : 'text-stone-400'}`}`}>
+                  {isDaily ? 'Time' : 'Avg'}
+                </th>
+                <th onClick={() => { if (isDaily) return; sortKey === 'med' ? setSortAsc(v => !v) : (setSortKey('med'), setSortAsc(true)); }}
+                  className={`px-1 pr-2.5 py-2 bg-stone-50 border-b border-stone-200 text-right
+                             text-[10px] uppercase tracking-tight font-bold
+                             ${isDaily ? 'text-stone-400' : `cursor-pointer hover:bg-stone-100 ${sortKey === 'med' ? 'text-red-700' : 'text-stone-400'}`}`}>
+                  {isDaily ? 'Behind' : 'Median'}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, i) => {
+                const isMe = r.name === currentName;
+                return (
+                  <tr key={r.name} onClick={() => onPlayerClick(r.name)}
+                      className={`cursor-pointer transition-colors
+                                 ${isMe ? 'bg-red-50 hover:bg-red-100' : 'hover:bg-stone-50'}`}>
+                    <td className={`px-1 pl-2.5 py-2 border-b border-stone-100 text-[12.5px] font-semibold
+                                   whitespace-nowrap overflow-hidden text-ellipsis
+                                   ${isMe ? 'text-red-800' : i === 0 ? 'text-amber-700' : 'text-stone-800'}`}>
+                      <span className="inline-block w-3.5 text-stone-400 font-normal text-[10.5px]">{i + 1}</span>
+                      {medal(i) && <span className="mr-0.5">{medal(i)}</span>}
+                      {r.name}
+                      {isMe && <span className="text-stone-400 font-normal text-[10.5px]"> (you)</span>}
+                    </td>
+                    {!isDaily && (
+                      <td className="px-1 py-2 text-right border-b border-stone-100 tabular-nums
+                                     text-stone-400 text-[11.5px]"
+                          style={{ fontFamily: '"Menlo", monospace' }}>{r.n}</td>
+                    )}
+                    <td className={`px-1 py-2 text-right border-b border-stone-100 tabular-nums text-[12px]
+                                   font-bold ${isMe ? 'text-red-700' : 'text-stone-800'}`}
+                        style={{ fontFamily: '"Menlo", monospace' }}>
+                      {formatCompact(isDaily ? r.time : r.avg)}
+                    </td>
+                    <td className="px-1 pr-2.5 py-2 text-right border-b border-stone-100 tabular-nums
+                                   text-[12px] text-stone-500"
+                        style={{ fontFamily: '"Menlo", monospace' }}>
+                      {isDaily
+                        ? (i === 0 ? '—' : `+${formatCompact(r.time - winnerTime)}`)
+                        : formatCompact(r.med)}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+        <div className="text-[10px] text-stone-400 px-2.5 py-2 bg-stone-50 border-t border-stone-200 leading-relaxed">
+          {isDaily
+            ? 'Everyone who finished this puzzle, fastest first. Use ‹ › to step through days.'
+            : `Average and median across the window. ${LB_MIN_PUZZLES}+ puzzles to qualify. Tap a column to sort.`}
+        </div>
+      </div>
     </main>
   );
 }
@@ -3716,6 +3965,16 @@ export default function App() {
     typeof document !== 'undefined' ? !document.hidden : true
   );
 
+  // History for the Leaderboard tab. Lazy-loaded the first time the tab is
+  // opened (loadAllHistory is cached, so this is cheap on repeat visits).
+  const [lbHistory, setLbHistory] = useState(null);
+  useEffect(() => {
+    if (view !== 'leaderboard' || lbHistory !== null) return;
+    let cancelled = false;
+    Storage.loadAllHistory().then((h) => { if (!cancelled) setLbHistory(h); });
+    return () => { cancelled = true; };
+  }, [view, lbHistory]);
+
   const lastActiveDateRef = useRef(null);
 
   // === Load name on mount ===
@@ -3970,6 +4229,7 @@ export default function App() {
 
   // Tab navigation
   const activeTab = view === 'archives' ? 'archives'
+                  : view === 'leaderboard' ? 'leaderboard'
                   : view === 'survivor' ? 'survivor'
                   : (view === 'stats' || view === 'playerStats') ? 'stats'
                   : view === 'scoring' ? (scoringFrom === 'archives' ? 'archives'
@@ -3984,6 +4244,9 @@ export default function App() {
       setView('game');
     } else if (tab === 'archives') {
       setView('archives');
+    } else if (tab === 'leaderboard') {
+      setViewingPlayer(null);
+      setView('leaderboard');
     } else if (tab === 'survivor') {
       setView('survivor');
     } else if (tab === 'stats') {
@@ -4069,6 +4332,15 @@ export default function App() {
 
       {view === 'survivor' && (
         <SurvivorContent name={name} onPlayerClick={openPlayerStats} />
+      )}
+
+      {view === 'leaderboard' && (
+        <LeaderboardContent
+          history={lbHistory}
+          todayKey={todayKey}
+          currentName={name}
+          onPlayerClick={openPlayerStats}
+        />
       )}
 
       {view === 'stats' && (
