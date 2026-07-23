@@ -670,7 +670,7 @@ const Storage = {
     }
     return lsListResults();
   },
-  async saveResult(dateKey, name, time, splits) {
+  async saveResult(dateKey, name, time, splits, misses) {
     // A fresh solve changes the shared history query's answer — invalidate
     // so the player sees their own result immediately instead of waiting out
     // the cache TTL. (fieldSplits is left to expire on its own; one solve
@@ -679,6 +679,10 @@ const Storage = {
     invalidateCache('allHistory');
     const payload = { time, completedAt: Date.now() };
     if (splits && splits.length) payload.splits = splits;
+    // Always attach misses, including the empty array — "solved with zero
+    // wrong guesses" is a real signal, and indistinguishable from "this
+    // client predates miss tracking" if we drop empties.
+    if (Array.isArray(misses)) payload.misses = misses;
     if (USE_SUPABASE) {
       lsSetResult(dateKey, payload);
       try {
@@ -693,6 +697,7 @@ const Storage = {
           p_time_seconds: time,
           p_completed_at: payload.completedAt,
           p_splits: payload.splits || null,
+          p_misses: payload.misses || null,
         });
         if (r !== 'ok') console.error('saveResult rejected:', r);
       } catch (e) { console.error('saveResult:', e); }
@@ -762,6 +767,7 @@ const Storage = {
             p_time_seconds: payload.time,
             p_completed_at: payload.completedAt || Date.now(),
             p_splits: payload.splits || null,
+            p_misses: payload.misses || null,
           });
           if (r === 'ok') pushed++;
           else console.error(`syncLocalToCloud: rejected for ${date}:`, r);
@@ -3677,6 +3683,7 @@ export default function App() {
   const startTimeRef = useRef(null);
   const accumulatedMsRef = useRef(0);
   const splitsRef = useRef([]);   // per-set {t, idx, mask} for the active puzzle
+  const missesRef = useRef([]);   // wrong selections {t, idx, type} for the active puzzle
 
   // Timer is running unless the user actively pressed Pause.
   const [userPaused, setUserPaused] = useState(false);
@@ -3782,6 +3789,7 @@ export default function App() {
     accumulatedMsRef.current = 0;
     startTimeRef.current = null;
     splitsRef.current = [];
+    missesRef.current = [];
 
     // Persist the puzzle cards (idempotent in Supabase; useful for any future
     // analysis even if no one finishes today's puzzle).
@@ -3866,10 +3874,20 @@ export default function App() {
     const sorted = [...selected].sort((a, b) => a - b);
     const [i, j, k] = sorted;
     const valid = isSet(puzzle.cards[i], puzzle.cards[j], puzzle.cards[k]);
+    // Same pause-aware clock used for splits and the final time.
+    const elapsedNow = () => {
+      const ms = accumulatedMsRef.current +
+        (startTimeRef.current !== null ? Date.now() - startTimeRef.current : 0);
+      return Math.round(ms / 10) / 100;
+    };
     if (valid) {
       const key = sorted.join('-');
       const already = foundSets.some((s) => s.key === key);
       if (already) {
+        // A valid SET the player has already claimed: a memory failure
+        // rather than a discrimination failure. Tracked separately from
+        // 'bad' so the two can be analysed independently.
+        missesRef.current.push({ t: elapsedNow(), idx: sorted, type: 'dup' });
         setFlash('dup');
         flashTimer.current = setTimeout(() => { setSelected([]); setFlash(null); }, 900);
       } else {
@@ -3877,10 +3895,8 @@ export default function App() {
         // pause-aware clock as the final time), card indices, and the set's
         // differing-attribute mask. Stored with the result for later
         // analysis of find-order vs set type.
-        const elapsedMs = accumulatedMsRef.current +
-          (startTimeRef.current !== null ? Date.now() - startTimeRef.current : 0);
         splitsRef.current.push({
-          t: Math.round(elapsedMs / 10) / 100,
+          t: elapsedNow(),
           idx: sorted,
           mask: setDiffMask(puzzle.cards[i], puzzle.cards[j], puzzle.cards[k]),
         });
@@ -3898,8 +3914,9 @@ export default function App() {
           setTime(finalTime);
           const newResult = { time: finalTime, completedAt: Date.now() };
           const splits = splitsRef.current;
+          const misses = missesRef.current;
           (async () => {
-            await Storage.saveResult(activeDate, name, finalTime, splits);
+            await Storage.saveResult(activeDate, name, finalTime, splits, misses);
             setCurrentResult(newResult);
             setMyResults((prev) => ({ ...prev, [activeDate]: newResult }));
             const lb = await Storage.loadLeaderboard(activeDate);
@@ -3908,6 +3925,8 @@ export default function App() {
         }
       }
     } else {
+      // Not a SET at all — the player misjudged one of the four attributes.
+      missesRef.current.push({ t: elapsedNow(), idx: sorted, type: 'bad' });
       setFlash('bad');
       flashTimer.current = setTimeout(() => { setSelected([]); setFlash(null); }, 900);
     }
