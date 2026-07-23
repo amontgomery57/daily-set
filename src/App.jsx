@@ -937,7 +937,7 @@ const Storage = {
     if (USE_SUPABASE) {
       return cachedFetch('allSplits', HISTORY_CACHE_TTL_MS, async () => {
         try {
-          const rows = await sbFetchAll('/results?splits=not.is.null&select=name,splits');
+          const rows = await sbFetchAll('/results?splits=not.is.null&select=date,name,splits');
           return rows || [];
         } catch { return []; }
       });
@@ -1082,8 +1082,9 @@ function TabBar({ activeTab, onChange }) {
     { id: 'game', label: "Today's Puzzle" },
     { id: 'archives', label: 'Archives' },
     { id: 'leaderboard', label: 'Leaderboard' },
+    // 'Stats' removed: the Players table and Day-by-day list are now the
+    // All-time and Today views of the Leaderboard tab.
     // { id: 'survivor', label: 'Weekly Puzzle' },  // hidden — WIP, re-enable to restore
-    { id: 'stats', label: 'Stats' },
   ];
   return (
     <nav className="bg-white border-b border-stone-200">
@@ -2082,26 +2083,8 @@ function ArchiveDetailStrip({ dateKey, info, MEDAL, RANK_WORD,
   );
 }
 
-// ===== Stats content (Option C: segmented Players / Day-by-day) =====
-// Design rule: no element's size depends on player count. Regulars (3+
-// solves) get rich ranked rows; drive-by visitors collapse behind a toggle.
-// The old dates-x-players matrix is replaced by constant-width day rows
-// that expand on tap.
-
-// Players need at least this many total solves to appear on the leaderboard.
-const REGULAR_MIN_SOLVES = 5;
-// Per-difficulty averages show for any player with at least one solve at that
-// tier (no minimum) — the leaderboard already requires 5+ total solves.
-const TIER_MIN_SOLVES = 1;
-// Minimum split-recorded solves before we show a player's per-set pace.
-const SPLIT_MIN_SOLVES = 5;
-const DAYS_PAGE = 14;
-
-// Tiny trend line of a player's last few solves (chronological; lower =
-// better, so a falling line means improvement).
-// Compact 1-3 star glyph used as a column header in the Players table.
-// Filled stars stay red so they read as the same rating shown on a puzzle;
-// the header colours itself when its column is the active sort.
+// Compact 1-3 star glyph used as a column header. Filled stars stay red so
+// they read as the same rating shown on a puzzle.
 function TierStars({ stars }) {
   return (
     <span style={{ whiteSpace: 'nowrap', letterSpacing: '-0.03em' }}>
@@ -2111,603 +2094,19 @@ function TierStars({ stars }) {
   );
 }
 
-function Sparkline({ times, accent }) {
-  if (!times || times.length < 2) return null;
-  const W = 92, H = 22, P = 3;
-  const min = Math.min(...times), max = Math.max(...times);
-  const span = max - min || 1;
-  const xs = times.map((_, i) => P + (i * (W - 2 * P)) / (times.length - 1));
-  const ys = times.map((t) => P + ((t - min) / span) * (H - 2 * P));
-  const pts = xs.map((x, i) => `${x.toFixed(1)},${ys[i].toFixed(1)}`).join(' ');
-  const color = accent ? '#b91c1c' : '#78716c';
-  return (
-    <svg width={W} height={H} className="flex-shrink-0" aria-hidden="true">
-      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.8" />
-      <circle cx={xs[xs.length - 1]} cy={ys[ys.length - 1]} r="2.2" fill={color} />
-    </svg>
-  );
-}
-
-function StatsContent({ onPlayerClick, currentName, todayKey, onOpenScoring }) {
-  const [history, setHistory] = useState(null);
-  const [tab, setTab] = useState('players');           // 'players' | 'days'
-  const [showVisitors, setShowVisitors] = useState(false);
-  // Players table sorting. Default: fastest overall average first.
-  const [sortKey, setSortKey] = useState('avg');   // 'name'|'easy'|'medium'|'hard'|'avg'|'played'
-  const [sortAsc, setSortAsc] = useState(true);
-  const [daysShown, setDaysShown] = useState(DAYS_PAGE);
-  const [expandedDays, setExpandedDays] = useState(() => new Set());
-  // Weekly Survivor standings (lazy: fetched when the tab is first opened)
-  const [survivorWeek, setSurvivorWeek] = useState(null);
-  const [survivorPast, setSurvivorPast] = useState(null);
-  const weekKey = utcIsoWeekKey();
-  useEffect(() => { Storage.loadAllHistory().then(setHistory); }, []);
-  // Splits (per-set find times) power the 1st..6th columns. Loaded separately
-  // so the main history object stays lean; null until it arrives.
-  const [allSplits, setAllSplits] = useState(null);
-  useEffect(() => { Storage.loadAllSplits().then(setAllSplits); }, []);
-  useEffect(() => {
-    if (tab !== 'weekly' || survivorWeek !== null) return;
-    Storage.loadSurvivorWeek(weekKey).then(setSurvivorWeek);
-    Storage.loadSurvivorChampions(weekKey).then(setSurvivorPast);
-  }, [tab, survivorWeek, weekKey]);
-
-  const dates = useMemo(
-    () => (history ? Object.keys(history).sort().reverse() : []),
-    [history]
-  );
-
-  // Difficulty for every date with results (deterministic from the date).
-  // ~50ms worst case per date, runs once when history arrives.
-  const difficulties = useMemo(() => {
-    const map = {};
-    for (const d of dates) map[d] = computePuzzleDifficulty(generateDailyPuzzle(d));
-    return map;
-  }, [dates]);
-
-  // Per-player average time to find each set (positions 1..6). Splits store
-  // cumulative timestamps, so the gap for position i is t[i] - t[i-1]. We
-  // average each position across all of a player's split-recorded solves.
-  // A player needs SPLIT_MIN_SOLVES recorded games before we show gaps, else
-  // one or two puzzles would masquerade as a stable pace.
-  const splitGaps = useMemo(() => {
-    if (!allSplits) return {};
-    const acc = {};  // name -> [{sum,n} x6]
-    for (const row of allSplits) {
-      const s = row.splits;
-      if (!Array.isArray(s) || s.length !== 6) continue;
-      const bucket = (acc[row.name] ??= Array.from({ length: 6 }, () => ({ sum: 0, n: 0 })));
-      let prev = 0;
-      for (let i = 0; i < 6; i++) {
-        const t = typeof s[i]?.t === 'number' ? s[i].t : null;
-        if (t == null) { prev = prev; continue; }
-        const gap = Math.max(0, t - prev);
-        prev = t;
-        bucket[i].sum += gap;
-        bucket[i].n += 1;
-      }
-    }
-    const out = {};
-    for (const [n, arr] of Object.entries(acc)) {
-      const games = Math.min(...arr.map((x) => x.n));
-      out[n] = {
-        games,
-        gaps: arr.map((x) => (x.n >= SPLIT_MIN_SOLVES ? Math.round((x.sum / x.n) * 10) / 10 : null)),
-      };
-    }
-    return out;
-  }, [allSplits]);
-
-  // Per-player aggregates, including average time per difficulty tier.
-  // A tier needs TIER_MIN_SOLVES samples before we show a number — below that
-  // the "average" is one or two puzzles and reads as false precision.
-  const players = useMemo(() => {
-    if (!history) return [];
-    const byName = {};
-    for (const d of dates) {
-      for (const [n, r] of Object.entries(history[d])) {
-        (byName[n] ??= []).push({ date: d, time: r.time });
-      }
-    }
-    const out = [];
-    for (const [n, rows] of Object.entries(byName)) {
-      rows.sort((a, b) => a.date.localeCompare(b.date));
-      const times = rows.map((r) => r.time);
-      const played = times.length;
-      const best = Math.min(...times);
-      const avg = Math.round((times.reduce((s, t) => s + t, 0) / played) * 100) / 100;
-
-      // Win rate over CONTESTED days only — a day you were the only finisher
-      // isn't a win worth counting, and counting it would hand one-off names
-      // a free 100%.
-      let contested = 0, wins = 0;
-      for (const r of rows) {
-        const day = history[r.date];
-        const dayTimes = Object.values(day).map((x) => x.time);
-        if (dayTimes.length < 2) continue;
-        contested++;
-        if (r.time === Math.min(...dayTimes)) wins++;
-      }
-      const winPct = contested > 0 ? Math.round((1000 * wins) / contested) / 10 : null;
-
-      // per-tier averages (null when too few solves to be meaningful)
-      const tiers = {};
-      for (const level of DIFFICULTY_ORDER) {
-        const ts = rows
-          .filter((r) => difficulties[r.date]?.level === level)
-          .map((r) => r.time);
-        tiers[level] = ts.length >= TIER_MIN_SOLVES
-          ? Math.round((ts.reduce((s, t) => s + t, 0) / ts.length) * 100) / 100
-          : null;
-      }
-
-      const playedSet = new Set(rows.map((r) => r.date));
-      let streak = 0;
-      let cursor = todayKey;
-      if (!playedSet.has(cursor)) {
-        cursor = utcDateKey(new Date(dateKeyToUTC(cursor) - 86400000));
-      }
-      while (playedSet.has(cursor)) {
-        streak++;
-        cursor = utcDateKey(new Date(dateKeyToUTC(cursor) - 86400000));
-      }
-      const gaps = splitGaps[n]?.gaps || [null, null, null, null, null, null];
-      out.push({ name: n, played, best, avg, streak, tiers, gaps, winPct, wins, contested });
-    }
-    out.sort((a, b) => a.avg - b.avg);
-    return out;
-  }, [history, dates, difficulties, todayKey, splitGaps]);
-
-  // The spotlight leader: fastest regular by overall average. `players` is
-  // already avg-sorted, so the first regular is the leader regardless of how
-  // the table below is currently sorted.
-  const leader = useMemo(
-    () => players.find((p) => p.played >= REGULAR_MIN_SOLVES) || null,
-    [players]
-  );
-
-  // Sorted view of the regulars for the table. Nulls always sink to the
-  // bottom regardless of direction, so an empty tier never wins a sort.
-  const sortedRegulars = useMemo(() => {
-    const regs = players.filter((p) => p.played >= REGULAR_MIN_SOLVES);
-    const val = (p) => {
-      if (sortKey === 'name') return null;
-      if (sortKey === 'played') return p.played;
-      if (sortKey === 'winPct') return p.winPct;
-      if (sortKey === 'avg') return p.avg;
-      if (sortKey.startsWith('g')) return p.gaps[Number(sortKey.slice(1))]; // g0..g5
-      return p.tiers[sortKey];  // 'easy' | 'medium' | 'hard'
-    };
-    const arr = [...regs];
-    arr.sort((a, b) => {
-      if (sortKey === 'name') {
-        return sortAsc ? a.name.localeCompare(b.name) : b.name.localeCompare(a.name);
-      }
-      const av = val(a), bv = val(b);
-      if (av == null && bv == null) return a.avg - b.avg;
-      if (av == null) return 1;   // nulls last, always
-      if (bv == null) return -1;
-      return sortAsc ? av - bv : bv - av;
-    });
-    return arr;
-  }, [players, sortKey, sortAsc]);
-
-  if (history === null) {
-    return (
-      <main className="flex-1 flex items-center justify-center text-stone-500">
-        Loading stats…
-      </main>
-    );
-  }
-
-  if (dates.length === 0) {
-    return (
-      <main className="flex-1 p-3 max-w-2xl w-full mx-auto">
-        <div className="text-center text-stone-500 italic mt-10">
-          No games yet. Finish a puzzle to start tracking.
-        </div>
-      </main>
-    );
-  }
-
-  const regulars = players.filter((p) => p.played >= REGULAR_MIN_SOLVES);
-  const visitors = players.filter((p) => p.played < REGULAR_MIN_SOLVES);
-  // Rank among regulars only — a visitor's single lucky solve shouldn't top
-  // the board. Visitors are listed unranked.
-  const rankOf = (p) => regulars.indexOf(p) + 1;
-
-  const toggleDay = (date) => {
-    setExpandedDays((prev) => {
-      const next = new Set(prev);
-      if (next.has(date)) next.delete(date);
-      else next.add(date);
-      return next;
-    });
-  };
-
-  return (
-    <main className="flex-1 p-3 max-w-2xl w-full mx-auto">
-      {/* segmented control */}
-      <div className="flex bg-stone-200 rounded-lg p-0.5 mb-3">
-        {[
-          { id: 'players', label: 'Players' },
-          { id: 'days', label: 'Day by day' },
-          // { id: 'weekly', label: 'Weekly' },  // hidden with Weekly Puzzle
-        ].map((t) => (
-          <button key={t.id} onClick={() => setTab(t.id)}
-            className={`flex-1 py-1.5 rounded-md text-sm font-semibold transition-colors
-                       ${tab === t.id ? 'bg-white text-red-700 shadow-sm' : 'text-stone-500 hover:text-stone-700'}`}>
-            {t.label}
-          </button>
-        ))}
-      </div>
-
-      {tab === 'players' && (
-        <>
-          {leader && (
-            <button onClick={() => onPlayerClick(leader.name)}
-              className="w-full mb-3 flex items-center gap-3 text-left rounded-lg overflow-hidden
-                         shadow-sm border border-amber-200 px-3 py-3
-                         transition-colors hover:brightness-[0.99]"
-              style={{ background: 'linear-gradient(100deg, #fdf6e3, #ffffff 78%)' }}>
-              <span className="text-2xl flex-shrink-0" aria-hidden="true">👑</span>
-              <span className="flex-1 min-w-0">
-                <span className="block text-lg font-bold text-stone-900 truncate"
-                      style={{ fontFamily: '"Georgia", serif' }}>
-                  {leader.name}
-                  {leader.name === currentName && (
-                    <span className="text-stone-400 font-normal text-sm"> (you)</span>
-                  )}
-                </span>
-                <span className="block text-[11.5px] text-stone-600 truncate">
-                  {leader.played} solves · fastest average
-                  {leader.streak >= 2 && <> · 🔥 {leader.streak}-day streak</>}
-                </span>
-              </span>
-              <span className="text-right flex-shrink-0">
-                <span className="block text-xl font-bold tabular-nums"
-                      style={{ fontFamily: '"Menlo", monospace', color: '#b08a24' }}>
-                  {formatMmSs1(leader.avg)}
-                </span>
-                <span className="block text-[9px] uppercase tracking-wider text-stone-400 font-semibold">
-                  avg
-                </span>
-              </span>
-            </button>
-          )}
-
-          <div className="bg-white rounded-md shadow-sm overflow-hidden">
-            {/* Horizontal scroll: the name column is sticky-left so it stays
-                put while the difficulty + per-set columns scroll under it. */}
-            <div className="overflow-x-auto">
-              <table className="border-collapse" style={{ minWidth: '700px', width: '100%' }}>
-                <thead>
-                  <tr>
-                    {[
-                      { k: 'name',   node: 'Player' },
-                      { k: 'played', node: '#' },
-                      { k: 'winPct', node: 'Win %' },
-                      { k: 'easy',   node: <TierStars stars={1} /> },
-                      { k: 'medium', node: <TierStars stars={2} /> },
-                      { k: 'hard',   node: <TierStars stars={3} /> },
-                      { k: 'avg',    node: 'Avg' },
-                      { k: 'g0', node: '1st' }, { k: 'g1', node: '2nd' },
-                      { k: 'g2', node: '3rd' }, { k: 'g3', node: '4th' },
-                      { k: 'g4', node: '5th' }, { k: 'g5', node: '6th' },
-                    ].map(({ k, node }) => {
-                      const active = sortKey === k;
-                      const isName = k === 'name';
-                      return (
-                        <th key={k}
-                          onClick={() => {
-                            if (sortKey === k) setSortAsc((v) => !v);
-                            else { setSortKey(k); setSortAsc(k !== 'played' && k !== 'winPct'); }
-                          }}
-                          className={`py-2 bg-stone-50 border-b border-stone-200
-                                     text-[10px] uppercase tracking-tight font-bold whitespace-nowrap
-                                     cursor-pointer select-none transition-colors hover:bg-stone-100
-                                     ${isName
-                                       ? 'text-left pl-2.5 pr-2 sticky left-0 z-10'
-                                       : 'text-right px-2'}
-                                     ${k === 'g5' ? 'pr-3' : ''}
-                                     ${active ? 'text-red-700' : 'text-stone-400'}`}
-                          style={isName ? { background: '#fafaf9' } : undefined}>
-                          {node}
-                          {active && <span className="ml-0.5 text-[8px]">{sortAsc ? '▲' : '▼'}</span>}
-                        </th>
-                      );
-                    })}
-                  </tr>
-                </thead>
-                <tbody>
-                  {sortedRegulars.map((p, i) => {
-                    const isMe = p.name === currentName;
-                    const rowBg = isMe ? '#fef2f2' : '#fff';
-                    const num = (v, extra = '') => v == null
-                      ? <td className="px-2 py-2 text-right text-stone-300 border-b border-stone-100">—</td>
-                      : <td className={`px-2 py-2 text-right border-b border-stone-100 tabular-nums
-                                       text-[12px] ${extra}`}
-                            style={{ fontFamily: '"Menlo", monospace' }}>{formatCompact(v)}</td>;
-                    return (
-                      <tr key={p.name}
-                          onClick={() => onPlayerClick(p.name)}
-                          className={`cursor-pointer transition-colors
-                                     ${isMe ? 'hover:bg-red-100' : 'hover:bg-stone-50'}`}
-                          style={{ background: rowBg }}>
-                        <td className={`pl-2.5 pr-2 py-2 border-b border-stone-100 text-[12.5px]
-                                       font-semibold whitespace-nowrap sticky left-0 z-10
-                                       ${isMe ? 'text-red-800' : 'text-stone-800'}`}
-                            style={{ background: rowBg }}>
-                          <span className="inline-block w-3.5 text-stone-400 font-normal text-[10.5px]">
-                            {i + 1}
-                          </span>
-                          {p.name}
-                          {isMe && <span className="text-stone-400 font-normal text-[10.5px]"> (you)</span>}
-                        </td>
-                        <td className="px-2 py-2 text-right border-b border-stone-100 tabular-nums
-                                       text-stone-400 text-[11.5px]"
-                            style={{ fontFamily: '"Menlo", monospace' }}>
-                          {p.played}
-                        </td>
-                        <td className={`px-2 py-2 text-right border-b border-stone-100 tabular-nums
-                                       text-[11.5px] ${p.winPct > 0 ? 'text-stone-700 font-semibold' : 'text-stone-300'}`}
-                            style={{ fontFamily: '"Menlo", monospace' }}
-                            title={p.contested ? `${p.wins} of ${p.contested} contested days` : 'no contested days'}>
-                          {p.winPct == null ? '—' : `${p.winPct}%`}
-                        </td>
-                        {num(p.tiers.easy, 'text-stone-600')}
-                        {num(p.tiers.medium, 'text-stone-600')}
-                        {num(p.tiers.hard, 'text-stone-600')}
-                        {num(p.avg, `font-bold ${isMe ? 'text-red-700' : 'text-stone-800'}`)}
-                        {p.gaps.map((g, gi) =>
-                          <React.Fragment key={gi}>
-                            {num(g, gi === 5 ? 'text-stone-500 pr-3' : 'text-stone-500')}
-                          </React.Fragment>
-                        )}
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-
-            {visitors.length > 0 && (
-              <>
-                {showVisitors && visitors.map((p) => {
-                  const isMe = p.name === currentName;
-                  return (
-                    <button key={p.name} onClick={() => onPlayerClick(p.name)}
-                      className={`w-full flex items-center justify-between px-3 py-2 border-t border-stone-100
-                                 transition-colors text-left
-                                 ${isMe ? 'bg-red-50 hover:bg-red-100' : 'hover:bg-stone-50'}`}>
-                      <span className={`text-sm font-medium ${isMe ? 'text-red-800' : 'text-stone-700'}`}>
-                        {p.name}
-                        {isMe && <span className="text-stone-400 font-normal text-[11px]"> (you)</span>}
-                      </span>
-                      <span className="text-[10.5px] text-stone-500 font-mono tabular-nums"
-                            style={{ fontFamily: '"Menlo", monospace' }}>
-                        {p.played}d · avg {formatMmSs(p.avg)}
-                      </span>
-                    </button>
-                  );
-                })}
-                <button onClick={() => setShowVisitors((v) => !v)}
-                  className="w-full py-2 bg-stone-50 hover:bg-stone-100 text-stone-500 text-[11px]
-                             font-medium border-t border-stone-200 transition-colors">
-                  {showVisitors
-                    ? 'Hide occasional players ▴'
-                    : `+ ${visitors.length} occasional player${visitors.length === 1 ? '' : 's'} (under ${REGULAR_MIN_SOLVES} solves) ▾`}
-                </button>
-              </>
-            )}
-          </div>
-          <p className="text-[10px] text-stone-400 text-center mt-2 px-3 leading-relaxed">
-            Win % counts only days two or more people finished. Swipe sideways for per-difficulty averages and the time to
-            find each set (1st–6th). Times under a minute show as seconds.
-            Tap any column to sort, or a row for the full profile.
-          </p>
-        </>
-      )}
-
-      {tab === 'weekly' && (
-        <>
-          <div className="flex items-baseline justify-between mb-1.5 px-1">
-            <span className="text-[11px] uppercase tracking-wider text-stone-500 font-semibold">
-              Weekly Puzzle · {weekKey}
-            </span>
-            <span className="text-[10px] text-stone-400">
-              this week: {WEEKLY_TYPE_META[weeklyTypeForKey(weekKey)].title} · resets Mon UTC
-            </span>
-          </div>
-          <div className="bg-white rounded-md shadow-sm overflow-hidden mb-4">
-            {survivorWeek === null ? (
-              <div className="text-center text-stone-400 text-sm py-4">Loading…</div>
-            ) : survivorWeek.length === 0 ? (
-              <div className="text-center text-stone-400 text-sm italic py-4">
-                No Survivor runs yet this week.
-              </div>
-            ) : (
-              survivorWeek.map((r, i) => {
-                const isMe = r.name === currentName;
-                const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : null;
-                return (
-                  <div key={r.name}
-                       className={`flex items-center justify-between px-3 py-2 border-t border-stone-100 first:border-t-0
-                                  ${isMe ? 'bg-red-50' : ''}`}>
-                    <span className="flex items-center gap-2 min-w-0">
-                      <span className="text-base w-5 inline-block text-center flex-shrink-0">
-                        {medal || <span className="text-stone-400 text-sm">{i + 1}</span>}
-                      </span>
-                      <button onClick={() => onPlayerClick(r.name)}
-                              className={`text-sm font-medium truncate hover:underline underline-offset-2 text-left
-                                         ${isMe ? 'text-red-800' : 'text-stone-800'}`}>
-                        {r.name}{isMe && <span className="text-stone-400 font-normal"> (you)</span>}
-                      </button>
-                    </span>
-                    <span className="text-sm flex-shrink-0 ml-2">
-                      <span className="font-bold text-stone-800 tabular-nums">{r.best}</span>
-                      <span className="text-stone-400 text-[11px]"> cards · {r.attempts} {r.attempts === 1 ? 'try' : 'tries'}</span>
-                    </span>
-                  </div>
-                );
-              })
-            )}
-          </div>
-
-          <div className="flex items-baseline justify-between mb-1.5 px-1">
-            <span className="text-[11px] uppercase tracking-wider text-stone-500 font-semibold">
-              Past champions
-            </span>
-          </div>
-          <div className="bg-white rounded-md shadow-sm overflow-hidden">
-            {survivorPast === null ? (
-              <div className="text-center text-stone-400 text-sm py-4">Loading…</div>
-            ) : survivorPast.length === 0 ? (
-              <div className="text-center text-stone-400 text-sm italic py-4">
-                No completed weeks yet — this is week one.
-              </div>
-            ) : (
-              survivorPast.map((c) => (
-                <div key={c.week}
-                     className="flex items-center justify-between px-3 py-2 border-t border-stone-100 first:border-t-0">
-                  <span className="text-[12px] text-stone-500 min-w-0">
-                    <span className="font-mono" style={{ fontFamily: '"Menlo", monospace' }}>{c.week}</span>
-                    <span className="text-stone-400 text-[10px]"> · {WEEKLY_TYPE_META[weeklyTypeForKey(c.week)].title}</span>
-                  </span>
-                  <span className="text-sm">
-                    🏆{' '}
-                    <button onClick={() => onPlayerClick(c.name)}
-                            className={`font-medium hover:underline underline-offset-2
-                                       ${c.name === currentName ? 'text-red-800' : 'text-stone-800'}`}>
-                      {c.name}
-                    </button>{' '}
-                    <span className="font-bold text-stone-800 tabular-nums">{c.score}</span>
-                    <span className="text-stone-400 text-[11px]"> cards</span>
-                  </span>
-                </div>
-              ))
-            )}
-          </div>
-        </>
-      )}
-
-      {tab === 'days' && (
-        <>
-          <div className="bg-white rounded-md shadow-sm overflow-hidden">
-            {dates.slice(0, daysShown).map((date) => {
-              const entries = Object.entries(history[date])
-                .map(([n, r]) => ({ name: n, time: r.time }))
-                .sort((a, b) => a.time - b.time);
-              const winner = entries[0];
-              const others = Math.max(0, entries.length - 1);  // everyone but the winner
-              const open = expandedDays.has(date);
-              const diff = difficulties[date];
-              const expandable = others > 0;
-              return (
-                <div key={date} className={`border-t border-stone-100 first:border-t-0 ${open ? 'bg-stone-50' : ''}`}>
-                  {/* One line per day: date · winner · time · difficulty · count.
-                      Tap to expand the full field. */}
-                  <div role={expandable ? 'button' : undefined}
-                       tabIndex={expandable ? 0 : undefined}
-                       onClick={expandable ? () => toggleDay(date) : undefined}
-                       onKeyDown={expandable ? (e) => {
-                         if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleDay(date); }
-                       } : undefined}
-                       className={`flex items-center gap-2.5 px-3 py-2.5
-                                  ${expandable ? 'cursor-pointer hover:bg-stone-50' : ''}`}>
-                    {/* date */}
-                    <div className="flex-shrink-0" style={{ width: '46px' }}>
-                      <div className="text-[9px] font-bold text-stone-400 tracking-wider leading-none">
-                        {shortWeekday(date, true)}
-                      </div>
-                      <div className="text-[12.5px] font-bold text-stone-800 leading-tight">
-                        {formatShortDate(date)}
-                      </div>
-                    </div>
-                    {/* winner */}
-                    <div className="flex-1 min-w-0 flex items-center gap-1.5">
-                      <span className="flex-shrink-0 text-[13px]" aria-hidden="true">🥇</span>
-                      {winner ? (
-                        <>
-                          <button onClick={(ev) => { ev.stopPropagation(); onPlayerClick(winner.name); }}
-                            className={`font-semibold text-[13px] truncate hover:underline underline-offset-2
-                                       ${winner.name === currentName ? 'text-red-800' : 'text-stone-800'}`}>
-                            {winner.name}
-                          </button>
-                          <span className="flex-shrink-0 font-mono text-[12px] font-semibold tabular-nums"
-                                style={{ fontFamily: '"Menlo", monospace', color: '#b08a24' }}>
-                            {formatMmSs1(winner.time)}
-                          </span>
-                        </>
-                      ) : (
-                        <span className="text-[12px] text-stone-300">no plays</span>
-                      )}
-                    </div>
-                    {/* difficulty + count + chevron */}
-                    <div className="flex-shrink-0 flex items-center gap-2">
-                      {diff && (
-                        <button onClick={(ev) => { ev.stopPropagation(); onOpenScoring(); }}
-                                className="text-[10px]" title="How difficulty is scored">
-                          <DifficultyBadge difficulty={diff} />
-                        </button>
-                      )}
-                      <span className="text-[11px] text-stone-400 tabular-nums w-12 text-right">
-                        {entries.length} played
-                      </span>
-                      <span className="text-stone-300 text-[11px] w-2.5 text-right">
-                        {expandable ? (open ? '⌄' : '›') : ''}
-                      </span>
-                    </div>
-                  </div>
-                  {/* expanded: ranks 2..N */}
-                  {open && expandable && (
-                    <div className="pb-2.5 pl-[70px] pr-3">
-                      {entries.slice(1).map((e, i) => (
-                        <div key={e.name} className="flex items-center justify-between py-0.5">
-                          <span className="text-[12px] text-stone-600 min-w-0 truncate">
-                            <span className="inline-block w-5 text-stone-400">{i + 2}</span>
-                            <button onClick={() => onPlayerClick(e.name)}
-                                    className={`hover:underline underline-offset-2
-                                               ${e.name === currentName ? 'text-red-800 font-medium' : ''}`}>
-                              {e.name}
-                            </button>
-                          </span>
-                          <span className="font-mono text-[11px] text-stone-500 tabular-nums flex-shrink-0"
-                                style={{ fontFamily: '"Menlo", monospace' }}>
-                            {formatMmSs1(e.time)}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-            {dates.length > daysShown && (
-              <button onClick={() => setDaysShown((n) => n + DAYS_PAGE)}
-                className="w-full py-2 bg-stone-50 hover:bg-stone-100 text-stone-500 text-[11px]
-                           font-medium border-t border-stone-100 transition-colors">
-                Show {Math.min(DAYS_PAGE, dates.length - daysShown)} more days ▾
-              </button>
-            )}
-          </div>
-        </>
-      )}
-    </main>
-  );
-}
-
-// ===== Leaderboard (Daily / Weekly / Monthly / All-Time) =====
-// Daily is deliberately different from the other three: on a single day each
-// player has exactly one time, so "average" and "median" would print the same
-// number in every row. Daily therefore shows the raw time plus the gap to the
-// winner; the other periods show average and median across the window.
-const LB_MIN_PUZZLES = 3;   // minimum finishes to qualify for week/month/all-time
+// ===== Leaderboard (Today / Week / Month / All-time) =====
+// One tab, one axis: the time window. Every view answers "rank these players
+// over this period". Depth scales with what the window can actually support —
+// a single day has no average or median, so Today shows the raw time and the
+// gap to the winner instead. Week, Month and All-time share ONE table shape
+// (14 columns) so the columns never move; cells the window can't fill show a
+// dash and populate as the window grows.
+const LB_MIN_PUZZLES = 3;    // finishes needed to qualify on Week/Month/All-time
+const DAYS_PAGE = 14;        // "Earlier days" page size on the Today view
 
 function mondayOf(dateKey) {
   const t = dateKeyToUTC(dateKey);
-  const d = new Date(t);
-  const dow = (d.getUTCDay() + 6) % 7;         // 0 = Monday
+  const dow = (new Date(t).getUTCDay() + 6) % 7;   // 0 = Monday
   return utcDateKey(new Date(t - dow * 86400000));
 }
 function addDaysKey(dateKey, n) {
@@ -2716,95 +2115,199 @@ function addDaysKey(dateKey, n) {
 function monthStartOf(dateKey) { return dateKey.slice(0, 8) + '01'; }
 function addMonthsKey(dateKey, n) {
   const [y, m] = dateKey.split('-').map(Number);
-  const d = new Date(Date.UTC(y, m - 1 + n, 1));
-  return utcDateKey(d);
+  return utcDateKey(new Date(Date.UTC(y, m - 1 + n, 1)));
 }
-function median(nums) {
+function medianOf(nums) {
   if (!nums.length) return null;
   const a = [...nums].sort((x, y) => x - y);
   const mid = a.length >> 1;
   return a.length % 2 ? a[mid] : Math.round(((a[mid - 1] + a[mid]) / 2) * 100) / 100;
 }
+const avgOf = (a) => (a.length ? Math.round((a.reduce((s, t) => s + t, 0) / a.length) * 100) / 100 : null);
 
-function LeaderboardContent({ history, todayKey, currentName, onPlayerClick }) {
-  const [period, setPeriod] = useState('daily');   // daily | weekly | monthly | all
+function LeaderboardContent({ history, allSplits, todayKey, currentName,
+                              onPlayerClick, onOpenScoring }) {
+  const [period, setPeriod] = useState('today');   // today | week | month | all
   const [anchorDay, setAnchorDay] = useState(todayKey);
   const [anchorWeek, setAnchorWeek] = useState(() => mondayOf(todayKey));
   const [anchorMonth, setAnchorMonth] = useState(() => monthStartOf(todayKey));
-  const [sortKey, setSortKey] = useState('avg');   // avg | med | n
+  const [sortKey, setSortKey] = useState('avg');
   const [sortAsc, setSortAsc] = useState(true);
+  const [daysShown, setDaysShown] = useState(DAYS_PAGE);
+  const [expandedDays, setExpandedDays] = useState(() => new Set());
+  const [showVisitors, setShowVisitors] = useState(false);
 
-  if (history === null) {
-    return <main className="flex-1 flex items-center justify-center text-stone-500">Loading…</main>;
-  }
+  const dates = useMemo(
+    () => (history ? Object.keys(history).sort().reverse() : []),
+    [history]
+  );
 
-  const allDates = Object.keys(history);
-  const earliest = allDates.length ? allDates.sort()[0] : todayKey;
+  // Difficulty is deterministic from the date, so this is a pure lookup.
+  const difficulties = useMemo(() => {
+    const map = {};
+    for (const d of dates) map[d] = computePuzzleDifficulty(generateDailyPuzzle(d));
+    return map;
+  }, [dates]);
 
-  // ---- window bounds for the active period ----
-  let from = null, to = null, title = '', subtitle = '';
-  if (period === 'daily') {
+  // ---- window bounds -------------------------------------------------
+  const earliest = dates.length ? dates[dates.length - 1] : todayKey;
+  let from, to, title, subtitle;
+  if (period === 'today') {
     from = to = anchorDay;
-    title = formatLongDate(anchorDay).replace(/^\w+,\s*/, '');
-    subtitle = anchorDay === todayKey ? "today's puzzle" : 'archived day';
-  } else if (period === 'weekly') {
+    title = formatLongDate(anchorDay);
+    const n = history?.[anchorDay] ? Object.keys(history[anchorDay]).length : 0;
+    subtitle = `${n} finished`;
+  } else if (period === 'week') {
     from = anchorWeek; to = addDaysKey(anchorWeek, 6);
     title = `${formatShortDate(from)} – ${formatShortDate(to)}`;
-    subtitle = anchorWeek === mondayOf(todayKey) ? 'this week' : 'past week';
-  } else if (period === 'monthly') {
+    subtitle = anchorWeek === mondayOf(todayKey) ? 'this week' : 'Mon–Sun';
+  } else if (period === 'month') {
     from = anchorMonth; to = addDaysKey(addMonthsKey(anchorMonth, 1), -1);
-    title = new Date(dateKeyToUTC(anchorMonth)).toLocaleDateString(undefined,
-      { month: 'long', year: 'numeric', timeZone: 'UTC' });
-    subtitle = anchorMonth === monthStartOf(todayKey) ? 'this month' : 'past month';
+    title = new Date(dateKeyToUTC(anchorMonth))
+      .toLocaleDateString(undefined, { month: 'long', year: 'numeric', timeZone: 'UTC' });
+    subtitle = anchorMonth === monthStartOf(todayKey) ? 'this month' : 'full month';
   } else {
     from = earliest; to = todayKey;
-    title = 'All time'; subtitle = `${allDates.length} puzzle days`;
+    title = 'All time';
+    subtitle = `${dates.length} puzzle days`;
   }
 
-  // ---- gather rows in the window ----
-  const byName = {};
-  for (const d of allDates) {
-    if (d < from || d > to) continue;
-    for (const [n, r] of Object.entries(history[d])) {
-      (byName[n] ??= []).push(r.time);
+  // ---- per-player aggregates for the active window --------------------
+  const players = useMemo(() => {
+    if (!history) return [];
+    const acc = {};
+    const bucket = (n) => (acc[n] ??= {
+      name: n, times: [], wins: 0, contested: 0,
+      tiers: { easy: [], medium: [], hard: [] },
+      gaps: Array.from({ length: 6 }, () => []),
+    });
+
+    for (const d of dates) {
+      if (d < from || d > to) continue;
+      const day = history[d];
+      const dayTimes = Object.values(day).map((x) => x.time);
+      const fastest = Math.min(...dayTimes);
+      const isContested = dayTimes.length >= 2;
+      const level = difficulties[d]?.level;
+      for (const [n, r] of Object.entries(day)) {
+        const b = bucket(n);
+        b.times.push(r.time);
+        if (level) b.tiers[level].push(r.time);
+        if (isContested) {
+          b.contested++;
+          if (r.time === fastest) b.wins++;
+        }
+      }
     }
-  }
 
-  const isDaily = period === 'daily';
-  let rows = Object.entries(byName).map(([name, times]) => ({
-    name,
-    n: times.length,
-    avg: Math.round((times.reduce((s, t) => s + t, 0) / times.length) * 100) / 100,
-    med: median(times),
-    time: times[0],
-  }));
-  if (!isDaily) rows = rows.filter((r) => r.n >= LB_MIN_PUZZLES);
+    // per-set find times (splits store cumulative timestamps)
+    for (const row of allSplits || []) {
+      if (!row.date || row.date < from || row.date > to) continue;
+      const s = row.splits;
+      if (!Array.isArray(s) || s.length !== 6) continue;
+      if (!acc[row.name]) continue;   // no result row in window; skip
+      const b = acc[row.name];
+      let prev = 0;
+      for (let i = 0; i < 6; i++) {
+        const t = typeof s[i]?.t === 'number' ? s[i].t : null;
+        if (t == null) continue;
+        b.gaps[i].push(Math.max(0, t - prev));
+        prev = t;
+      }
+    }
 
-  const sortVal = (r) => (isDaily ? r.time : sortKey === 'n' ? r.n : sortKey === 'med' ? r.med : r.avg);
-  rows.sort((a, b) => {
-    const av = sortVal(a), bv = sortVal(b);
-    if (isDaily) return av - bv;
-    return sortAsc ? av - bv : bv - av;
-  });
+    return Object.values(acc).map((b) => ({
+      name: b.name,
+      n: b.times.length,
+      time: b.times[0],
+      avg: avgOf(b.times),
+      med: medianOf(b.times),
+      winPct: b.contested > 0 ? Math.round((1000 * b.wins) / b.contested) / 10 : null,
+      wins: b.wins,
+      contested: b.contested,
+      tiers: {
+        easy: avgOf(b.tiers.easy),
+        medium: avgOf(b.tiers.medium),
+        hard: avgOf(b.tiers.hard),
+      },
+      gaps: b.gaps.map((g) => avgOf(g)),
+    }));
+  }, [history, allSplits, dates, difficulties, from, to]);
+
+  const isToday = period === 'today';
+  const qualified = isToday ? players : players.filter((p) => p.n >= LB_MIN_PUZZLES);
+  const visitors = isToday ? [] : players.filter((p) => p.n < LB_MIN_PUZZLES);
+
+  const sortVal = (p) => {
+    if (sortKey === 'n') return p.n;
+    if (sortKey === 'winPct') return p.winPct;
+    if (sortKey === 'med') return p.med;
+    if (sortKey.startsWith('g')) return p.gaps[Number(sortKey.slice(1))];
+    if (sortKey === 'easy' || sortKey === 'medium' || sortKey === 'hard') return p.tiers[sortKey];
+    return p.avg;
+  };
+  const rows = useMemo(() => {
+    const arr = [...qualified];
+    if (isToday) { arr.sort((a, b) => a.time - b.time); return arr; }
+    arr.sort((a, b) => {
+      const av = sortVal(a), bv = sortVal(b);
+      if (av == null && bv == null) return a.avg - b.avg;
+      if (av == null) return 1;        // nulls always sink
+      if (bv == null) return -1;
+      return sortAsc ? av - bv : bv - av;
+    });
+    return arr;
+  }, [qualified, isToday, sortKey, sortAsc]);
+
   const winnerTime = rows.length ? rows[0].time : null;
+  const leader = period === 'all' ? rows[0] : null;
 
   const step = (dir) => {
-    if (period === 'daily') setAnchorDay((d) => addDaysKey(d, dir));
-    else if (period === 'weekly') setAnchorWeek((w) => addDaysKey(w, dir * 7));
-    else if (period === 'monthly') setAnchorMonth((m) => addMonthsKey(m, dir));
+    if (period === 'today') setAnchorDay((d) => addDaysKey(d, dir));
+    else if (period === 'week') setAnchorWeek((w) => addDaysKey(w, dir * 7));
+    else if (period === 'month') setAnchorMonth((m) => addMonthsKey(m, dir));
   };
-  const atNewest = period === 'daily' ? anchorDay >= todayKey
-                 : period === 'weekly' ? anchorWeek >= mondayOf(todayKey)
-                 : period === 'monthly' ? anchorMonth >= monthStartOf(todayKey)
+  const atNewest = period === 'today' ? anchorDay >= todayKey
+                 : period === 'week' ? anchorWeek >= mondayOf(todayKey)
+                 : period === 'month' ? anchorMonth >= monthStartOf(todayKey)
                  : true;
 
+  const toggleDay = (d) => setExpandedDays((prev) => {
+    const next = new Set(prev);
+    next.has(d) ? next.delete(d) : next.add(d);
+    return next;
+  });
+
   const medal = (i) => (i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : null);
+
+  if (history === null) {
+    return (
+      <main className="flex-1 flex items-center justify-center text-stone-500">
+        Loading…
+      </main>
+    );
+  }
+
+  // 14 columns, identical for week / month / all-time.
+  const COLS = [
+    { k: 'name',   node: 'Player', w: 96 },
+    { k: 'n',      node: '#', w: 46 },
+    { k: 'winPct', node: 'Win %', w: 54 },
+    { k: 'avg',    node: 'Avg', w: 52 },
+    { k: 'med',    node: 'Median', w: 56 },
+    { k: 'easy',   node: <TierStars stars={1} />, w: 48, grp: true },
+    { k: 'medium', node: <TierStars stars={2} />, w: 48, grp: true },
+    { k: 'hard',   node: <TierStars stars={3} />, w: 48, grp: true },
+    { k: 'g0', node: '1st', w: 44 }, { k: 'g1', node: '2nd', w: 44 },
+    { k: 'g2', node: '3rd', w: 44 }, { k: 'g3', node: '4th', w: 44 },
+    { k: 'g4', node: '5th', w: 44 }, { k: 'g5', node: '6th', w: 46 },
+  ];
 
   return (
     <main className="flex-1 p-3 max-w-2xl w-full mx-auto">
       {/* period pills */}
       <div className="flex gap-1.5 mb-2.5">
-        {[['daily','Daily'],['weekly','Weekly'],['monthly','Monthly'],['all','All-Time']].map(([id,label]) => (
+        {[['today','Today'],['week','Week'],['month','Month'],['all','All-time']].map(([id, label]) => (
           <button key={id} onClick={() => setPeriod(id)}
             className={`flex-1 py-1.5 rounded-full text-[11.5px] font-semibold border transition-colors
                        ${period === id
@@ -2815,72 +2318,96 @@ function LeaderboardContent({ history, todayKey, currentName, onPlayerClick }) {
         ))}
       </div>
 
-      {/* window nav */}
-      {period !== 'all' && (
-        <div className="flex items-center justify-between mb-2.5">
+      {/* window heading */}
+      <div className="flex items-center justify-between mb-2.5">
+        {period !== 'all' ? (
           <button onClick={() => step(-1)}
             className="w-8 h-8 rounded-lg bg-white border border-stone-300 text-stone-600
-                       flex items-center justify-center hover:bg-stone-50">‹</button>
-          <div className="text-center leading-tight">
-            <div className="font-bold text-[15px]" style={{ fontFamily: '"Georgia", serif' }}>{title}</div>
-            <div className="text-[10.5px] text-stone-400 mt-0.5">{subtitle}</div>
+                       flex items-center justify-center hover:bg-stone-50 flex-shrink-0">‹</button>
+        ) : <span className="w-8" />}
+        <div className="text-center leading-tight px-2 min-w-0">
+          <div className="font-bold text-[15px] truncate" style={{ fontFamily: '"Georgia", serif' }}>
+            {title}
           </div>
+          <div className="text-[10.5px] text-stone-400 mt-0.5 flex items-center justify-center gap-1.5">
+            <span>{subtitle}</span>
+            {isToday && difficulties[anchorDay] && (
+              <>
+                <span className="text-stone-300">·</span>
+                <button onClick={onOpenScoring} title="How difficulty is scored">
+                  <DifficultyBadge difficulty={difficulties[anchorDay]} />
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+        {period !== 'all' ? (
           <button onClick={() => step(1)} disabled={atNewest}
             className={`w-8 h-8 rounded-lg bg-white border border-stone-300 text-stone-600
-                       flex items-center justify-center hover:bg-stone-50
+                       flex items-center justify-center hover:bg-stone-50 flex-shrink-0
                        ${atNewest ? 'opacity-30' : ''}`}>›</button>
-        </div>
-      )}
-      {period === 'all' && (
-        <div className="text-center mb-2.5 leading-tight">
-          <div className="font-bold text-[15px]" style={{ fontFamily: '"Georgia", serif' }}>{title}</div>
-          <div className="text-[10.5px] text-stone-400 mt-0.5">{subtitle}</div>
-        </div>
-      )}
+        ) : <span className="w-8" />}
+      </div>
 
       <div className="bg-white rounded-md shadow-sm overflow-hidden">
+        {/* leader spotlight, all-time only */}
+        {leader && (
+          <button onClick={() => onPlayerClick(leader.name)}
+            className="w-full flex items-center gap-3 text-left px-3 py-3 border-b border-stone-200
+                       transition-colors hover:brightness-[0.99]"
+            style={{ background: 'linear-gradient(100deg, #fdf6e3, #ffffff 78%)' }}>
+            <span className="text-2xl flex-shrink-0" aria-hidden="true">👑</span>
+            <span className="flex-1 min-w-0">
+              <span className="block text-lg font-bold text-stone-900 truncate"
+                    style={{ fontFamily: '"Georgia", serif' }}>
+                {leader.name}
+                {leader.name === currentName && (
+                  <span className="text-stone-400 font-normal text-sm"> (you)</span>
+                )}
+              </span>
+              <span className="block text-[11.5px] text-stone-600 truncate">
+                {leader.n} solves · fastest average
+                {leader.winPct != null && <> · wins {leader.winPct}%</>}
+              </span>
+            </span>
+            <span className="text-right flex-shrink-0">
+              <span className="block text-xl font-bold tabular-nums"
+                    style={{ fontFamily: '"Menlo", monospace', color: '#b08a24' }}>
+                {formatCompact(leader.avg)}
+              </span>
+              <span className="block text-[9px] uppercase tracking-wider text-stone-400 font-semibold">
+                avg
+              </span>
+            </span>
+          </button>
+        )}
+
         {rows.length === 0 ? (
           <div className="py-10 text-center text-stone-400 text-sm italic">
-            {isDaily ? 'Nobody has finished this puzzle yet.'
+            {isToday ? 'Nobody has finished this puzzle yet.'
                      : `No one reached ${LB_MIN_PUZZLES} puzzles in this window.`}
           </div>
-        ) : (
+        ) : isToday ? (
+          /* ---------- TODAY: time + gap to winner ---------- */
           <table className="w-full table-fixed border-collapse">
             <colgroup>
-              <col style={{ width: isDaily ? '46%' : '40%' }} />
-              {!isDaily && <col style={{ width: '14%' }} />}
-              <col style={{ width: isDaily ? '27%' : '23%' }} />
-              <col style={{ width: isDaily ? '27%' : '23%' }} />
+              <col style={{ width: '46%' }} /><col style={{ width: '27%' }} /><col style={{ width: '27%' }} />
             </colgroup>
             <thead>
               <tr>
                 <th className="px-1 pl-2.5 py-2 bg-stone-50 border-b border-stone-200 text-left
                                text-[10px] uppercase tracking-tight font-bold text-stone-400">Player</th>
-                {!isDaily && (
-                  <th onClick={() => { sortKey === 'n' ? setSortAsc(v => !v) : (setSortKey('n'), setSortAsc(false)); }}
-                    className={`px-1 py-2 bg-stone-50 border-b border-stone-200 text-right cursor-pointer
-                               text-[10px] uppercase tracking-tight font-bold hover:bg-stone-100
-                               ${sortKey === 'n' ? 'text-red-700' : 'text-stone-400'}`}>#</th>
-                )}
-                <th onClick={() => { if (isDaily) return; sortKey === 'avg' ? setSortAsc(v => !v) : (setSortKey('avg'), setSortAsc(true)); }}
-                  className={`px-1 py-2 bg-stone-50 border-b border-stone-200 text-right
-                             text-[10px] uppercase tracking-tight font-bold
-                             ${isDaily ? 'text-stone-400' : `cursor-pointer hover:bg-stone-100 ${sortKey === 'avg' ? 'text-red-700' : 'text-stone-400'}`}`}>
-                  {isDaily ? 'Time' : 'Avg'}
-                </th>
-                <th onClick={() => { if (isDaily) return; sortKey === 'med' ? setSortAsc(v => !v) : (setSortKey('med'), setSortAsc(true)); }}
-                  className={`px-1 pr-2.5 py-2 bg-stone-50 border-b border-stone-200 text-right
-                             text-[10px] uppercase tracking-tight font-bold
-                             ${isDaily ? 'text-stone-400' : `cursor-pointer hover:bg-stone-100 ${sortKey === 'med' ? 'text-red-700' : 'text-stone-400'}`}`}>
-                  {isDaily ? 'Behind' : 'Median'}
-                </th>
+                <th className="px-1 py-2 bg-stone-50 border-b border-stone-200 text-right
+                               text-[10px] uppercase tracking-tight font-bold text-stone-400">Time</th>
+                <th className="px-1 pr-2.5 py-2 bg-stone-50 border-b border-stone-200 text-right
+                               text-[10px] uppercase tracking-tight font-bold text-stone-400">Behind</th>
               </tr>
             </thead>
             <tbody>
-              {rows.map((r, i) => {
-                const isMe = r.name === currentName;
+              {rows.map((p, i) => {
+                const isMe = p.name === currentName;
                 return (
-                  <tr key={r.name} onClick={() => onPlayerClick(r.name)}
+                  <tr key={p.name} onClick={() => onPlayerClick(p.name)}
                       className={`cursor-pointer transition-colors
                                  ${isMe ? 'bg-red-50 hover:bg-red-100' : 'hover:bg-stone-50'}`}>
                     <td className={`px-1 pl-2.5 py-2 border-b border-stone-100 text-[12.5px] font-semibold
@@ -2888,38 +2415,239 @@ function LeaderboardContent({ history, todayKey, currentName, onPlayerClick }) {
                                    ${isMe ? 'text-red-800' : i === 0 ? 'text-amber-700' : 'text-stone-800'}`}>
                       <span className="inline-block w-3.5 text-stone-400 font-normal text-[10.5px]">{i + 1}</span>
                       {medal(i) && <span className="mr-0.5">{medal(i)}</span>}
-                      {r.name}
+                      {p.name}
                       {isMe && <span className="text-stone-400 font-normal text-[10.5px]"> (you)</span>}
                     </td>
-                    {!isDaily && (
-                      <td className="px-1 py-2 text-right border-b border-stone-100 tabular-nums
-                                     text-stone-400 text-[11.5px]"
-                          style={{ fontFamily: '"Menlo", monospace' }}>{r.n}</td>
-                    )}
                     <td className={`px-1 py-2 text-right border-b border-stone-100 tabular-nums text-[12px]
                                    font-bold ${isMe ? 'text-red-700' : 'text-stone-800'}`}
                         style={{ fontFamily: '"Menlo", monospace' }}>
-                      {formatCompact(isDaily ? r.time : r.avg)}
+                      {formatCompact(p.time)}
                     </td>
                     <td className="px-1 pr-2.5 py-2 text-right border-b border-stone-100 tabular-nums
                                    text-[12px] text-stone-500"
                         style={{ fontFamily: '"Menlo", monospace' }}>
-                      {isDaily
-                        ? (i === 0 ? '—' : `+${formatCompact(r.time - winnerTime)}`)
-                        : formatCompact(r.med)}
+                      {i === 0 ? '—' : `+${formatCompact(p.time - winnerTime)}`}
                     </td>
                   </tr>
                 );
               })}
             </tbody>
           </table>
+        ) : (
+          /* ---------- WEEK / MONTH / ALL-TIME: the 14-column table ---------- */
+          <>
+            <div className="overflow-x-auto">
+              <table className="border-collapse" style={{ minWidth: '860px', width: '100%' }}>
+                <thead>
+                  <tr>
+                    {COLS.map(({ k, node, w, grp }) => {
+                      const active = sortKey === k;
+                      const isName = k === 'name';
+                      return (
+                        <th key={k} style={{ width: w, ...(isName ? { background: '#fafaf9' } : {}) }}
+                          onClick={() => {
+                            if (isName) return;
+                            if (sortKey === k) setSortAsc((v) => !v);
+                            else { setSortKey(k); setSortAsc(k !== 'n' && k !== 'winPct'); }
+                          }}
+                          className={`py-2 border-b border-stone-200 text-[9.5px] uppercase tracking-tight
+                                     font-bold whitespace-nowrap select-none
+                                     ${isName ? 'text-left pl-2.5 pr-2 sticky left-0 z-30'
+                                              : 'text-right px-1 cursor-pointer hover:bg-stone-100'}
+                                     ${grp ? 'bg-emerald-50/60' : 'bg-stone-50'}
+                                     ${active ? 'text-red-700' : 'text-stone-400'}`}>
+                          {node}
+                          {active && <span className="ml-0.5 text-[8px]">{sortAsc ? '▲' : '▼'}</span>}
+                        </th>
+                      );
+                    })}
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((p, i) => {
+                    const isMe = p.name === currentName;
+                    const rowBg = isMe ? '#fef2f2' : '#fff';
+                    const cell = (v, extra = '', grp = false) => (
+                      <td className={`px-1 py-2 text-right border-b border-stone-100 tabular-nums
+                                     text-[12px] ${v == null ? 'text-stone-300' : extra}
+                                     ${grp ? 'bg-emerald-50/40' : ''}`}
+                          style={{ fontFamily: '"Menlo", monospace' }}>
+                        {v == null ? '—' : formatCompact(v)}
+                      </td>
+                    );
+                    return (
+                      <tr key={p.name} onClick={() => onPlayerClick(p.name)}
+                          className={`cursor-pointer transition-colors
+                                     ${isMe ? 'hover:bg-red-100' : 'hover:bg-stone-50'}`}
+                          style={{ background: rowBg }}>
+                        <td className={`pl-2.5 pr-2 py-2 border-b border-stone-100 text-[12.5px] font-semibold
+                                       whitespace-nowrap sticky left-0 z-20
+                                       ${isMe ? 'text-red-800' : i === 0 ? 'text-amber-700' : 'text-stone-800'}`}
+                            style={{ background: rowBg }}>
+                          <span className="inline-block w-3.5 text-stone-400 font-normal text-[10.5px]">{i + 1}</span>
+                          {p.name}
+                          {isMe && <span className="text-stone-400 font-normal text-[10.5px]"> (you)</span>}
+                        </td>
+                        <td className="px-1 py-2 text-right border-b border-stone-100 tabular-nums
+                                       text-stone-400 text-[11.5px]"
+                            style={{ fontFamily: '"Menlo", monospace' }}>{p.n}</td>
+                        <td className={`px-1 py-2 text-right border-b border-stone-100 tabular-nums text-[11.5px]
+                                       ${p.winPct == null ? 'text-stone-300'
+                                         : p.winPct > 0 ? 'text-stone-700 font-semibold' : 'text-stone-300'}`}
+                            style={{ fontFamily: '"Menlo", monospace' }}
+                            title={p.contested ? `${p.wins} of ${p.contested} contested days` : 'no contested days'}>
+                          {p.winPct == null ? '—' : `${p.winPct}%`}
+                        </td>
+                        {cell(p.avg, `font-bold ${isMe ? 'text-red-700' : 'text-stone-800'}`)}
+                        {cell(p.med, 'text-stone-600')}
+                        {cell(p.tiers.easy, 'text-stone-600', true)}
+                        {cell(p.tiers.medium, 'text-stone-600', true)}
+                        {cell(p.tiers.hard, 'text-stone-600', true)}
+                        {p.gaps.map((g, gi) => (
+                          <React.Fragment key={gi}>{cell(g, 'text-stone-500')}</React.Fragment>
+                        ))}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div className="text-[9.5px] text-stone-400 text-right px-2.5 pt-1 italic">
+              ← swipe · 14 columns →
+            </div>
+            {visitors.length > 0 && (
+              <>
+                {showVisitors && visitors
+                  .sort((a, b) => a.avg - b.avg)
+                  .map((p) => {
+                    const isMe = p.name === currentName;
+                    return (
+                      <button key={p.name} onClick={() => onPlayerClick(p.name)}
+                        className={`w-full flex items-center justify-between px-3 py-2 border-t border-stone-100
+                                   transition-colors text-left
+                                   ${isMe ? 'bg-red-50 hover:bg-red-100' : 'hover:bg-stone-50'}`}>
+                        <span className={`text-sm font-medium ${isMe ? 'text-red-800' : 'text-stone-700'}`}>
+                          {p.name}
+                        </span>
+                        <span className="text-[10.5px] text-stone-500 tabular-nums"
+                              style={{ fontFamily: '"Menlo", monospace' }}>
+                          {p.n} pz · avg {formatCompact(p.avg)}
+                        </span>
+                      </button>
+                    );
+                  })}
+                <button onClick={() => setShowVisitors((v) => !v)}
+                  className="w-full py-2 bg-stone-50 hover:bg-stone-100 text-stone-500 text-[11px]
+                             font-medium border-t border-stone-200 transition-colors">
+                  {showVisitors
+                    ? 'Hide ▴'
+                    : `+ ${visitors.length} under ${LB_MIN_PUZZLES} puzzles ▾`}
+                </button>
+              </>
+            )}
+          </>
         )}
+
         <div className="text-[10px] text-stone-400 px-2.5 py-2 bg-stone-50 border-t border-stone-200 leading-relaxed">
-          {isDaily
-            ? 'Everyone who finished this puzzle, fastest first. Use ‹ › to step through days.'
-            : `Average and median across the window. ${LB_MIN_PUZZLES}+ puzzles to qualify. Tap a column to sort.`}
+          {isToday
+            ? 'Everyone who finished this puzzle. ‹ › steps through past days.'
+            : `${LB_MIN_PUZZLES}+ puzzles to qualify. Win % counts contested days only. Tap a column to sort, or a row for that player's profile.`}
         </div>
       </div>
+
+      {/* ---------- Earlier days: the day-by-day list, only under Today ---------- */}
+      {isToday && (
+        <>
+          <div className="text-[10px] uppercase tracking-widest text-stone-400 font-bold mt-4 mb-1.5 px-1">
+            Earlier days
+          </div>
+          <div className="bg-white rounded-md shadow-sm overflow-hidden">
+            {dates.filter((d) => d < anchorDay).slice(0, daysShown).map((date) => {
+              const entries = Object.entries(history[date])
+                .map(([n, r]) => ({ name: n, time: r.time }))
+                .sort((a, b) => a.time - b.time);
+              const winner = entries[0];
+              const open = expandedDays.has(date);
+              const diff = difficulties[date];
+              const expandable = entries.length > 1;
+              return (
+                <div key={date} className={`border-t border-stone-100 first:border-t-0 ${open ? 'bg-stone-50' : ''}`}>
+                  <div role={expandable ? 'button' : undefined}
+                       tabIndex={expandable ? 0 : undefined}
+                       onClick={expandable ? () => toggleDay(date) : undefined}
+                       onKeyDown={expandable ? (e) => {
+                         if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleDay(date); }
+                       } : undefined}
+                       className={`flex items-center gap-2.5 px-3 py-2.5
+                                  ${expandable ? 'cursor-pointer hover:bg-stone-50' : ''}`}>
+                    <div className="flex-shrink-0" style={{ width: '44px' }}>
+                      <div className="text-[8.5px] font-bold text-stone-400 tracking-wider leading-none">
+                        {shortWeekday(date, true)}
+                      </div>
+                      <div className="text-[12px] font-bold text-stone-800 leading-tight">
+                        {formatShortDate(date)}
+                      </div>
+                    </div>
+                    <div className="flex-1 min-w-0 flex items-center gap-1.5">
+                      <span className="flex-shrink-0 text-[12px]" aria-hidden="true">🥇</span>
+                      <button onClick={(ev) => { ev.stopPropagation(); onPlayerClick(winner.name); }}
+                        className={`font-semibold text-[12.5px] truncate hover:underline underline-offset-2
+                                   ${winner.name === currentName ? 'text-red-800' : 'text-stone-800'}`}>
+                        {winner.name}
+                      </button>
+                      <span className="flex-shrink-0 tabular-nums text-[11.5px] font-semibold"
+                            style={{ fontFamily: '"Menlo", monospace', color: '#b08a24' }}>
+                        {formatCompact(winner.time)}
+                      </span>
+                    </div>
+                    <div className="flex-shrink-0 flex items-center gap-2">
+                      {diff && (
+                        <button onClick={(ev) => { ev.stopPropagation(); onOpenScoring(); }}
+                                className="text-[10px]" title="How difficulty is scored">
+                          <DifficultyBadge difficulty={diff} />
+                        </button>
+                      )}
+                      <span className="text-[10.5px] text-stone-400 tabular-nums w-5 text-right">
+                        {entries.length}
+                      </span>
+                      <span className="text-stone-300 text-[11px] w-2 text-right">
+                        {expandable ? (open ? '⌄' : '›') : ''}
+                      </span>
+                    </div>
+                  </div>
+                  {open && expandable && (
+                    <div className="pb-2.5 pl-[70px] pr-3">
+                      {entries.slice(1).map((e, i) => (
+                        <div key={e.name} className="flex items-center justify-between py-0.5">
+                          <span className="text-[12px] text-stone-600 min-w-0 truncate">
+                            <span className="inline-block w-5 text-stone-400">{i + 2}</span>
+                            <button onClick={() => onPlayerClick(e.name)}
+                              className={`hover:underline underline-offset-2
+                                         ${e.name === currentName ? 'text-red-800 font-medium' : ''}`}>
+                              {e.name}
+                            </button>
+                          </span>
+                          <span className="tabular-nums text-[11px] text-stone-500 flex-shrink-0"
+                                style={{ fontFamily: '"Menlo", monospace' }}>
+                            {formatCompact(e.time)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            {dates.filter((d) => d < anchorDay).length > daysShown && (
+              <button onClick={() => setDaysShown((n) => n + DAYS_PAGE)}
+                className="w-full py-2 bg-stone-50 hover:bg-stone-100 text-stone-500 text-[11px]
+                           font-medium border-t border-stone-100 transition-colors">
+                Show {DAYS_PAGE} more days ▾
+              </button>
+            )}
+          </div>
+        </>
+      )}
     </main>
   );
 }
@@ -3968,12 +3696,23 @@ export default function App() {
   // History for the Leaderboard tab. Lazy-loaded the first time the tab is
   // opened (loadAllHistory is cached, so this is cheap on repeat visits).
   const [lbHistory, setLbHistory] = useState(null);
+  const [lbSplits, setLbSplits] = useState(null);
+  // Two independent effects on purpose. Sharing one effect meant whichever
+  // fetch resolved first flipped its own state, re-ran the effect, and the
+  // cleanup cancelled the slower sibling before it could land — splits were
+  // silently dropped every time. Each now guards on its own state.
   useEffect(() => {
     if (view !== 'leaderboard' || lbHistory !== null) return;
     let cancelled = false;
     Storage.loadAllHistory().then((h) => { if (!cancelled) setLbHistory(h); });
     return () => { cancelled = true; };
   }, [view, lbHistory]);
+  useEffect(() => {
+    if (view !== 'leaderboard' || lbSplits !== null) return;
+    let cancelled = false;
+    Storage.loadAllSplits().then((r) => { if (!cancelled) setLbSplits(r); });
+    return () => { cancelled = true; };
+  }, [view, lbSplits]);
 
   const lastActiveDateRef = useRef(null);
 
@@ -4231,9 +3970,9 @@ export default function App() {
   const activeTab = view === 'archives' ? 'archives'
                   : view === 'leaderboard' ? 'leaderboard'
                   : view === 'survivor' ? 'survivor'
-                  : (view === 'stats' || view === 'playerStats') ? 'stats'
+                  : view === 'playerStats' ? 'leaderboard'
                   : view === 'scoring' ? (scoringFrom === 'archives' ? 'archives'
-                      : (scoringFrom === 'stats' || scoringFrom === 'playerStats') ? 'stats'
+                      : (scoringFrom === 'leaderboard' || scoringFrom === 'playerStats') ? 'leaderboard'
                       : 'game')
                   : playingDate ? 'archives'  // archived puzzle in game view
                   : 'game';
@@ -4249,9 +3988,6 @@ export default function App() {
       setView('leaderboard');
     } else if (tab === 'survivor') {
       setView('survivor');
-    } else if (tab === 'stats') {
-      setViewingPlayer(null);
-      setView('stats');
     }
   };
 
@@ -4337,27 +4073,21 @@ export default function App() {
       {view === 'leaderboard' && (
         <LeaderboardContent
           history={lbHistory}
+          allSplits={lbSplits}
           todayKey={todayKey}
           currentName={name}
           onPlayerClick={openPlayerStats}
-        />
-      )}
-
-      {view === 'stats' && (
-        <StatsContent
-          onPlayerClick={openPlayerStats}
-          currentName={name}
-          todayKey={todayKey}
           onOpenScoring={openScoring}
         />
       )}
+
 
       {view === 'playerStats' && (
         <PlayerStatsContent
           player={viewingPlayer}
           todayKey={todayKey}
           currentName={name}
-          onBack={() => setView('stats')}
+          onBack={() => setView('leaderboard')}
           onOpenScoring={openScoring}
         />
       )}
