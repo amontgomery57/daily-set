@@ -1394,11 +1394,17 @@ function PauseOverlay({ foundCount, targetCount, onResume }) {
 // sees their final time on the completion screen. This reduces clock anxiety
 // and keeps the focus on the puzzle itself.
 function GameContent({ puzzle, targetSets, time, foundSets, selected, flash,
-                       userPaused, name, isPlayingToday, activeDate,
+                       userPaused, name, isPlayingToday, practice, activeDate,
                        onToggle, onPause, onResume, onRename, onOpenScoring }) {
   const difficulty = useMemo(() => computePuzzleDifficulty(puzzle), [puzzle]);
   return (
     <>
+      {practice && (
+        <div className="bg-amber-50 border-b border-amber-200 text-amber-800 text-[11.5px]
+                        font-medium text-center py-1.5 px-3">
+          🎯 Practice mode — this replay won't be saved or counted
+        </div>
+      )}
       <div className="text-center pt-3 pb-1">
         {!userPaused && (
           <div className="flex items-center justify-center">
@@ -1579,7 +1585,7 @@ function PersonalHistoryCard({ myResults, thisTime, thisDateKey }) {
 }
 
 // ===== Completed content =====
-function CompletedContent({ result, leaderboard, name, isPlayingToday, dateKey,
+function CompletedContent({ result, leaderboard, name, isPlayingToday, practice, dateKey,
                             msUntilTomorrow, puzzle, myResults, onPlayToday, onPlayerClick,
                             nextUnplayedDate, onPlayDate,
                             onRefresh, refreshing, onRename, onOpenScoring }) {
@@ -1596,16 +1602,23 @@ function CompletedContent({ result, leaderboard, name, isPlayingToday, dateKey,
     <main className="flex-1 flex items-start justify-center p-4">
       <div className="max-w-md w-full bg-white rounded-xl shadow-md p-6">
         <div className="text-center mb-4">
-          <div className="text-5xl mb-1">🏆</div>
+          <div className="text-5xl mb-1">{practice ? '🎯' : '🏆'}</div>
           <h2 className="text-xl font-bold"
               style={{ fontFamily: '"Georgia", serif' }}>
-            {isPlayingToday ? "You finished today's puzzle!" : "Puzzle complete!"}
+            {practice ? 'Practice complete!'
+                      : isPlayingToday ? "You finished today's puzzle!"
+                      : "Puzzle complete!"}
           </h2>
           <p className="text-4xl font-mono font-bold text-red-700 mt-2 tabular-nums"
              style={{ fontFamily: '"Menlo", monospace' }}>
             {formatMmSs(result.time)}
           </p>
-          {!isPlayingToday && (
+          {practice ? (
+            <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200
+                          rounded-full inline-block px-3 py-1 mt-2">
+              Replay of {formatShortDate(dateKey)} — not saved, not counted
+            </p>
+          ) : !isPlayingToday && (
             <p className="text-xs text-stone-500 mt-1">
               Archived puzzle · {formatShortDate(dateKey)}
             </p>
@@ -1631,6 +1644,7 @@ function CompletedContent({ result, leaderboard, name, isPlayingToday, dateKey,
           )}
         </div>
 
+        {!practice && (
         <div className="border-t border-stone-200 pt-4 mb-4">
           <div className="flex items-center justify-between mb-2">
             <h3 className="text-sm font-semibold text-stone-700">
@@ -1648,6 +1662,7 @@ function CompletedContent({ result, leaderboard, name, isPlayingToday, dateKey,
           </div>
           <Leaderboard results={leaderboard} currentName={name} onPlayerClick={onPlayerClick} />
         </div>
+        )}
 
         <PersonalHistoryCard myResults={myResults} thisTime={result.time} thisDateKey={dateKey} />
 
@@ -1704,7 +1719,7 @@ function CompletedContent({ result, leaderboard, name, isPlayingToday, dateKey,
 // puzzle's difficulty, the player's time (if solved), rank info, and a
 // play/play-again button. Month nav arrows let users browse any prior month.
 function ArchivesContent({ myResults, todayKey, currentName,
-                           onPlayDate, onOpenScoring }) {
+                           onPlayDate, onPractice, onOpenScoring }) {
   const todayMonth = todayKey.substring(0, 7);  // "2026-05"
   const [viewMonth, setViewMonth] = useState(todayMonth);
   const [selectedDate, setSelectedDate] = useState(todayKey);
@@ -1935,6 +1950,7 @@ function ArchivesContent({ myResults, todayKey, currentName,
           MEDAL={MEDAL}
           RANK_WORD={RANK_WORD}
           onPlay={() => onPlayDate(selectedDate)}
+          onPractice={() => onPractice(selectedDate)}
           onOpenScoring={onOpenScoring}
         />
       )}
@@ -1971,7 +1987,7 @@ function ArchivesContent({ myResults, todayKey, currentName,
 // the selected day was solved, is today, is in the future, or is an unplayed
 // past day.
 function ArchiveDetailStrip({ dateKey, info, MEDAL, RANK_WORD,
-                              onPlay, onOpenScoring }) {
+                              onPlay, onPractice, onOpenScoring }) {
   const { result, isToday, isFuture, medal, count, difficulty } = info;
   const dateLong = formatLongDate(dateKey);
   const wrap = "bg-white border border-stone-200 rounded-md mt-4 p-4 shadow-sm";
@@ -2031,12 +2047,15 @@ function ArchiveDetailStrip({ dateKey, info, MEDAL, RANK_WORD,
             {formatMmSs(result.time)}
           </div>
         </div>
-        <button onClick={onPlay}
+        <button onClick={onPractice}
           className="w-full bg-transparent hover:bg-stone-50 border border-stone-300
                      text-stone-700 rounded-md py-2 text-sm font-medium
                      transition-colors">
           Play again
         </button>
+        <p className="text-[10.5px] text-stone-400 text-center mt-1.5">
+          Practice replay — won't affect your saved time or the leaderboard.
+        </p>
       </div>
     );
   }
@@ -3661,6 +3680,9 @@ function ScoringContent({ onBack }) {
 export default function App() {
   const [todayKey, setTodayKey] = useState(() => utcDateKey());
   const [playingDate, setPlayingDate] = useState(null);
+  // Practice mode: replaying a puzzle you've already solved. The game plays
+  // normally but the result is NOT saved and does NOT touch the leaderboard.
+  const [practiceMode, setPracticeMode] = useState(false);
   const activeDate = playingDate || todayKey;
   const isPlayingToday = !playingDate;
 
@@ -3796,6 +3818,10 @@ export default function App() {
     Storage.savePuzzle(activeDate, puzzle.cards);
 
     (async () => {
+      // In practice mode we deliberately ignore any saved result so the
+      // puzzle starts fresh in the game view rather than jumping to the
+      // completed screen.
+      if (practiceMode) return;
       const r = await Storage.getMyResult(activeDate, name);
       if (cancelled) return;
       if (r) {
@@ -3806,7 +3832,7 @@ export default function App() {
     })();
 
     return () => { cancelled = true; };
-  }, [activeDate, name, loadingName, puzzle.cards]);
+  }, [activeDate, name, loadingName, puzzle.cards, practiceMode]);
 
   // === Visibility tracking ===
   useEffect(() => {
@@ -3912,16 +3938,22 @@ export default function App() {
           // Final time as seconds with 2-decimal precision (e.g. 123.45)
           const finalTime = Math.round(accumulatedMsRef.current / 10) / 100;
           setTime(finalTime);
-          const newResult = { time: finalTime, completedAt: Date.now() };
+          const newResult = { time: finalTime, completedAt: Date.now(), practice: practiceMode };
           const splits = splitsRef.current;
           const misses = missesRef.current;
-          (async () => {
-            await Storage.saveResult(activeDate, name, finalTime, splits, misses);
+          if (practiceMode) {
+            // Replay: show the result locally but never persist it or refresh
+            // the leaderboard. Nothing about this solve reaches the server.
             setCurrentResult(newResult);
-            setMyResults((prev) => ({ ...prev, [activeDate]: newResult }));
-            const lb = await Storage.loadLeaderboard(activeDate);
-            setLeaderboard(lb);
-          })();
+          } else {
+            (async () => {
+              await Storage.saveResult(activeDate, name, finalTime, splits, misses);
+              setCurrentResult(newResult);
+              setMyResults((prev) => ({ ...prev, [activeDate]: newResult }));
+              const lb = await Storage.loadLeaderboard(activeDate);
+              setLeaderboard(lb);
+            })();
+          }
         }
       }
     } else {
@@ -3930,7 +3962,7 @@ export default function App() {
       setFlash('bad');
       flashTimer.current = setTimeout(() => { setSelected([]); setFlash(null); }, 900);
     }
-  }, [selected, foundSets, puzzle, flash, name, activeDate, targetSets]);
+  }, [selected, foundSets, puzzle, flash, name, activeDate, targetSets, practiceMode]);
 
   // === Handlers ===
   const toggle = (idx) => {
@@ -3998,6 +4030,7 @@ export default function App() {
 
   const handleTabChange = (tab) => {
     if (tab === 'game') {
+      setPracticeMode(false);
       setPlayingDate(null);
       setView('game');
     } else if (tab === 'archives') {
@@ -4077,6 +4110,15 @@ export default function App() {
           currentName={name}
           onPlayDate={(date) => {
             // Today => regular play; any other date => archived puzzle.
+            setPracticeMode(false);
+            if (date === todayKey) setPlayingDate(null);
+            else setPlayingDate(date);
+            setView('game');
+          }}
+          onPractice={(date) => {
+            // Replay an already-solved puzzle without it counting.
+            setPracticeMode(true);
+            setCurrentResult(null);
             if (date === todayKey) setPlayingDate(null);
             else setPlayingDate(date);
             setView('game');
@@ -4121,13 +4163,14 @@ export default function App() {
           leaderboard={leaderboard}
           name={name}
           isPlayingToday={isPlayingToday}
+          practice={practiceMode}
           dateKey={activeDate}
           msUntilTomorrow={msUntilTomorrow}
           puzzle={puzzle}
           myResults={myResults}
           onPlayToday={() => handleTabChange('game')}
           nextUnplayedDate={nextUnplayedDate}
-          onPlayDate={(date) => { setPlayingDate(date); setView('game'); }}
+          onPlayDate={(date) => { setPracticeMode(false); setPlayingDate(date); setView('game'); }}
           onPlayerClick={openPlayerStats}
           onRefresh={refreshLeaderboard}
           refreshing={refreshing}
@@ -4147,6 +4190,7 @@ export default function App() {
           userPaused={userPaused}
           name={name}
           isPlayingToday={isPlayingToday}
+          practice={practiceMode}
           activeDate={activeDate}
           onToggle={toggle}
           onPause={() => setUserPaused(true)}
