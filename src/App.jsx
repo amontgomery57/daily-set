@@ -2677,6 +2677,157 @@ function LeaderboardContent({ history, allSplits, todayKey, currentName,
   );
 }
 
+// ===== Moving-average completion-time chart =====
+// An interactive time-series of a player's completion time, smoothed into a
+// moving average. Raw solves render as faint dots (clamped so one outlier
+// doesn't flatten the scale); the red line is the moving average over a
+// selectable window. The line deliberately doesn't start until a full window
+// of solves exists — a 1- or 2-sample "average" is noise and produces a fake
+// ramp from the corner. Cumulative ("All") waits for CUMULATIVE_MIN solves.
+const MIN_SOLVES_FOR_TREND = 12;   // don't show the card below this
+const CUMULATIVE_MIN = 10;         // "All" needs this many before it plots
+
+function MovingAverageChart({ series }) {
+  // series: [{ date, time }] oldest-first
+  const [win, setWin] = useState(14);
+  const [hoverI, setHoverI] = useState(null);
+  const svgRef = useRef(null);
+
+  const n = series.length;
+  const W = 340, H = 150, PADL = 4, PADR = 4, PADT = 8, PADB = 8;
+
+  const ma = useMemo(() => {
+    const out = [];
+    if (win <= 0) {
+      let s = 0;
+      for (let i = 0; i < n; i++) { s += series[i].time; out.push(i + 1 >= CUMULATIVE_MIN ? s / (i + 1) : null); }
+      return out;
+    }
+    for (let i = 0; i < n; i++) {
+      if (i + 1 < win) { out.push(null); continue; }
+      let s = 0;
+      for (let j = i - win + 1; j <= i; j++) s += series[j].time;
+      out.push(s / win);
+    }
+    return out;
+  }, [series, win, n]);
+
+  const real = useMemo(() => ma.map((v, i) => ({ v, i })).filter((o) => o.v != null), [ma]);
+  if (!real.length) return null;   // window longer than history; nothing to draw
+  const start = real[0].i;
+  const maVals = real.map((o) => o.v);
+  const rawCap = 200;
+  const maxMA = Math.max(...maVals), minMA = Math.min(...maVals);
+  const yMax = Math.min(rawCap, Math.max(maxMA * 1.15, 90));
+  const yMin = Math.max(0, minMA * 0.7);
+
+  const x = (i) => PADL + (n === 1 ? 0 : (i / (n - 1)) * (W - PADL - PADR));
+  const y = (v) => PADT + (1 - (Math.min(v, yMax) - yMin) / (yMax - yMin || 1)) * (H - PADT - PADB);
+
+  let dots = '';
+  for (let i = 0; i < n; i++) {
+    dots += `<circle cx="${x(i).toFixed(1)}" cy="${y(series[i].time).toFixed(1)}" r="1.1" fill="#d6d3d1"/>`;
+  }
+  let path = 'M', area = `M${x(start).toFixed(1)} ${H - PADB} L`;
+  real.forEach((o, k) => {
+    const seg = `${x(o.i).toFixed(1)} ${y(o.v).toFixed(1)} `;
+    path += (k === 0 ? seg + 'L' : seg);
+    area += seg;
+  });
+  area += `L${x(real[real.length - 1].i).toFixed(1)} ${H - PADB} Z`;
+
+  let grid = '';
+  const step = yMax > 150 ? 60 : yMax > 90 ? 30 : 20;
+  for (let g = Math.ceil(yMin / step) * step; g < yMax; g += step) {
+    const gy = y(g).toFixed(1);
+    grid += `<line x1="0" y1="${gy}" x2="${W}" y2="${gy}" stroke="#f0efed" stroke-width="1"/>`;
+    grid += `<text x="2" y="${(gy - 2).toFixed(1)}" font-size="7" fill="#c4beb6">${formatCompact(g)}</text>`;
+  }
+
+  let hi = hoverI == null ? n - 1 : hoverI;
+  if (hi < start) hi = start;
+  const cursor =
+    `<line x1="${x(hi).toFixed(1)}" y1="${PADT}" x2="${x(hi).toFixed(1)}" y2="${H - PADB}" ` +
+    `stroke="#b91c1c" stroke-width="1" stroke-dasharray="2 2" opacity="0.5"/>` +
+    `<circle cx="${x(hi).toFixed(1)}" cy="${y(ma[hi]).toFixed(1)}" r="3.5" fill="#b91c1c" stroke="#fff" stroke-width="1.5"/>`;
+
+  const svgHtml =
+    grid +
+    `<path d="${area}" fill="#b91c1c" opacity="0.06"/>` +
+    dots +
+    `<path d="${path}" fill="none" stroke="#b91c1c" stroke-width="2" stroke-linejoin="round"/>` +
+    cursor;
+
+  const firstReal = ma[start], last = ma[n - 1];
+  const delta = last - firstReal;
+  const pct = firstReal ? Math.round((100 * delta) / firstReal) : 0;
+  const recent = last - ma[Math.max(start, n - 15)];
+  const dir = recent < -1 ? 'improving' : recent > 1 ? 'slipping' : 'holding steady';
+  const dirClass = recent < -1 ? 'text-green-700' : recent > 1 ? 'text-amber-700' : 'text-stone-600';
+  const deltaClass = delta < 0 ? 'text-green-700' : 'text-amber-700';
+  const winLabel = win <= 0 ? 'cumulative' : `${win}-solve`;
+
+  const onMove = (e) => {
+    const el = svgRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const frac = (e.clientX - r.left) / r.width;
+    setHoverI(Math.max(0, Math.min(n - 1, Math.round(frac * (n - 1)))));
+  };
+
+  return (
+    <div className="bg-white rounded-md shadow-sm p-3 mb-3">
+      <div className="text-[10px] text-stone-500 uppercase tracking-wider font-semibold mb-1">
+        Completion time trend
+        <span className="normal-case font-normal text-stone-400"> · moving average</span>
+      </div>
+      <div className="flex items-baseline justify-between mb-0.5">
+        <div>
+          <span className="text-2xl font-bold text-red-800 tabular-nums"
+                style={{ fontFamily: '"Menlo", monospace' }}>
+            {formatCompact(ma[hi])}
+          </span>
+          <span className="text-[10.5px] text-stone-400 ml-1">avg</span>
+        </div>
+        <span className="text-[10.5px] text-stone-600 font-semibold tabular-nums">
+          {series[hi].date}
+        </span>
+      </div>
+      <svg ref={svgRef} viewBox="0 0 340 150" preserveAspectRatio="none"
+           style={{ display: 'block', width: '100%', touchAction: 'none' }}
+           onPointerMove={onMove}
+           onPointerLeave={() => setHoverI(null)}
+           dangerouslySetInnerHTML={{ __html: svgHtml }} />
+      <div className="flex gap-3 text-[10.5px] text-stone-400 mt-1.5">
+        <span className="flex items-center gap-1.5">
+          <span className="inline-block rounded-sm" style={{ width: 11, height: 3, background: '#d6d3d1' }} /> each solve
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span className="inline-block rounded-sm" style={{ width: 11, height: 3, background: '#b91c1c' }} /> {winLabel} average
+        </span>
+      </div>
+      <div className="flex gap-1 mt-2.5">
+        {[[7, '7'], [14, '14'], [30, '30'], [0, 'All']].map(([w, label]) => (
+          <button key={label} onClick={() => setWin(w)}
+            className={`flex-1 py-1 rounded-md text-[11px] font-semibold border transition-colors
+                       ${win === w
+                         ? 'bg-red-700 border-red-700 text-white'
+                         : 'bg-white border-stone-200 text-stone-600 hover:bg-stone-50'}`}>
+            {label}
+          </button>
+        ))}
+      </div>
+      <p className="text-[11px] text-stone-600 mt-2.5 pt-2 border-t border-stone-100 leading-relaxed">
+        Currently <span className={`font-semibold ${dirClass}`}>{dir}</span> — your {winLabel} average
+        is <b>{formatCompact(last)}</b>,{' '}
+        <span className={`font-semibold ${deltaClass}`}>
+          {delta < 0 ? `down ${Math.abs(pct)}%` : `up ${pct}%`}
+        </span>{' '}since you started tracking.
+      </p>
+    </div>
+  );
+}
+
 // ===== Player detail stats =====
 function PlayerStatsContent({ player, todayKey, currentName, onBack, onOpenScoring }) {
   const [history, setHistory] = useState(null);
@@ -2919,6 +3070,12 @@ function PlayerStatsContent({ player, todayKey, currentName, onBack, onOpenScori
             </p>
           )}
         </div>
+      )}
+
+      {entries.length >= MIN_SOLVES_FOR_TREND && (
+        <MovingAverageChart
+          series={[...entries].reverse().map((e) => ({ date: e.date, time: e.time }))}
+        />
       )}
 
       {multiPlayerEntries.length > 0 && (
