@@ -2508,8 +2508,8 @@ function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
               <span className="flex-1 min-w-0">
                 <span className="block text-[11.5px] text-stone-700 font-semibold leading-tight">{r.label}</span>
                 {r.holder && (
-                  <span className={`block text-[10px] leading-tight mt-0.5 ${r.iHold ? 'text-blue-700 font-bold' : 'text-stone-400'}`}>
-                    {r.iHold ? "that's you 🎉" : `held by ${r.holder}`}
+                  <span className={`block text-[10px] leading-tight mt-0.5 ${r.iHold ? 'text-blue-700 font-semibold' : 'text-stone-400'}`}>
+                    {r.holder}{r.iHold ? ' (you)' : ''}
                   </span>
                 )}
               </span>
