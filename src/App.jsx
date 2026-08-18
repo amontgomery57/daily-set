@@ -1090,16 +1090,33 @@ function PreviewModeBanner() {
 }
 
 // ===== Header (brand bar) =====
-function Header({ dateKey }) {
+function Header({ dateKey, name, onRename }) {
   return (
-    <header className="bg-red-700 text-white py-2.5 px-4 shadow-md">
-      <div className="max-w-6xl mx-auto text-center">
-        <h1 className="text-base sm:text-lg font-semibold tracking-wide leading-tight"
-            style={{ fontFamily: '"Georgia", serif' }}>
-          The Daily <span className="italic">SET</span> Puzzle
-        </h1>
-        {dateKey && (
-          <p className="text-[11px] text-red-100 mt-0.5">{formatLongDate(dateKey)}</p>
+    <header className="bg-red-700 text-white shadow-md">
+      <div className="max-w-6xl mx-auto relative px-4 py-2.5">
+        <div className="text-center">
+          <h1 className="text-base sm:text-lg font-semibold tracking-wide leading-tight"
+              style={{ fontFamily: '"Georgia", serif' }}>
+            The Daily <span className="italic">SET</span> Puzzle
+          </h1>
+          {dateKey && (
+            <p className="text-[11px] text-red-100 mt-0.5">{formatLongDate(dateKey)}</p>
+          )}
+        </div>
+        {name && onRename && (
+          <button onClick={onRename}
+            className="absolute top-1.5 right-3 flex flex-col items-end leading-tight
+                       text-right group"
+            title="Change your name">
+            <span className="text-[9px] uppercase tracking-wider text-red-200 font-semibold">
+              playing as
+            </span>
+            <span className="text-[12px] font-semibold text-white max-w-[110px] truncate
+                             group-hover:underline underline-offset-2">
+              {cleanName(name)}
+            </span>
+            <span className="text-[9px] text-red-200 group-hover:text-white">Change ›</span>
+          </button>
         )}
       </div>
     </header>
@@ -4745,7 +4762,7 @@ export default function App() {
          style={{ fontFamily: '"Inter", system-ui, sans-serif' }}>
       <SharedSvgDefs />
       <PreviewModeBanner />
-      <Header dateKey={headerDate} />
+      <Header dateKey={headerDate} name={name} onRename={() => setView('rename')} />
       <TabBar activeTab={activeTab} onChange={handleTabChange} />
 
       {view === 'archives' && (
