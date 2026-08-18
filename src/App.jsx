@@ -2184,7 +2184,6 @@ function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
     const wallBuckets = {};          // count of nvary=4 sets in a solve -> [times]
     const openingBuckets = {};       // first-set nvary -> [total times]
     let totalSets = 0;
-    let fastestOpeningSet = null;    // min first-set gap across everyone
 
     for (const row of allSplits) {
       const s = row.splits;
@@ -2204,8 +2203,7 @@ function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
         totalSets++;
         const b = byNvary[nvary];
         b.gaps.push(gap); b.pos.push(i + 1); b.n++;
-        if (i === 0) { b.first++; firstNvary = nvary;
-          if (fastestOpeningSet == null || gap < fastestOpeningSet) fastestOpeningSet = gap; }
+        if (i === 0) { b.first++; firstNvary = nvary; }
         if (i === 5) b.last++;
         if (nvary === 4) nAllDiff++;
 
@@ -2254,21 +2252,32 @@ function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
     // ---- hero + records ----
     const allTimes = [];
     const perPlayerCount = {};
+    let fastestSolve = null, fastestSolveHolder = null;
     for (const d of Object.keys(history)) {
       for (const [n, r] of Object.entries(history[d])) {
         allTimes.push(r.time);
         perPlayerCount[n] = (perPlayerCount[n] || 0) + 1;
+        if (fastestSolve == null || r.time < fastestSolve) { fastestSolve = r.time; fastestSolveHolder = n; }
       }
     }
     const players = Object.keys(perPlayerCount).length;
-    const fastestSolve = allTimes.length ? Math.min(...allTimes) : null;
+
+    // Fastest opening set across everyone, with its holder — computed from the
+    // raw first-splits so the displayed name always matches the displayed value.
+    let fastestOpeningSet = null, fastestOpenHolder = null;
+    for (const row of allSplits) {
+      const t0 = row.splits?.[0]?.t;
+      if (typeof t0 === 'number' && (fastestOpeningSet == null || t0 < fastestOpeningSet)) {
+        fastestOpeningSet = t0; fastestOpenHolder = row.name;
+      }
+    }
 
     // personal bests
     const myTimes = [];
-    let myFastestOpen = null, mySlowest = null, mySlowestDate = null;
+    let myFastestOpen = null;
     for (const d of Object.keys(history)) {
       const r = history[d]?.[currentName];
-      if (r) { myTimes.push(r.time); if (mySlowest == null || r.time > mySlowest) { mySlowest = r.time; mySlowestDate = d; } }
+      if (r) myTimes.push(r.time);
     }
     for (const row of allSplits) {
       if (row.name !== currentName) continue;
@@ -2276,13 +2285,14 @@ function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
       if (typeof g0?.t === 'number' && (myFastestOpen == null || g0.t < myFastestOpen)) myFastestOpen = g0.t;
     }
     const myFastest = myTimes.length ? Math.min(...myTimes) : null;
+    const mySolveCount = myTimes.length;
 
     return {
       totalSolves: allTimes.length, totalSets, players,
       gradient, gMax, shading, shMax, color, colorSpread,
       wall, wallMax, opening, opMax,
-      fastestSolve, fastestOpeningSet,
-      myFastest, myFastestOpen, mySlowest, mySlowestDate,
+      fastestSolve, fastestSolveHolder, fastestOpeningSet, fastestOpenHolder,
+      myFastest, myFastestOpen, mySolveCount,
     };
   }, [history, allSplits, currentName]);
 
@@ -2462,27 +2472,59 @@ function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
       {/* records + personal best */}
       <div className={card}>
         <div className="text-[10px] uppercase tracking-wider text-stone-400 font-bold mb-0.5">
-          The record books · &amp; your personal best
+          The record books
         </div>
-        <div className={csub}>Community record on the left, your own best on the right.</div>
-        {[
-          { ic: '⚡', label: 'Fastest solve ever', rec: S.fastestSolve == null ? '—' : formatCompact(S.fastestSolve), mine: S.myFastest == null ? null : `you ${formatCompact(S.myFastest)}` },
-          { ic: '🎯', label: 'Fastest opening set', rec: S.fastestOpeningSet == null ? '—' : secFmt(S.fastestOpeningSet), mine: S.myFastestOpen == null ? null : `you ${secFmt(S.myFastestOpen)}` },
-          { ic: '🧗', label: 'Your slowest solve', rec: S.mySlowest == null ? '—' : formatCompact(S.mySlowest), mine: S.mySlowestDate ? formatShortDate(S.mySlowestDate) : null },
-        ].map((r) => (
-          <div key={r.label} className="flex items-center gap-2.5 py-2 border-t border-stone-100 first:border-t-0">
-            <span className="text-base w-5 text-center flex-shrink-0">{r.ic}</span>
-            <span className="flex-1 min-w-0">
-              <span className="block text-[11px] text-stone-400 font-semibold">{r.label}</span>
-            </span>
-            <span className="text-right flex-shrink-0">
-              <span className="block text-[12.5px] font-extrabold text-red-800 tabular-nums leading-tight"
-                    style={{ fontFamily: '"Menlo", monospace' }}>{r.rec}</span>
-              {r.mine && <span className="block text-[9.5px] font-bold text-blue-700 tabular-nums"
-                               style={{ fontFamily: '"Menlo", monospace' }}>{r.mine}</span>}
-            </span>
-          </div>
-        ))}
+        <div className={csub}>Community record, who holds it, and your own best.</div>
+        {(() => {
+          const iHoldSolve = S.fastestSolveHolder === currentName;
+          const iHoldOpen = S.fastestOpenHolder === currentName;
+          const rows = [
+            {
+              ic: '⚡', label: 'Fastest solve ever',
+              holder: S.fastestSolveHolder,
+              rec: S.fastestSolve == null ? '—' : formatCompact(S.fastestSolve),
+              iHold: iHoldSolve,
+              mine: (!iHoldSolve && S.myFastest != null) ? `you ${formatCompact(S.myFastest)}` : null,
+            },
+            {
+              ic: '🎯', label: 'Fastest opening set',
+              holder: S.fastestOpenHolder,
+              rec: S.fastestOpeningSet == null ? '—' : secFmt(S.fastestOpeningSet),
+              iHold: iHoldOpen,
+              mine: (!iHoldOpen && S.myFastestOpen != null) ? `you ${secFmt(S.myFastestOpen)}` : null,
+            },
+            {
+              ic: '🏅', label: 'Your personal best',
+              holder: null,
+              rec: S.myFastest == null ? '—' : formatCompact(S.myFastest),
+              iHold: false,
+              mine: S.mySolveCount ? `across ${S.mySolveCount} solves` : null,
+              mineMuted: true,
+            },
+          ];
+          return rows.map((r) => (
+            <div key={r.label} className="flex items-center gap-2.5 py-2 border-t border-stone-100 first:border-t-0">
+              <span className="text-base w-5 text-center flex-shrink-0">{r.ic}</span>
+              <span className="flex-1 min-w-0">
+                <span className="block text-[11.5px] text-stone-700 font-semibold leading-tight">{r.label}</span>
+                {r.holder && (
+                  <span className={`block text-[10px] leading-tight mt-0.5 ${r.iHold ? 'text-blue-700 font-bold' : 'text-stone-400'}`}>
+                    {r.iHold ? "that's you 🎉" : `held by ${r.holder}`}
+                  </span>
+                )}
+              </span>
+              <span className="text-right flex-shrink-0">
+                <span className="block text-[13px] font-extrabold text-red-800 tabular-nums leading-tight"
+                      style={{ fontFamily: '"Menlo", monospace' }}>{r.rec}</span>
+                {r.mine && (
+                  <span className={`block text-[9.5px] font-bold tabular-nums leading-tight
+                                   ${r.mineMuted ? 'text-stone-400' : 'text-blue-700'}`}
+                        style={{ fontFamily: r.mineMuted ? undefined : '"Menlo", monospace' }}>{r.mine}</span>
+                )}
+              </span>
+            </div>
+          ));
+        })()}
       </div>
 
       <p className="text-center text-[10px] text-stone-400 mt-1">
