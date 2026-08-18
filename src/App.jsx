@@ -1093,7 +1093,7 @@ function PreviewModeBanner() {
 function Header({ dateKey, name, onRename }) {
   return (
     <header className="bg-red-700 text-white shadow-md">
-      <div className="max-w-6xl mx-auto relative px-4 py-2.5">
+      <div className="max-w-6xl mx-auto relative px-4 py-2.5" style={{ minHeight: 58 }}>
         <div className="text-center">
           <h1 className="text-base sm:text-lg font-semibold tracking-wide leading-tight"
               style={{ fontFamily: '"Georgia", serif' }}>
@@ -4755,7 +4755,10 @@ export default function App() {
     );
   }
 
-  const headerDate = view === 'game' ? activeDate : null;
+  // Always show a date in the header so its height is constant across tabs
+  // (otherwise the two-line 'Change' control gets clipped on tabs without it).
+  // On the game view show the puzzle's own date; elsewhere show today's.
+  const headerDate = view === 'game' ? activeDate : todayKey;
 
   return (
     <div className="min-h-screen bg-stone-50 flex flex-col"
