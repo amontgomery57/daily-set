@@ -8,6 +8,30 @@ const SHADINGS = ['solid', 'striped', 'open'];
 const NUMBERS = [1, 2, 3];
 const PUZZLE_VERSION = '1';
 
+// Name blocklist — racial slurs and the f-slur only (ordinary profanity is
+// allowed). Mirrors the server-side public.name_is_blocked() check in Supabase,
+// which is the real enforcement point; this copy just gives instant feedback so
+// the person isn't surprised by a rejection after submitting. Normalises common
+// evasions: case, spacing/punctuation, and leetspeak digit swaps.
+const SLUR_PATTERN = /(nigg|nigr|niger|faggot|fagot|chink|kike|spick|spic|wetback|coon|gook|beaner|tranny|retard)/;
+function nameIsBlocked(raw) {
+  if (!raw) return false;
+  let base = raw.toLowerCase().replace(/[0345$@!]/g, (c) =>
+    ({ '0': 'o', '3': 'e', '4': 'a', '5': 's', $: 's', '@': 'a', '!': 'i' }[c] || c));
+  const v1 = base.replace(/1/g, 'i').replace(/[^a-z]/g, '');
+  const v2 = base.replace(/1/g, 'l').replace(/[^a-z]/g, '');
+  return SLUR_PATTERN.test(v1) || SLUR_PATTERN.test(v2)
+      || ['fag', 'coon'].includes(v1) || ['fag', 'coon'].includes(v2);
+}
+
+// Display safety net: mask any slur that somehow reached stored data (e.g. from
+// before the block existed) so it never renders in the UI. Keeps first letter,
+// replaces the rest with asterisks.
+function cleanName(raw) {
+  if (raw && nameIsBlocked(raw)) return raw[0] + '*'.repeat(Math.max(1, raw.length - 1));
+  return raw;
+}
+
 // ===== Deck / set logic =====
 function generateDeck() {
   const deck = [];
@@ -1130,7 +1154,8 @@ function NameEntry({ initial, onSubmit, onCancel, mySecret }) {
   const [copied, setCopied] = useState(false);
 
   const trimmed = input.trim();
-  const valid = trimmed.length > 0 && trimmed.length <= 20;
+  const blocked = nameIsBlocked(trimmed);
+  const valid = trimmed.length > 0 && trimmed.length <= 20 && !blocked;
 
   const submit = async () => {
     if (!valid || busy) return;
@@ -1184,7 +1209,10 @@ function NameEntry({ initial, onSubmit, onCancel, mySecret }) {
             yours, paste your sync code below to claim it on this device.
           </div>
         )}
-        {status === 'invalid' && (
+        {blocked && (
+          <p className="mt-2 text-sm text-red-700">That name isn't allowed. Please choose another.</p>
+        )}
+        {status === 'invalid' && !blocked && (
           <p className="mt-2 text-sm text-red-700">That name can't be used. Try another.</p>
         )}
         {status === 'unavailable' && (
@@ -2509,7 +2537,7 @@ function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
                 <span className="block text-[11.5px] text-stone-700 font-semibold leading-tight">{r.label}</span>
                 {r.holder && (
                   <span className={`block text-[10px] leading-tight mt-0.5 ${r.iHold ? 'text-blue-700 font-semibold' : 'text-stone-400'}`}>
-                    {r.holder}{r.iHold ? ' (you)' : ''}
+                    {cleanName(r.holder)}{r.iHold ? ' (you)' : ''}
                   </span>
                 )}
               </span>
@@ -2800,7 +2828,7 @@ function LeaderboardContent({ history, allSplits, todayKey, currentName,
             <span className="flex-1 min-w-0">
               <span className="block text-lg font-bold text-stone-900 truncate"
                     style={{ fontFamily: '"Georgia", serif' }}>
-                {leader.name}
+                {cleanName(leader.name)}
                 {leader.name === currentName && (
                   <span className="text-stone-400 font-normal text-sm"> (you)</span>
                 )}
@@ -2855,7 +2883,7 @@ function LeaderboardContent({ history, allSplits, todayKey, currentName,
                                    ${isMe ? 'text-red-800' : i === 0 ? 'text-amber-700' : 'text-stone-800'}`}>
                       <span className="inline-block w-3.5 text-stone-400 font-normal text-[10.5px]">{i + 1}</span>
                       {medal(i) && <span className="mr-0.5">{medal(i)}</span>}
-                      {p.name}
+                      {cleanName(p.name)}
                       {isMe && <span className="text-stone-400 font-normal text-[10.5px]"> (you)</span>}
                     </td>
                     <td className={`px-1 py-2 text-right border-b border-stone-100 tabular-nums text-[12px]
@@ -2925,7 +2953,7 @@ function LeaderboardContent({ history, allSplits, todayKey, currentName,
                                        ${isMe ? 'text-red-800' : i === 0 ? 'text-amber-700' : 'text-stone-800'}`}
                             style={{ background: rowBg }}>
                           <span className="inline-block w-3.5 text-stone-400 font-normal text-[10.5px]">{i + 1}</span>
-                          {p.name}
+                          {cleanName(p.name)}
                           {isMe && <span className="text-stone-400 font-normal text-[10.5px]"> (you)</span>}
                         </td>
                         <td className="px-1 py-2 text-right border-b border-stone-100 tabular-nums
@@ -3033,7 +3061,7 @@ function LeaderboardContent({ history, allSplits, todayKey, currentName,
                       <button onClick={(ev) => { ev.stopPropagation(); onPlayerClick(winner.name); }}
                         className={`font-semibold text-[12.5px] truncate hover:underline underline-offset-2
                                    ${winner.name === currentName ? 'text-red-800' : 'text-stone-800'}`}>
-                        {winner.name}
+                        {cleanName(winner.name)}
                       </button>
                       <span className="flex-shrink-0 tabular-nums text-[11.5px] font-semibold"
                             style={{ fontFamily: '"Menlo", monospace', color: '#b08a24' }}>
@@ -3064,7 +3092,7 @@ function LeaderboardContent({ history, allSplits, todayKey, currentName,
                             <button onClick={() => onPlayerClick(e.name)}
                               className={`hover:underline underline-offset-2
                                          ${e.name === currentName ? 'text-red-800 font-medium' : ''}`}>
-                              {e.name}
+                              {cleanName(e.name)}
                             </button>
                           </span>
                           <span className="tabular-nums text-[11px] text-stone-500 flex-shrink-0"
@@ -3292,7 +3320,7 @@ function PlayerStatsContent({ player, todayKey, currentName, onBack, onOpenScori
         </button>
         <h2 className="text-2xl font-bold text-stone-800 mb-2"
             style={{ fontFamily: '"Georgia", serif' }}>
-          {player}
+          {cleanName(player)}
           {player === currentName && (
             <span className="text-base text-stone-400 font-normal ml-2">(you)</span>
           )}
@@ -3395,7 +3423,7 @@ function PlayerStatsContent({ player, todayKey, currentName, onBack, onOpenScori
       </button>
       <h2 className="text-2xl font-bold text-stone-800 mb-3"
           style={{ fontFamily: '"Georgia", serif' }}>
-        {player}
+        {cleanName(player)}
         {player === currentName && (
           <span className="text-base text-stone-400 font-normal ml-2">(you)</span>
         )}
@@ -3923,7 +3951,7 @@ function SurvivorContent({ name, onPlayerClick }) {
                   <button onClick={() => onPlayerClick(r.name)}
                           className={`text-sm font-medium truncate hover:underline underline-offset-2 text-left
                                      ${isMe ? 'text-red-800' : 'text-stone-800'}`}>
-                    {r.name}{isMe && <span className="text-stone-400 font-normal"> (you)</span>}
+                    {cleanName(r.name)}{isMe && <span className="text-stone-400 font-normal"> (you)</span>}
                   </button>
                 </span>
                 <span className="text-sm flex-shrink-0 ml-2">
