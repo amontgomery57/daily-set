@@ -2787,7 +2787,18 @@ function LeaderboardContent({ history, allSplits, todayKey, currentName,
   }, [qualified, isToday, sortKey, sortAsc]);
 
   const winnerTime = rows.length ? rows[0].time : null;
-  const leader = period === 'all' ? rows[0] : null;
+  // The all-time crown goes to the best WIN RATE, not the fastest average — a
+  // more meaningful "champion" than raw speed. Require a floor of contested
+  // days so a 2-for-2 newcomer can't out-crown a season-long regular; among
+  // those, highest win% wins, ties broken by more wins then faster average.
+  const CROWN_MIN_CONTESTED = 10;
+  const leader = useMemo(() => {
+    if (period !== 'all') return null;
+    const eligible = qualified.filter((p) => p.winPct != null && p.contested >= CROWN_MIN_CONTESTED);
+    if (!eligible.length) return rows[0] || null;   // fallback: nobody has enough contested days
+    return [...eligible].sort((a, b) =>
+      (b.winPct - a.winPct) || (b.wins - a.wins) || (a.avg - b.avg))[0];
+  }, [period, qualified, rows]);
 
   const step = (dir) => {
     if (period === 'today') setAnchorDay((d) => addDaysKey(d, dir));
@@ -2893,17 +2904,17 @@ function LeaderboardContent({ history, allSplits, todayKey, currentName,
                 )}
               </span>
               <span className="block text-[11.5px] text-stone-600 truncate">
-                {leader.n} solves · fastest average
-                {leader.winPct != null && <> · wins {leader.winPct}%</>}
+                {leader.wins} {leader.wins === 1 ? 'win' : 'wins'} in {leader.contested} contested
+                {' · '}avg {formatCompact(leader.avg)}
               </span>
             </span>
             <span className="text-right flex-shrink-0">
               <span className="block text-xl font-bold tabular-nums"
                     style={{ fontFamily: '"Menlo", monospace', color: '#b08a24' }}>
-                {formatCompact(leader.avg)}
+                {leader.winPct}%
               </span>
               <span className="block text-[9px] uppercase tracking-wider text-stone-400 font-semibold">
-                avg
+                win rate
               </span>
             </span>
           </button>
