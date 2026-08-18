@@ -2272,10 +2272,23 @@ function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
     const colorSpread = colMedians.length ? Math.max(...colMedians) - Math.min(...colMedians) : null;
 
     const wall = [0, 1, 2, 3, 4].map((k) => ({ k, median: median(wallBuckets[k] || []), n: (wallBuckets[k] || []).length }));
-    const wallMax = Math.max(...wall.map((w) => w.median || 0)) || 1;
+    const wallVals = wall.map((w) => w.median).filter((v) => v != null);
+    const wallMax = wallVals.length ? Math.max(...wallVals) : 1;
+    // Option B baseline: start the bars a little below the smallest bucket so the
+    // 48-58s band separates visibly while the 82s bar still towers. Rounded down
+    // to a clean 5s.
+    const wallBase = wallVals.length ? Math.max(0, Math.floor((Math.min(...wallVals) - 3) / 5) * 5) : 0;
 
     const opening = [1, 2, 3, 4].map((k) => ({ k, median: median(openingBuckets[k] || []), n: (openingBuckets[k] || []).length }));
-    const opMax = Math.max(...opening.map((o) => o.median || 0)) || 1;
+    const opVals = opening.map((o) => o.median).filter((v) => v != null);
+    const opMax = opVals.length ? Math.max(...opVals) : 1;
+    // Opening tell option B: diverge from the overall median of the grouped
+    // solves, so each opening reads as faster/slower than typical.
+    const opAll = [];
+    for (const k of Object.keys(openingBuckets)) opAll.push(...openingBuckets[k]);
+    const opCenter = median(opAll);
+    const opMaxDev = opVals.length && opCenter != null
+      ? Math.max(...opVals.map((v) => Math.abs(v - opCenter))) : 1;
 
     // ---- hero + records ----
     const allTimes = [];
@@ -2318,7 +2331,7 @@ function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
     return {
       totalSolves: allTimes.length, totalSets, players,
       gradient, gMax, shading, shMax, color, colorSpread,
-      wall, wallMax, opening, opMax,
+      wall, wallMax, wallBase, opening, opMax, opCenter, opMaxDev,
       fastestSolve, fastestSolveHolder, fastestOpeningSet, fastestOpenHolder,
       myFastest, myFastestOpen, mySolveCount,
     };
@@ -2448,52 +2461,81 @@ function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
         </div>
       </div>
 
-      {/* CARD C — all-different wall */}
+      {/* CARD C — all-different wall (bars scaled from a baseline so the band separates) */}
       <div className={card}>
         <div className={ctitle}>The all-different wall</div>
         <div className={csub}>How a puzzle's median solve time climbs with the number of hard "all-different" (4-attribute) sets it contains.</div>
-        <div className="flex items-end gap-2" style={{ height: 120, paddingTop: 16 }}>
-          {S.wall.map((w) => (
-            <div key={w.k} className="flex-1 flex flex-col items-center justify-end h-full">
-              <div className="text-[10px] font-extrabold text-stone-700 tabular-nums mb-1"
-                   style={{ fontFamily: '"Menlo", monospace' }}>{w.median == null ? '—' : formatCompact(w.median)}</div>
-              <div className="w-full rounded-t"
-                   style={{ height: `${Math.max(4, (100 * (w.median || 0)) / S.wallMax)}%`,
-                            background: w.k >= 4 ? 'linear-gradient(180deg,#c9433c,#7f1d1d)' : 'linear-gradient(180deg,#e6a8a3,#b91c1c)' }} />
-              <div className="text-[10px] text-stone-400 font-semibold mt-1.5">{w.k}</div>
-            </div>
-          ))}
+        <div className="flex items-end gap-2.5" style={{ height: 130, paddingTop: 18 }}>
+          {S.wall.map((w) => {
+            const span = Math.max(1, S.wallMax - S.wallBase);
+            const h = w.median == null ? 0 : Math.max(4, (100 * (w.median - S.wallBase)) / span);
+            return (
+              <div key={w.k} className="flex-1 flex flex-col items-center justify-end h-full">
+                <div className="text-[10.5px] font-extrabold text-stone-800 tabular-nums mb-1"
+                     style={{ fontFamily: '"Menlo", monospace' }}>{w.median == null ? '—' : formatCompact(w.median)}</div>
+                <div className="w-full rounded-t"
+                     style={{ height: `${h}%`, minHeight: 3,
+                              background: w.k >= 4 ? 'linear-gradient(180deg,#c9433c,#7f1d1d)' : 'linear-gradient(180deg,#e6a8a3,#b91c1c)' }} />
+                <div className="text-[10px] text-stone-400 font-semibold mt-1.5">{w.k}</div>
+              </div>
+            );
+          })}
         </div>
-        <div className="text-[10.5px] text-stone-400 text-center mt-1.5">number of all-different sets in the puzzle →</div>
+        <div className="text-[10px] text-stone-400 text-center mt-1.5">
+          ↑ heights scaled from {formatCompact(S.wallBase)} · number of all-different sets in the puzzle →
+        </div>
         <div className={note}>
-          Puzzles <b className="text-red-800">loaded with all-different sets play markedly slower</b>. This is
-          arguably a cleaner difficulty signal than the star formula — it's measured on the sets people
-          actually find. <button onClick={onOpenScoring} className="text-red-700 underline underline-offset-2">How difficulty is scored →</button>
+          The leap at <b className="text-red-800">4 all-different sets</b> is the story — solve time towers over
+          the tight band below it. Puzzles loaded with them play markedly slower, arguably a cleaner difficulty
+          signal than the star formula since it's measured on the sets people actually find.{' '}
+          <button onClick={onOpenScoring} className="text-red-700 underline underline-offset-2">How difficulty is scored →</button>
         </div>
       </div>
 
-      {/* CARD D — opening tell */}
+      {/* CARD D — opening tell (diverging from the overall median) */}
       <div className={card}>
         <div className={ctitle}>The opening tell</div>
-        <div className={csub}>Grouped by the type of the <i>first</i> set a player finds — and their median total solve.</div>
-        <div className="flex items-end gap-2" style={{ height: 100, paddingTop: 14 }}>
-          {S.opening.map((o, i) => (
-            <div key={o.k} className="flex-1 flex flex-col items-center justify-end h-full">
-              <div className="text-[10px] font-extrabold text-stone-700 tabular-nums mb-1"
-                   style={{ fontFamily: '"Menlo", monospace' }}>{o.median == null ? '—' : formatCompact(o.median)}</div>
-              <div className="w-full rounded-t" style={{ height: `${Math.max(4, (100 * (o.median || 0)) / S.opMax)}%`,
-                            background: 'linear-gradient(180deg,#9db4d8,#1d4ed8)' }} />
-              <div className="text-[8.5px] text-stone-400 text-center mt-1.5 leading-tight">
-                {o.k}-attr{o.k === 1 ? <><br />(easiest)</> : o.k === 4 ? <><br />(hardest)</> : null}
-              </div>
-            </div>
-          ))}
+        <div className={csub}>
+          How each opening compares to the {S.opCenter == null ? 'overall' : formatCompact(S.opCenter)} median solve.
+          Left of the line = faster than typical, right = slower.
         </div>
-        <div className="text-[10.5px] text-stone-400 text-center mt-1.5">type of the first set found →</div>
+        <div className="pt-1">
+          {S.opening.map((o) => {
+            const dev = (o.median == null || S.opCenter == null) ? 0 : o.median - S.opCenter;
+            const w = S.opMaxDev ? (44 * Math.abs(dev)) / S.opMaxDev : 0;  // up to ~44% each side
+            const slower = dev > 0;
+            const label = o.k === 1 ? 'easiest' : o.k === 4 ? 'hardest' : null;
+            return (
+              <div key={o.k} className="flex items-center gap-2.5 py-2 border-t border-stone-100 first:border-t-0">
+                <div className="flex-shrink-0" style={{ width: 62 }}>
+                  <div className="text-[10.5px] font-bold text-stone-700 leading-tight">{o.k}-attr</div>
+                  {label && <div className="text-[9px] text-stone-400">{label}</div>}
+                </div>
+                <div className="relative flex-1" style={{ height: 20 }}>
+                  <div className="absolute bg-stone-300" style={{ left: '50%', top: -3, bottom: -3, width: 1.5 }} />
+                  {o.median != null && (
+                    slower
+                      ? <div className="absolute rounded" style={{ left: '50%', top: 3, height: 14, width: `${w}%`, background: '#dc9b4a' }} />
+                      : <div className="absolute rounded" style={{ right: '50%', top: 3, height: 14, width: `${w}%`, background: '#1d4ed8' }} />
+                  )}
+                </div>
+                <div className={`text-[11px] font-extrabold tabular-nums flex-shrink-0 text-right ${slower ? 'text-amber-700' : 'text-blue-700'}`}
+                     style={{ fontFamily: '"Menlo", monospace', width: 46 }}>
+                  {o.median == null ? '—' : `${dev >= 0 ? '+' : '−'}${Math.abs(Math.round(dev))}s`}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div className="flex justify-between text-[9.5px] text-stone-400 mt-2 px-0.5">
+          <span className="text-blue-600 font-semibold">← faster than typical</span>
+          <span className="text-amber-600 font-semibold">slower →</span>
+        </div>
         <div className={note}>
-          The twist: players who <b className="text-blue-700">open with the hardest set solve fastest overall</b> —
-          it reverses the gradient. Read it as a tell, not a cause: spotting a 4-attribute set first is the mark
-          of a solver scanning for structure, or an easier board.
+          The twist: opening on the <b className="text-amber-700">easy</b> set runs <b>slower</b> than typical,
+          while opening on a <b className="text-blue-700">hard</b> set runs faster — the gradient reverses. Read it
+          as a tell, not a cause: spotting a 4-attribute set first is the mark of a solver scanning for structure,
+          or an easier board.
         </div>
       </div>
 
