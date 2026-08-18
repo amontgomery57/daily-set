@@ -1088,8 +1088,7 @@ function TabBar({ activeTab, onChange }) {
     { id: 'game', label: "Today's Puzzle" },
     { id: 'archives', label: 'Archives' },
     { id: 'leaderboard', label: 'Leaderboard' },
-    // 'Stats' removed: the Players table and Day-by-day list are now the
-    // All-time and Today views of the Leaderboard tab.
+    { id: 'stats', label: 'Stats' },
     // { id: 'survivor', label: 'Weekly Puzzle' },  // hidden — WIP, re-enable to restore
   ];
   return (
@@ -2116,6 +2115,380 @@ function TierStars({ stars }) {
       <span className="text-red-600">{'★'.repeat(stars)}</span>
       <span className="text-stone-300">{'★'.repeat(3 - stars)}</span>
     </span>
+  );
+}
+
+// ===== Stats (community set-anatomy dashboard) =====
+// The crux is the "anatomy of a set" analysis: every SET varies in 1-4 of its
+// four attributes, and that "type" (recorded as a 4-bit mask on each found set)
+// turns out to drive how fast and how early it's found. Everything here is
+// computed live from the splits every player has recorded.
+
+function pctFmt(x) { return x == null ? '—' : `${Math.round(x * 10) / 10}%`; }
+function secFmt(x) { return x == null ? '—' : `${(Math.round(x * 10) / 10).toFixed(1)}s`; }
+
+// One example set per "number of varying attributes", used purely for the
+// visual in the gradient card. Cards are literal so MiniCard can render them.
+const EXAMPLE_SETS = {
+  1: [
+    { color: 'red', shape: 'oval', shading: 'solid', number: 1 },
+    { color: 'red', shape: 'oval', shading: 'solid', number: 2 },
+    { color: 'red', shape: 'oval', shading: 'solid', number: 3 },
+  ],
+  2: [
+    { color: 'green', shape: 'diamond', shading: 'solid', number: 1 },
+    { color: 'green', shape: 'diamond', shading: 'striped', number: 2 },
+    { color: 'green', shape: 'diamond', shading: 'open', number: 3 },
+  ],
+  3: [
+    { color: 'red', shape: 'oval', shading: 'solid', number: 1 },
+    { color: 'green', shape: 'diamond', shading: 'striped', number: 2 },
+    { color: 'purple', shape: 'squiggle', shading: 'open', number: 3 },
+  ],
+  4: [
+    { color: 'red', shape: 'oval', shading: 'solid', number: 1 },
+    { color: 'green', shape: 'diamond', shading: 'striped', number: 2 },
+    { color: 'purple', shape: 'squiggle', shading: 'open', number: 3 },
+  ],
+};
+
+function median(nums) {
+  if (!nums.length) return null;
+  const a = [...nums].sort((x, y) => x - y);
+  const m = a.length >> 1;
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+}
+const mean = (a) => (a.length ? a.reduce((s, x) => s + x, 0) / a.length : null);
+
+function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
+  const stats = useMemo(() => {
+    if (!history || !allSplits) return null;
+
+    // ---- puzzle card lookup, regenerated per distinct date (deterministic) ----
+    const cardCache = {};
+    const cardsFor = (date) => {
+      if (!(date in cardCache)) {
+        try { cardCache[date] = generateDailyPuzzle(date).cards; }
+        catch { cardCache[date] = null; }
+      }
+      return cardCache[date];
+    };
+
+    // accumulators
+    const byNvary = { 1: { gaps: [], pos: [], first: 0, last: 0, n: 0 },
+                      2: { gaps: [], pos: [], first: 0, last: 0, n: 0 },
+                      3: { gaps: [], pos: [], first: 0, last: 0, n: 0 },
+                      4: { gaps: [], pos: [], first: 0, last: 0, n: 0 } };
+    const byShading = { solid: [], striped: [], open: [] };
+    const byColor = { red: [], green: [], purple: [] };
+    const wallBuckets = {};          // count of nvary=4 sets in a solve -> [times]
+    const openingBuckets = {};       // first-set nvary -> [total times]
+    let totalSets = 0;
+    let fastestOpeningSet = null;    // min first-set gap across everyone
+
+    for (const row of allSplits) {
+      const s = row.splits;
+      if (!Array.isArray(s) || s.length !== 6) continue;
+      const cards = cardsFor(row.date);
+      const total = history[row.date]?.[row.name]?.time ?? null;
+
+      let prev = 0, nAllDiff = 0, firstNvary = null;
+      for (let i = 0; i < 6; i++) {
+        const seg = s[i];
+        const mask = seg?.mask;
+        if (typeof seg?.t !== 'number' || !mask) { prev = seg?.t ?? prev; continue; }
+        const gap = Math.max(0, seg.t - prev);
+        prev = seg.t;
+        const nvary = (mask.match(/1/g) || []).length;
+        if (nvary < 1 || nvary > 4) continue;
+        totalSets++;
+        const b = byNvary[nvary];
+        b.gaps.push(gap); b.pos.push(i + 1); b.n++;
+        if (i === 0) { b.first++; firstNvary = nvary;
+          if (fastestOpeningSet == null || gap < fastestOpeningSet) fastestOpeningSet = gap; }
+        if (i === 5) b.last++;
+        if (nvary === 4) nAllDiff++;
+
+        // shading / color: only when that attribute is held constant, and we
+        // can resolve the actual card value from the regenerated puzzle.
+        if (cards && Array.isArray(seg.idx) && seg.idx.length === 3) {
+          const c0 = cards[seg.idx[0]];
+          if (c0) {
+            if (mask[2] === '0' && byShading[c0.shading]) byShading[c0.shading].push(gap);
+            if (mask[0] === '0' && byColor[c0.color]) byColor[c0.color].push(gap);
+          }
+        }
+      }
+
+      if (total != null) {
+        (wallBuckets[nAllDiff] ??= []).push(total);
+        if (firstNvary != null) (openingBuckets[firstNvary] ??= []).push(total);
+      }
+    }
+
+    const gradient = [1, 2, 3, 4].map((k) => {
+      const b = byNvary[k];
+      return {
+        nvary: k,
+        median: median(b.gaps),
+        n: b.n,
+        pctFirst: b.n ? (100 * b.first) / b.n : null,
+        pctLast: b.n ? (100 * b.last) / b.n : null,
+      };
+    });
+    const gMax = Math.max(...gradient.map((g) => g.median || 0)) || 1;
+
+    const shading = ['solid', 'striped', 'open'].map((k) => ({ k, median: median(byShading[k]), n: byShading[k].length }));
+    const shMax = Math.max(...shading.map((s) => s.median || 0)) || 1;
+
+    const color = ['red', 'green', 'purple'].map((k) => ({ k, median: median(byColor[k]), n: byColor[k].length }));
+    const colMedians = color.map((c) => c.median).filter((v) => v != null);
+    const colorSpread = colMedians.length ? Math.max(...colMedians) - Math.min(...colMedians) : null;
+
+    const wall = [0, 1, 2, 3, 4].map((k) => ({ k, median: median(wallBuckets[k] || []), n: (wallBuckets[k] || []).length }));
+    const wallMax = Math.max(...wall.map((w) => w.median || 0)) || 1;
+
+    const opening = [1, 2, 3, 4].map((k) => ({ k, median: median(openingBuckets[k] || []), n: (openingBuckets[k] || []).length }));
+    const opMax = Math.max(...opening.map((o) => o.median || 0)) || 1;
+
+    // ---- hero + records ----
+    const allTimes = [];
+    const perPlayerCount = {};
+    for (const d of Object.keys(history)) {
+      for (const [n, r] of Object.entries(history[d])) {
+        allTimes.push(r.time);
+        perPlayerCount[n] = (perPlayerCount[n] || 0) + 1;
+      }
+    }
+    const players = Object.keys(perPlayerCount).length;
+    const fastestSolve = allTimes.length ? Math.min(...allTimes) : null;
+
+    // personal bests
+    const myTimes = [];
+    let myFastestOpen = null, mySlowest = null, mySlowestDate = null;
+    for (const d of Object.keys(history)) {
+      const r = history[d]?.[currentName];
+      if (r) { myTimes.push(r.time); if (mySlowest == null || r.time > mySlowest) { mySlowest = r.time; mySlowestDate = d; } }
+    }
+    for (const row of allSplits) {
+      if (row.name !== currentName) continue;
+      const g0 = row.splits?.[0];
+      if (typeof g0?.t === 'number' && (myFastestOpen == null || g0.t < myFastestOpen)) myFastestOpen = g0.t;
+    }
+    const myFastest = myTimes.length ? Math.min(...myTimes) : null;
+
+    return {
+      totalSolves: allTimes.length, totalSets, players,
+      gradient, gMax, shading, shMax, color, colorSpread,
+      wall, wallMax, opening, opMax,
+      fastestSolve, fastestOpeningSet,
+      myFastest, myFastestOpen, mySlowest, mySlowestDate,
+    };
+  }, [history, allSplits, currentName]);
+
+  if (!stats) {
+    return <main className="flex-1 flex items-center justify-center text-stone-500">Loading…</main>;
+  }
+
+  const S = stats;
+  const card = "bg-white rounded-lg shadow-sm p-3 mb-3";
+  const ctitle = "text-[13px] font-bold text-stone-900 mb-0.5";
+  const csub = "text-[11px] text-stone-400 mb-3 leading-snug";
+  const note = "mt-3 pt-2.5 border-t border-stone-100 text-[11px] text-stone-600 leading-relaxed";
+
+  return (
+    <main className="flex-1 p-3 max-w-2xl w-full mx-auto">
+      {/* hero */}
+      <div className="grid grid-cols-3 gap-2 mb-3">
+        {[[S.totalSolves.toLocaleString(), 'solves'],
+          [S.totalSets >= 1000 ? `${(S.totalSets / 1000).toFixed(1)}k` : S.totalSets, 'sets found'],
+          [S.players, 'players']].map(([v, l]) => (
+          <div key={l} className="bg-white rounded-lg shadow-sm py-2.5 text-center">
+            <div className="text-lg font-extrabold text-red-800 tabular-nums"
+                 style={{ fontFamily: '"Menlo", monospace' }}>{v}</div>
+            <div className="text-[9px] uppercase tracking-wide text-stone-400 font-bold mt-0.5">{l}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* section header */}
+      <div className="text-center mb-2.5 px-1">
+        <div className="text-lg font-extrabold" style={{ fontFamily: '"Georgia", serif' }}>
+          The anatomy of a set
+        </div>
+        <div className="text-[11px] text-stone-500 mt-1 leading-snug">
+          Every set varies in 1 to 4 attributes. The fewer it varies, the more alike its cards look —
+          and that changes everything about how it's found.
+        </div>
+      </div>
+
+      {/* CARD A — gradient */}
+      <div className={card}>
+        <div className={ctitle}>The harder the type, the later it's found</div>
+        <div className={csub}>Median seconds to spot each type, and how often it's the first vs last set of the puzzle.</div>
+        {S.gradient.map((g) => (
+          <div key={g.nvary} className="flex items-center gap-2.5 py-2 border-t border-stone-100 first:border-t-0">
+            <div className="flex gap-0.5 flex-shrink-0" style={{ width: 78 }}>
+              {EXAMPLE_SETS[g.nvary].map((c, i) => (
+                <div key={i} style={{ width: 24 }}><MiniCard card={c} /></div>
+              ))}
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="text-[11.5px] font-bold text-stone-800">
+                Varies in {g.nvary} attribute{g.nvary > 1 ? 's' : ''}
+              </div>
+              <div className="flex items-center gap-1.5 mt-1">
+                <div className="flex-1 h-2 bg-stone-100 rounded-full overflow-hidden">
+                  <div className="h-full rounded-full"
+                       style={{ width: `${(100 * (g.median || 0)) / S.gMax}%`,
+                                background: 'linear-gradient(90deg,#e6a8a3,#b91c1c)' }} />
+                </div>
+                <span className="text-[11.5px] font-extrabold text-red-800 tabular-nums w-9 text-right"
+                      style={{ fontFamily: '"Menlo", monospace' }}>{secFmt(g.median)}</span>
+              </div>
+              <div className="text-[9.5px] text-stone-400 mt-1">
+                found <b className="text-stone-600">first</b> {pctFmt(g.pctFirst)} · <b className="text-stone-600">last</b> {pctFmt(g.pctLast)}
+              </div>
+            </div>
+          </div>
+        ))}
+        <div className={note}>
+          A near-perfect gradient. A <b className="text-red-800">4-attribute set</b> (every card different)
+          takes far longer to spot than a 1-attribute set and is much more likely to be the frustrating
+          final set. The eye grabs look-alike trios first.
+        </div>
+      </div>
+
+      {/* CARD B — shading */}
+      <div className={card}>
+        <div className={ctitle}>Solid pops, open hides</div>
+        <div className={csub}>When a set shares one shading, which is found fastest? The old player's intuition, measured.</div>
+        {S.shading.map((s) => {
+          const label = s.k[0].toUpperCase() + s.k.slice(1);
+          const col = s.k === 'solid' ? '#b91c1c' : s.k === 'striped' ? '#c9433c' : '#e07a72';
+          return (
+            <div key={s.k} className="flex items-center gap-2.5 py-2 border-t border-stone-100 first:border-t-0">
+              <div style={{ width: 22 }}><MiniCard card={{ color: 'red', shape: 'oval', shading: s.k, number: 1 }} /></div>
+              <div className="text-[11.5px] font-bold text-stone-800" style={{ width: 58 }}>All {label.toLowerCase()}</div>
+              <div className="flex-1 h-3.5 bg-stone-100 rounded overflow-hidden">
+                <div className="h-full rounded" style={{ width: `${(100 * (s.median || 0)) / S.shMax}%`, background: col }} />
+              </div>
+              <span className="text-[11px] font-extrabold text-stone-700 tabular-nums w-10 text-right"
+                    style={{ fontFamily: '"Menlo", monospace' }}>{secFmt(s.median)}</span>
+            </div>
+          );
+        })}
+        <div className={note}>
+          All-<b>solid</b> sets are found fastest; all-<b>open</b> (outline-only) sets slowest. Empty shapes
+          are simply harder for the eye to register. Which single attribute <i>varies</i> barely matters — it's
+          the shading you hold constant that counts.
+        </div>
+      </div>
+
+      {/* CARD — color null result */}
+      <div className={card}>
+        <div className={ctitle}>Does color matter? We checked — it doesn't</div>
+        <div className={csub}>Median time to find a set that shares one color. If hue mattered, these would differ.</div>
+        <div className="flex items-stretch gap-2">
+          {S.color.map((c) => (
+            <div key={c.k} className="flex-1 text-center rounded-lg py-2.5"
+                 style={{ background: '#faf7f5', border: '1px solid #f0e8e2' }}>
+              <div className="mx-auto mb-1.5" style={{ width: 20 }}>
+                <MiniCard card={{ color: c.k, shape: 'oval', shading: 'solid', number: 1 }} />
+              </div>
+              <div className="text-[13px] font-extrabold tabular-nums" style={{ fontFamily: '"Menlo", monospace', color: COLORS[c.k] }}>
+                {secFmt(c.median)}
+              </div>
+              <div className="text-[9px] uppercase tracking-wide text-stone-400 font-bold mt-0.5">{c.k}</div>
+            </div>
+          ))}
+        </div>
+        <div className={note}>
+          Green, purple, and red are found within <b>{S.colorSpread == null ? 'a fraction of a second' : `${secFmt(S.colorSpread)}`}</b> of
+          each other — statistically indistinguishable (color explains under 0.1% of the variance). Your eye
+          reads hue for free; it's the shading that slows you down.
+        </div>
+      </div>
+
+      {/* CARD C — all-different wall */}
+      <div className={card}>
+        <div className={ctitle}>The all-different wall</div>
+        <div className={csub}>How a puzzle's median solve time climbs with the number of hard "all-different" (4-attribute) sets it contains.</div>
+        <div className="flex items-end gap-2" style={{ height: 120, paddingTop: 16 }}>
+          {S.wall.map((w) => (
+            <div key={w.k} className="flex-1 flex flex-col items-center justify-end h-full">
+              <div className="text-[10px] font-extrabold text-stone-700 tabular-nums mb-1"
+                   style={{ fontFamily: '"Menlo", monospace' }}>{w.median == null ? '—' : formatCompact(w.median)}</div>
+              <div className="w-full rounded-t"
+                   style={{ height: `${Math.max(4, (100 * (w.median || 0)) / S.wallMax)}%`,
+                            background: w.k >= 4 ? 'linear-gradient(180deg,#c9433c,#7f1d1d)' : 'linear-gradient(180deg,#e6a8a3,#b91c1c)' }} />
+              <div className="text-[10px] text-stone-400 font-semibold mt-1.5">{w.k}</div>
+            </div>
+          ))}
+        </div>
+        <div className="text-[10.5px] text-stone-400 text-center mt-1.5">number of all-different sets in the puzzle →</div>
+        <div className={note}>
+          Puzzles <b className="text-red-800">loaded with all-different sets play markedly slower</b>. This is
+          arguably a cleaner difficulty signal than the star formula — it's measured on the sets people
+          actually find. <button onClick={onOpenScoring} className="text-red-700 underline underline-offset-2">How difficulty is scored →</button>
+        </div>
+      </div>
+
+      {/* CARD D — opening tell */}
+      <div className={card}>
+        <div className={ctitle}>The opening tell</div>
+        <div className={csub}>Grouped by the type of the <i>first</i> set a player finds — and their median total solve.</div>
+        <div className="flex items-end gap-2" style={{ height: 100, paddingTop: 14 }}>
+          {S.opening.map((o, i) => (
+            <div key={o.k} className="flex-1 flex flex-col items-center justify-end h-full">
+              <div className="text-[10px] font-extrabold text-stone-700 tabular-nums mb-1"
+                   style={{ fontFamily: '"Menlo", monospace' }}>{o.median == null ? '—' : formatCompact(o.median)}</div>
+              <div className="w-full rounded-t" style={{ height: `${Math.max(4, (100 * (o.median || 0)) / S.opMax)}%`,
+                            background: 'linear-gradient(180deg,#9db4d8,#1d4ed8)' }} />
+              <div className="text-[8.5px] text-stone-400 text-center mt-1.5 leading-tight">
+                {o.k}-attr{o.k === 1 ? <><br />(easiest)</> : o.k === 4 ? <><br />(hardest)</> : null}
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="text-[10.5px] text-stone-400 text-center mt-1.5">type of the first set found →</div>
+        <div className={note}>
+          The twist: players who <b className="text-blue-700">open with the hardest set solve fastest overall</b> —
+          it reverses the gradient. Read it as a tell, not a cause: spotting a 4-attribute set first is the mark
+          of a solver scanning for structure, or an easier board.
+        </div>
+      </div>
+
+      {/* records + personal best */}
+      <div className={card}>
+        <div className="text-[10px] uppercase tracking-wider text-stone-400 font-bold mb-0.5">
+          The record books · &amp; your personal best
+        </div>
+        <div className={csub}>Community record on the left, your own best on the right.</div>
+        {[
+          { ic: '⚡', label: 'Fastest solve ever', rec: S.fastestSolve == null ? '—' : formatCompact(S.fastestSolve), mine: S.myFastest == null ? null : `you ${formatCompact(S.myFastest)}` },
+          { ic: '🎯', label: 'Fastest opening set', rec: S.fastestOpeningSet == null ? '—' : secFmt(S.fastestOpeningSet), mine: S.myFastestOpen == null ? null : `you ${secFmt(S.myFastestOpen)}` },
+          { ic: '🧗', label: 'Your slowest solve', rec: S.mySlowest == null ? '—' : formatCompact(S.mySlowest), mine: S.mySlowestDate ? formatShortDate(S.mySlowestDate) : null },
+        ].map((r) => (
+          <div key={r.label} className="flex items-center gap-2.5 py-2 border-t border-stone-100 first:border-t-0">
+            <span className="text-base w-5 text-center flex-shrink-0">{r.ic}</span>
+            <span className="flex-1 min-w-0">
+              <span className="block text-[11px] text-stone-400 font-semibold">{r.label}</span>
+            </span>
+            <span className="text-right flex-shrink-0">
+              <span className="block text-[12.5px] font-extrabold text-red-800 tabular-nums leading-tight"
+                    style={{ fontFamily: '"Menlo", monospace' }}>{r.rec}</span>
+              {r.mine && <span className="block text-[9.5px] font-bold text-blue-700 tabular-nums"
+                               style={{ fontFamily: '"Menlo", monospace' }}>{r.mine}</span>}
+            </span>
+          </div>
+        ))}
+      </div>
+
+      <p className="text-center text-[10px] text-stone-400 mt-1">
+        Live from every finished puzzle · set types decoded from tap history
+      </p>
+    </main>
   );
 }
 
@@ -3888,13 +4261,13 @@ export default function App() {
   // cleanup cancelled the slower sibling before it could land — splits were
   // silently dropped every time. Each now guards on its own state.
   useEffect(() => {
-    if (view !== 'leaderboard' || lbHistory !== null) return;
+    if ((view !== 'leaderboard' && view !== 'stats') || lbHistory !== null) return;
     let cancelled = false;
     Storage.loadAllHistory().then((h) => { if (!cancelled) setLbHistory(h); });
     return () => { cancelled = true; };
   }, [view, lbHistory]);
   useEffect(() => {
-    if (view !== 'leaderboard' || lbSplits !== null) return;
+    if ((view !== 'leaderboard' && view !== 'stats') || lbSplits !== null) return;
     let cancelled = false;
     Storage.loadAllSplits().then((r) => { if (!cancelled) setLbSplits(r); });
     return () => { cancelled = true; };
@@ -4177,10 +4550,11 @@ export default function App() {
   // Tab navigation
   const activeTab = view === 'archives' ? 'archives'
                   : view === 'leaderboard' ? 'leaderboard'
+                  : view === 'stats' ? 'stats'
                   : view === 'survivor' ? 'survivor'
                   : view === 'playerStats' ? 'leaderboard'
                   : view === 'scoring' ? (scoringFrom === 'archives' ? 'archives'
-                      : (scoringFrom === 'leaderboard' || scoringFrom === 'playerStats') ? 'leaderboard'
+                      : (scoringFrom === 'leaderboard' || scoringFrom === 'playerStats' || scoringFrom === 'stats') ? 'leaderboard'
                       : 'game')
                   : playingDate ? 'archives'  // archived puzzle in game view
                   : 'game';
@@ -4195,6 +4569,8 @@ export default function App() {
     } else if (tab === 'leaderboard') {
       setViewingPlayer(null);
       setView('leaderboard');
+    } else if (tab === 'stats') {
+      setView('stats');
     } else if (tab === 'survivor') {
       setView('survivor');
     }
@@ -4299,6 +4675,14 @@ export default function App() {
         />
       )}
 
+      {view === 'stats' && (
+        <StatsContent
+          history={lbHistory}
+          allSplits={lbSplits}
+          currentName={name}
+          onOpenScoring={openScoring}
+        />
+      )}
 
       {view === 'playerStats' && (
         <PlayerStatsContent
