@@ -2386,7 +2386,6 @@ function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
   const card = "bg-white rounded-lg shadow-sm p-3 mb-3";
   const ctitle = "text-[13px] font-bold text-stone-900 mb-0.5";
   const csub = "text-[11px] text-stone-400 mb-3 leading-snug";
-  const note = "mt-3 pt-2.5 border-t border-stone-100 text-[11px] text-stone-600 leading-relaxed";
 
   return (
     <main className="flex-1 p-3 max-w-2xl w-full mx-auto">
@@ -2409,15 +2408,14 @@ function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
           The anatomy of a set
         </div>
         <div className="text-[11px] text-stone-500 mt-1 leading-snug">
-          Every set varies in 1 to 4 attributes. The fewer it varies, the more alike its cards look —
-          and that changes everything about how it's found.
+          Every set varies in 1 to 4 of its four attributes: color, shape, shading and number.
         </div>
       </div>
 
       {/* CARD A — gradient */}
       <div className={card}>
-        <div className={ctitle}>The harder the type, the later it's found</div>
-        <div className={csub}>Median seconds to spot each type, and how often it's the first vs last set of the puzzle.</div>
+        <div className={ctitle}>Find time by set type</div>
+        <div className={csub}>Median seconds to find each type of set, and how often it is the first or last set found in a puzzle.</div>
         {S.gradient.map((g) => (
           <div key={g.nvary} className="flex items-center gap-2.5 py-2 border-t border-stone-100 first:border-t-0">
             <div className="flex gap-0.5 flex-shrink-0" style={{ width: 78 }}>
@@ -2444,17 +2442,12 @@ function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
             </div>
           </div>
         ))}
-        <div className={note}>
-          A near-perfect gradient. A <b className="text-red-800">4-attribute set</b> (every card different)
-          takes far longer to spot than a 1-attribute set and is much more likely to be the frustrating
-          final set. The eye grabs look-alike trios first.
-        </div>
       </div>
 
       {/* CARD B — shading */}
       <div className={card}>
-        <div className={ctitle}>Solid pops, open hides</div>
-        <div className={csub}>When a set shares one shading, which is found fastest? The old player's intuition, measured.</div>
+        <div className={ctitle}>Find time by shading</div>
+        <div className={csub}>Median seconds to find a set whose three cards all share the same shading.</div>
         {S.shading.map((s) => {
           const label = s.k[0].toUpperCase() + s.k.slice(1);
           const col = s.k === 'solid' ? '#b91c1c' : s.k === 'striped' ? '#c9433c' : '#e07a72';
@@ -2470,17 +2463,12 @@ function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
             </div>
           );
         })}
-        <div className={note}>
-          All-<b>solid</b> sets are found fastest; all-<b>open</b> (outline-only) sets slowest. Empty shapes
-          are simply harder for the eye to register. Which single attribute <i>varies</i> barely matters — it's
-          the shading you hold constant that counts.
-        </div>
       </div>
 
       {/* CARD — color null result */}
       <div className={card}>
-        <div className={ctitle}>Does color matter? We checked — it doesn't</div>
-        <div className={csub}>Median time to find a set that shares one color. If hue mattered, these would differ.</div>
+        <div className={ctitle}>Find time by color</div>
+        <div className={csub}>Median seconds to find a set whose three cards all share the same color.</div>
         <div className="flex items-stretch gap-2">
           {S.color.map((c) => (
             <div key={c.k} className="flex-1 text-center rounded-lg py-2.5"
@@ -2495,17 +2483,12 @@ function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
             </div>
           ))}
         </div>
-        <div className={note}>
-          Green, purple, and red are found within <b>{S.colorSpread == null ? 'a fraction of a second' : `${secFmt(S.colorSpread)}`}</b> of
-          each other — statistically indistinguishable (color explains under 0.1% of the variance). Your eye
-          reads hue for free; it's the shading that slows you down.
-        </div>
       </div>
 
       {/* CARD C — all-different wall (bars scaled from a baseline so the band separates) */}
       <div className={card}>
-        <div className={ctitle}>The all-different wall</div>
-        <div className={csub}>How a puzzle's median solve time climbs with the number of hard "all-different" (4-attribute) sets it contains.</div>
+        <div className={ctitle}>Solve time by all-different sets</div>
+        <div className={csub}>Median puzzle solve time, grouped by how many of the puzzle's sets vary in all 4 attributes.</div>
         <div className="flex items-end gap-2.5" style={{ height: 130, paddingTop: 18 }}>
           {S.wall.map((w) => {
             const span = Math.max(1, S.wallMax - S.wallBase);
@@ -2525,20 +2508,17 @@ function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
         <div className="text-[10px] text-stone-400 text-center mt-1.5">
           ↑ heights scaled from {formatCompact(S.wallBase)} · number of all-different sets in the puzzle →
         </div>
-        <div className={note}>
-          The leap at <b className="text-red-800">4 all-different sets</b> is the story — solve time towers over
-          the tight band below it. Puzzles loaded with them play markedly slower, arguably a cleaner difficulty
-          signal than the star formula since it's measured on the sets people actually find.{' '}
+        <div className="mt-3 pt-2.5 border-t border-stone-100 text-[11px]">
           <button onClick={onOpenScoring} className="text-red-700 underline underline-offset-2">How difficulty is scored →</button>
         </div>
       </div>
 
       {/* CARD D — opening tell (diverging from the overall median) */}
       <div className={card}>
-        <div className={ctitle}>The opening tell</div>
+        <div className={ctitle}>Solve time by opening set type</div>
         <div className={csub}>
-          How each opening compares to the {S.opCenter == null ? 'overall' : formatCompact(S.opCenter)} median solve.
-          Left of the line = faster than typical, right = slower.
+          Median total solve time grouped by the type of the first set found, shown as the difference from the
+          overall median of {S.opCenter == null ? '—' : formatCompact(S.opCenter)}.
         </div>
         <div className="pt-1">
           {S.opening.map((o) => {
@@ -2571,12 +2551,6 @@ function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
         <div className="flex justify-between text-[9.5px] text-stone-400 mt-2 px-0.5">
           <span className="text-blue-600 font-semibold">← faster than typical</span>
           <span className="text-amber-600 font-semibold">slower →</span>
-        </div>
-        <div className={note}>
-          The twist: opening on the <b className="text-amber-700">easy</b> set runs <b>slower</b> than typical,
-          while opening on a <b className="text-blue-700">hard</b> set runs faster — the gradient reverses. Read it
-          as a tell, not a cause: spotting a 4-attribute set first is the mark of a solver scanning for structure,
-          or an easier board.
         </div>
       </div>
 
