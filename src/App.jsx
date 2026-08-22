@@ -694,6 +694,30 @@ const Storage = {
     }
     return lsListResults();
   },
+  // Practice replays go to their own table, never to results/. Deliberately
+  // fire-and-forget and failure-tolerant: this is analytics, and nothing about
+  // a practice game should be able to disrupt the player's experience. No
+  // local caching either — there's nothing in the app that reads it back.
+  async savePracticeResult(dateKey, name, time, splits, misses) {
+    if (!USE_SUPABASE || !name) return;
+    try {
+      await sbFetch('/practice_results', {
+        method: 'POST',
+        headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify({
+          date: dateKey,
+          name,
+          time_seconds: time,
+          splits: splits && splits.length ? splits : null,
+          misses: Array.isArray(misses) ? misses : null,
+          completed_at: Date.now(),
+        }),
+      });
+    } catch (e) {
+      // Swallow: practice logging must never surface to the player.
+      console.error('savePracticeResult:', e);
+    }
+  },
   async saveResult(dateKey, name, time, splits, misses) {
     // A fresh solve changes the shared history query's answer — invalidate
     // so the player sees their own result immediately instead of waiting out
@@ -4612,9 +4636,12 @@ export default function App() {
           const splits = splitsRef.current;
           const misses = missesRef.current;
           if (practiceMode) {
-            // Replay: show the result locally but never persist it or refresh
-            // the leaderboard. Nothing about this solve reaches the server.
+            // Replay: never touches results/ or the leaderboard. We do log it
+            // to the separate practice_results table for analysis (learning
+            // curves, recognition-vs-search). Fire-and-forget: a failure here
+            // must never disrupt the player's completion screen.
             setCurrentResult(newResult);
+            Storage.savePracticeResult(activeDate, name, finalTime, splits, misses);
           } else {
             (async () => {
               await Storage.saveResult(activeDate, name, finalTime, splits, misses);
