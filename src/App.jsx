@@ -2515,17 +2515,19 @@ function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
 
       {/* CARD D — opening tell (diverging from the overall median) */}
       <div className={card}>
-        <div className={ctitle}>Solve time by opening set type</div>
+        <div className={ctitle}>Solve time by the first set found</div>
         <div className={csub}>
-          Median total solve time grouped by the type of the first set found, shown as the difference from the
-          overall median of {S.opCenter == null ? '—' : formatCompact(S.opCenter)}.
+          Solves are grouped by which type of set the player happened to find first. Each bar is that group's
+          median total solve time, as a difference from the overall median of{' '}
+          {S.opCenter == null ? '—' : formatCompact(S.opCenter)}.
         </div>
         <div className="pt-1">
           {S.opening.map((o) => {
             const dev = (o.median == null || S.opCenter == null) ? 0 : o.median - S.opCenter;
             const w = S.opMaxDev ? (44 * Math.abs(dev)) / S.opMaxDev : 0;  // up to ~44% each side
             const slower = dev > 0;
-            const label = o.k === 1 ? 'easiest' : o.k === 4 ? 'hardest' : null;
+            const label = null;   // no difficulty wording here: this chart measures
+                                  // total solve time, not how hard a set is to spot.
             return (
               <div key={o.k} className="flex items-center gap-2.5 py-2 border-t border-stone-100 first:border-t-0">
                 <div className="flex-shrink-0" style={{ width: 62 }}>
