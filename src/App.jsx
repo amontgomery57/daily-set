@@ -176,6 +176,9 @@ const RAW_SCORE_MAX = 3.808;  // max raw composite over all real daily puzzles
 const SCORE_CUT_EASY = 3.46;  // < this -> 1 star
 const SCORE_CUT_HARD = 6.67;  // >= this -> 3 stars; between -> 2 stars
 
+// Mirrored server-side by public.puzzle_difficulty_level() (puzzles.level),
+// which the leaderboard's star-tier columns and profiles use. If this formula,
+// its constants, or PUZZLE_VERSION change, update that SQL function too.
 function computePuzzleDifficulty(puzzle) {
   if (!puzzle || !puzzle.sets || !puzzle.cards) return null;
   const { cards, sets } = puzzle;
@@ -554,8 +557,8 @@ async function sbRpc(fn, args) {
   return res.json();
 }
 
-// Tiny cached-fetch helper for the broad, whole-table-ish queries
-// (loadAllHistory, loadFieldSplits). Archives, Stats, and every player
+// Tiny cached-fetch helper for the aggregate queries (loadBoard,
+// loadPlayerDays, loadStatsPage, ...). Archives, Stats, and every player
 // profile each call these independently on mount with no coordination —
 // browsing Archives -> Stats -> two player profiles fires the same
 // multi-hundred-row fetch four times in a few seconds with no caching.
@@ -583,6 +586,9 @@ function cachedFetch(key, ttlMs, fetchFn) {
   return p;
 }
 function invalidateCache(key) { delete _cache[key]; }
+function invalidateCachePrefix(prefix) {
+  for (const k of Object.keys(_cache)) if (k.startsWith(prefix)) delete _cache[k];
+}
 
 const Storage = {
   async getName() {
@@ -724,7 +730,7 @@ const Storage = {
     // the cache TTL. (fieldSplits is left to expire on its own; one solve
     // barely moves a field-wide median, and it's an expensive query to
     // refetch on every single save across every player.)
-    invalidateCache('allHistory');
+    for (const pre of ['lb:', 'pd:', 'stats:']) invalidateCachePrefix(pre);
     const payload = { time, completedAt: Date.now() };
     if (splits && splits.length) payload.splits = splits;
     // Always attach misses, including the empty array — "solved with zero
@@ -915,47 +921,6 @@ const Storage = {
     }
     return {};
   },
-  async loadAllHistory() {
-    if (USE_SUPABASE) {
-      return cachedFetch('allHistory', HISTORY_CACHE_TTL_MS, async () => {
-        try {
-          // Paginated: PostgREST caps single responses ~1000 rows, which was
-          // silently truncating history to only the most recent dates.
-          const rows = await sbFetchAll(
-            '/results?select=date,name,time_seconds,completed_at&order=date.desc'
-          );
-          const history = {};
-          for (const row of rows || []) {
-            if (!history[row.date]) history[row.date] = {};
-            history[row.date][row.name] = { time: row.time_seconds, completedAt: row.completed_at };
-          }
-          return history;
-        } catch { return {}; }
-      });
-    }
-    if (hasStorage()) {
-      try {
-        const list = await window.storage.list('result:', true);
-        const keys = list?.keys || [];
-        const history = {};
-        await Promise.all(keys.map(async (key) => {
-          try {
-            const r = await window.storage.get(key, true);
-            if (!r) return;
-            const rest = key.substring('result:'.length);
-            const colon = rest.indexOf(':');
-            if (colon === -1) return;
-            const date = rest.substring(0, colon);
-            const n = rest.substring(colon + 1);
-            if (!history[date]) history[date] = {};
-            history[date][n] = JSON.parse(r.value);
-          } catch {}
-        }));
-        return history;
-      } catch { return {}; }
-    }
-    return {};
-  },
   // Fetch one player's own split-recorded solves — scoped by name, so most
   // profile views (players below the pace-chart threshold) never trigger
   // the heavier field-wide query below.
@@ -970,33 +935,46 @@ const Storage = {
     }
     return [];
   },
-  // Fetch every split-recorded solve across all players, to compute the
-  // field's median pace per set position. Only called once a profile has
-  // already cleared MIN_SPLITS_FOR_PACE_CHART on its own scoped query above.
-  async loadFieldSplits() {
-    if (USE_SUPABASE) {
-      return cachedFetch('fieldSplits', HISTORY_CACHE_TTL_MS, async () => {
-        try {
-          const rows = await sbFetchAll('/results?splits=not.is.null&select=splits');
-          return rows || [];
-        } catch { return []; }
-      });
-    }
-    return [];
+  // ---- Server-side aggregates ------------------------------------------
+  // Leaderboard, Archives, profiles and Stats used to download every result
+  // row (and every splits array) and aggregate in the browser — ~5 MB and a
+  // dozen sequential requests per visit by Oct 2026, growing ~1,500 rows a
+  // week. These call Postgres functions (aggregation_rpcs migrations) that
+  // return 1-120 KB instead. Each is cached for a minute client-side; a new
+  // solve invalidates them (saveResult). puzzles.level is the server copy of
+  // computePuzzleDifficulty — change both together.
+
+  // Week / month / all-time board. from=null means all-time.
+  // -> { days, earliest, players:[{name,n,avg,med,wins,contested,easy,medium,hard,g:[6]}],
+  //      visitors:[{name,n,avg}] }
+  async loadBoard(from, to) {
+    if (!USE_SUPABASE) return { days: 0, earliest: null, players: [], visitors: [] };
+    return cachedFetch(`lb:board:${from}:${to}`, HISTORY_CACHE_TTL_MS,
+      () => sbRpc('leaderboard', { p_from: from, p_to: to }));
   },
-  // Fetch name + splits for every split-recorded solve, so the Players table
-  // can show each player's average time to find the 1st..6th set. Paginated
-  // and cached like the other broad reads.
-  async loadAllSplits() {
-    if (USE_SUPABASE) {
-      return cachedFetch('allSplits', HISTORY_CACHE_TTL_MS, async () => {
-        try {
-          const rows = await sbFetchAll('/results?splits=not.is.null&select=date,name,splits');
-          return rows || [];
-        } catch { return []; }
-      });
-    }
-    return [];
+  // "Earlier days" under Leaderboard > Today. -> { days:[{date,n,winner,t,level}], more }
+  async loadEarlierDays(before, limit) {
+    if (!USE_SUPABASE) return { days: [], more: false };
+    return cachedFetch(`lb:days:${before}:${limit}`, HISTORY_CACHE_TTL_MS,
+      () => sbRpc('lb_days', { p_before: before, p_limit: limit }));
+  },
+  // One player's solves with that day's rank and finisher count.
+  // -> [[date, time, rank, total, level], ...] newest first
+  async loadPlayerDays(name) {
+    if (!USE_SUPABASE || !name) return [];
+    return cachedFetch(`pd:${name}`, HISTORY_CACHE_TTL_MS,
+      () => sbRpc('player_days', { p_name: name }));
+  },
+  // Field-wide median gap for the 1st..6th set. -> [{median, n}] x6
+  async loadFieldPace() {
+    if (!USE_SUPABASE) return [];
+    return cachedFetch('pace', HISTORY_CACHE_TTL_MS, () => sbRpc('field_pace_cached', {}));
+  },
+  // Everything the Stats tab shows, plus the viewer's personal records.
+  async loadStatsPage(name) {
+    if (!USE_SUPABASE) return null;
+    return cachedFetch(`stats:${name || ''}`, HISTORY_CACHE_TTL_MS,
+      () => sbRpc('stats_page', { p_name: name || null }));
   },
 };
 
@@ -1792,11 +1770,21 @@ function ArchivesContent({ myResults, todayKey, currentName,
   const [viewMonth, setViewMonth] = useState(todayMonth);
   const [selectedDate, setSelectedDate] = useState(todayKey);
 
-  // Cross-player history is needed to compute medals (rank among everyone who
-  // solved that day). This is the same query the stats page uses, so it's
-  // already cached on the backend side for short windows.
-  const [allHistory, setAllHistory] = useState({});
-  useEffect(() => { Storage.loadAllHistory().then(setAllHistory); }, []);
+  // Medals need this player's rank among everyone who solved each day. The
+  // server returns just this player's days with rank + finisher count.
+  const [myDays, setMyDays] = useState({});
+  useEffect(() => {
+    let cancelled = false;
+    Storage.loadPlayerDays(currentName)
+      .then((rows) => {
+        if (cancelled) return;
+        const m = {};
+        for (const [date, , rank, total] of rows || []) m[date] = { rank, total };
+        setMyDays(m);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [currentName]);
 
   // === Lifetime stats (overall, not per visible month — the calendar lets
   // you browse around but your numbers stay yours) ===
@@ -1862,16 +1850,11 @@ function ArchivesContent({ myResults, todayKey, currentName,
   // === Medal computation per date (for the current player) ===
   // Only awarded when 2+ players solved that day — no rank in a solo round.
   const medalFor = (dateKey) => {
-    const dateResults = allHistory[dateKey];
-    if (!dateResults || !dateResults[currentName]) return null;
-    const entries = Object.entries(dateResults);
-    if (entries.length < 2) return null;
-    const sorted = entries.sort((a, b) => a[1].time - b[1].time);
-    const rank = sorted.findIndex(([n]) => n === currentName);
-    return rank === 0 ? 'gold' : rank === 1 ? 'silver' : rank === 2 ? 'bronze' : null;
+    const d = myDays[dateKey];
+    if (!d || d.total < 2) return null;
+    return d.rank === 1 ? 'gold' : d.rank === 2 ? 'silver' : d.rank === 3 ? 'bronze' : null;
   };
-  const playerCount = (dateKey) =>
-    Object.keys(allHistory[dateKey] || {}).length;
+  const playerCount = (dateKey) => myDays[dateKey]?.total || 0;
 
   // === Selected day info for the detail strip ===
   // Difficulty is computed only for the selected date (one generateDailyPuzzle
@@ -1886,7 +1869,7 @@ function ArchivesContent({ myResults, todayKey, currentName,
     const difficulty = computePuzzleDifficulty(generateDailyPuzzle(selectedDate));
     return { result, isToday, isFuture, medal, count, difficulty };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedDate, myResults, allHistory, todayKey]);
+  }, [selectedDate, myResults, myDays, todayKey]);
 
   const MEDAL = { gold: '🥇', silver: '🥈', bronze: '🥉' };
   const RANK_WORD = { gold: '1st', silver: '2nd', bronze: '3rd' };
@@ -2221,162 +2204,63 @@ const EXAMPLE_SETS = {
   ],
 };
 
-function median(nums) {
-  if (!nums.length) return null;
-  const a = [...nums].sort((x, y) => x - y);
-  const m = a.length >> 1;
-  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
-}
-const mean = (a) => (a.length ? a.reduce((s, x) => s + x, 0) / a.length : null);
 
-function StatsContent({ history, allSplits, currentName, onOpenScoring }) {
+function StatsContent({ currentName, onOpenScoring }) {
+  // All aggregation happens server-side (stats_page RPC, cached ~10 min on
+  // the server); this just reshapes the result into what the cards draw.
+  const [raw, setRaw] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    Storage.loadStatsPage(currentName)
+      .then((d) => { if (!cancelled) setRaw(d || {}); })
+      .catch(() => { if (!cancelled) setRaw({}); });
+    return () => { cancelled = true; };
+  }, [currentName]);
+
   const stats = useMemo(() => {
-    if (!history || !allSplits) return null;
+    if (!raw) return null;
+    const pick = (obj, k) => (obj && obj[k]) || { median: null, n: 0 };
 
-    // ---- puzzle card lookup, regenerated per distinct date (deterministic) ----
-    const cardCache = {};
-    const cardsFor = (date) => {
-      if (!(date in cardCache)) {
-        try { cardCache[date] = generateDailyPuzzle(date).cards; }
-        catch { cardCache[date] = null; }
-      }
-      return cardCache[date];
-    };
-
-    // accumulators
-    const byNvary = { 1: { gaps: [], pos: [], first: 0, last: 0, n: 0 },
-                      2: { gaps: [], pos: [], first: 0, last: 0, n: 0 },
-                      3: { gaps: [], pos: [], first: 0, last: 0, n: 0 },
-                      4: { gaps: [], pos: [], first: 0, last: 0, n: 0 } };
-    const byShading = { solid: [], striped: [], open: [] };
-    const byColor = { red: [], green: [], purple: [] };
-    const wallBuckets = {};          // count of nvary=4 sets in a solve -> [times]
-    const openingBuckets = {};       // first-set nvary -> [total times]
-    let totalSets = 0;
-
-    for (const row of allSplits) {
-      const s = row.splits;
-      if (!Array.isArray(s) || s.length !== 6) continue;
-      const cards = cardsFor(row.date);
-      const total = history[row.date]?.[row.name]?.time ?? null;
-
-      let prev = 0, nAllDiff = 0, firstNvary = null;
-      for (let i = 0; i < 6; i++) {
-        const seg = s[i];
-        const mask = seg?.mask;
-        if (typeof seg?.t !== 'number' || !mask) { prev = seg?.t ?? prev; continue; }
-        const gap = Math.max(0, seg.t - prev);
-        prev = seg.t;
-        const nvary = (mask.match(/1/g) || []).length;
-        if (nvary < 1 || nvary > 4) continue;
-        totalSets++;
-        const b = byNvary[nvary];
-        b.gaps.push(gap); b.pos.push(i + 1); b.n++;
-        if (i === 0) { b.first++; firstNvary = nvary; }
-        if (i === 5) b.last++;
-        if (nvary === 4) nAllDiff++;
-
-        // shading / color: only when that attribute is held constant, and we
-        // can resolve the actual card value from the regenerated puzzle.
-        if (cards && Array.isArray(seg.idx) && seg.idx.length === 3) {
-          const c0 = cards[seg.idx[0]];
-          if (c0) {
-            if (mask[2] === '0' && byShading[c0.shading]) byShading[c0.shading].push(gap);
-            if (mask[0] === '0' && byColor[c0.color]) byColor[c0.color].push(gap);
-          }
-        }
-      }
-
-      if (total != null) {
-        (wallBuckets[nAllDiff] ??= []).push(total);
-        if (firstNvary != null) (openingBuckets[firstNvary] ??= []).push(total);
-      }
-    }
-
+    const gradRows = raw.gradient || [];
     const gradient = [1, 2, 3, 4].map((k) => {
-      const b = byNvary[k];
-      return {
-        nvary: k,
-        median: median(b.gaps),
-        n: b.n,
-        pctFirst: b.n ? (100 * b.first) / b.n : null,
-        pctLast: b.n ? (100 * b.last) / b.n : null,
-      };
+      const g = gradRows.find((r) => r.nvary === k);
+      return g
+        ? { nvary: k, median: g.median, n: g.n, pctFirst: g.pctFirst, pctLast: g.pctLast }
+        : { nvary: k, median: null, n: 0, pctFirst: null, pctLast: null };
     });
     const gMax = Math.max(...gradient.map((g) => g.median || 0)) || 1;
 
-    const shading = ['solid', 'striped', 'open'].map((k) => ({ k, median: median(byShading[k]), n: byShading[k].length }));
-    const shMax = Math.max(...shading.map((s) => s.median || 0)) || 1;
+    const shading = ['solid', 'striped', 'open'].map((k) => ({ k, ...pick(raw.shading, k) }));
+    const shMax = Math.max(...shading.map((x) => x.median || 0)) || 1;
 
-    const color = ['red', 'green', 'purple'].map((k) => ({ k, median: median(byColor[k]), n: byColor[k].length }));
+    const color = ['red', 'green', 'purple'].map((k) => ({ k, ...pick(raw.color, k) }));
     const colMedians = color.map((c) => c.median).filter((v) => v != null);
     const colorSpread = colMedians.length ? Math.max(...colMedians) - Math.min(...colMedians) : null;
 
-    const wall = [0, 1, 2, 3, 4].map((k) => ({ k, median: median(wallBuckets[k] || []), n: (wallBuckets[k] || []).length }));
+    const wall = [0, 1, 2, 3, 4].map((k) => ({ k, ...pick(raw.wall, String(k)) }));
     const wallVals = wall.map((w) => w.median).filter((v) => v != null);
     const wallMax = wallVals.length ? Math.max(...wallVals) : 1;
-    // Option B baseline: start the bars a little below the smallest bucket so the
-    // 48-58s band separates visibly while the 82s bar still towers. Rounded down
-    // to a clean 5s.
+    // Bars start a little below the smallest bucket so the band separates
+    // visibly; rounded down to a clean 5s.
     const wallBase = wallVals.length ? Math.max(0, Math.floor((Math.min(...wallVals) - 3) / 5) * 5) : 0;
 
-    const opening = [1, 2, 3, 4].map((k) => ({ k, median: median(openingBuckets[k] || []), n: (openingBuckets[k] || []).length }));
+    const opening = [1, 2, 3, 4].map((k) => ({ k, ...pick(raw.opening, String(k)) }));
     const opVals = opening.map((o) => o.median).filter((v) => v != null);
     const opMax = opVals.length ? Math.max(...opVals) : 1;
-    // Opening tell option B: diverge from the overall median of the grouped
-    // solves, so each opening reads as faster/slower than typical.
-    const opAll = [];
-    for (const k of Object.keys(openingBuckets)) opAll.push(...openingBuckets[k]);
-    const opCenter = median(opAll);
+    const opCenter = raw.opCenter ?? null;
     const opMaxDev = opVals.length && opCenter != null
       ? Math.max(...opVals.map((v) => Math.abs(v - opCenter))) : 1;
 
-    // ---- hero + records ----
-    const allTimes = [];
-    const perPlayerCount = {};
-    let fastestSolve = null, fastestSolveHolder = null;
-    for (const d of Object.keys(history)) {
-      for (const [n, r] of Object.entries(history[d])) {
-        allTimes.push(r.time);
-        perPlayerCount[n] = (perPlayerCount[n] || 0) + 1;
-        if (fastestSolve == null || r.time < fastestSolve) { fastestSolve = r.time; fastestSolveHolder = n; }
-      }
-    }
-    const players = Object.keys(perPlayerCount).length;
-
-    // Fastest opening set across everyone, with its holder — computed from the
-    // raw first-splits so the displayed name always matches the displayed value.
-    let fastestOpeningSet = null, fastestOpenHolder = null;
-    for (const row of allSplits) {
-      const t0 = row.splits?.[0]?.t;
-      if (typeof t0 === 'number' && (fastestOpeningSet == null || t0 < fastestOpeningSet)) {
-        fastestOpeningSet = t0; fastestOpenHolder = row.name;
-      }
-    }
-
-    // personal bests
-    const myTimes = [];
-    let myFastestOpen = null;
-    for (const d of Object.keys(history)) {
-      const r = history[d]?.[currentName];
-      if (r) myTimes.push(r.time);
-    }
-    for (const row of allSplits) {
-      if (row.name !== currentName) continue;
-      const g0 = row.splits?.[0];
-      if (typeof g0?.t === 'number' && (myFastestOpen == null || g0.t < myFastestOpen)) myFastestOpen = g0.t;
-    }
-    const myFastest = myTimes.length ? Math.min(...myTimes) : null;
-    const mySolveCount = myTimes.length;
-
+    const mine = raw.mine || {};
     return {
-      totalSolves: allTimes.length, totalSets, players,
+      totalSolves: raw.totalSolves || 0, totalSets: raw.totalSets || 0, players: raw.players || 0,
       gradient, gMax, shading, shMax, color, colorSpread,
       wall, wallMax, wallBase, opening, opMax, opCenter, opMaxDev,
-      fastestSolve, fastestSolveHolder, fastestOpeningSet, fastestOpenHolder,
-      myFastest, myFastestOpen, mySolveCount,
+      fastestSolve: raw.fastest?.t ?? null, fastestSolveHolder: raw.fastest?.name ?? null,
+      fastestOpeningSet: raw.fastestOpen?.t ?? null, fastestOpenHolder: raw.fastestOpen?.name ?? null,
+      myFastest: mine.fastest ?? null, myFastestOpen: mine.fastestOpen ?? null, mySolveCount: mine.n || 0,
     };
-  }, [history, allSplits, currentName]);
+  }, [raw]);
 
   if (!stats) {
     return <main className="flex-1 flex items-center justify-center text-stone-500">Loading…</main>;
@@ -2652,8 +2536,7 @@ function medianOf(nums) {
 }
 const avgOf = (a) => (a.length ? Math.round((a.reduce((s, t) => s + t, 0) / a.length) * 100) / 100 : null);
 
-function LeaderboardContent({ history, allSplits, todayKey, currentName,
-                              onPlayerClick, onOpenScoring }) {
+function LeaderboardContent({ todayKey, currentName, onPlayerClick, onOpenScoring }) {
   const [period, setPeriod] = useState('today');   // today | week | month | all
   const [anchorDay, setAnchorDay] = useState(todayKey);
   const [anchorWeek, setAnchorWeek] = useState(() => mondayOf(todayKey));
@@ -2664,106 +2547,102 @@ function LeaderboardContent({ history, allSplits, todayKey, currentName,
   const [expandedDays, setExpandedDays] = useState(() => new Set());
   const [showVisitors, setShowVisitors] = useState(false);
 
-  const dates = useMemo(
-    () => (history ? Object.keys(history).sort().reverse() : []),
-    [history]
+  // Difficulty badge for the day being viewed under Today (one puzzle, cheap).
+  const anchorDifficulty = useMemo(
+    () => computePuzzleDifficulty(generateDailyPuzzle(anchorDay)),
+    [anchorDay]
   );
 
-  // Difficulty is deterministic from the date, so this is a pure lookup.
-  const difficulties = useMemo(() => {
-    const map = {};
-    for (const d of dates) map[d] = computePuzzleDifficulty(generateDailyPuzzle(d));
-    return map;
-  }, [dates]);
-
   // ---- window bounds -------------------------------------------------
-  const earliest = dates.length ? dates[dates.length - 1] : todayKey;
-  let from, to, title, subtitle;
+  let from, to, title;
   if (period === 'today') {
     from = to = anchorDay;
     title = formatLongDate(anchorDay);
-    const n = history?.[anchorDay] ? Object.keys(history[anchorDay]).length : 0;
-    subtitle = `${n} finished`;
   } else if (period === 'week') {
     from = anchorWeek; to = addDaysKey(anchorWeek, 6);
     title = `${formatShortDate(from)} – ${formatShortDate(to)}`;
-    subtitle = anchorWeek === mondayOf(todayKey) ? 'this week' : 'Mon–Sun';
   } else if (period === 'month') {
     from = anchorMonth; to = addDaysKey(addMonthsKey(anchorMonth, 1), -1);
     title = new Date(dateKeyToUTC(anchorMonth))
       .toLocaleDateString(undefined, { month: 'long', year: 'numeric', timeZone: 'UTC' });
-    subtitle = anchorMonth === monthStartOf(todayKey) ? 'this month' : 'full month';
   } else {
-    from = earliest; to = todayKey;
+    from = null; to = todayKey;   // all-time: no lower bound (server caches this one)
     title = 'All time';
-    subtitle = `${dates.length} puzzle days`;
   }
 
-  // ---- per-player aggregates for the active window --------------------
+  // ---- data -----------------------------------------------------------
+  // Today = that one day's rows (small). Week/Month/All-time = per-player
+  // aggregates computed server-side (leaderboard RPC). Earlier days = one
+  // summary row per day; a day's full list loads only when it's expanded.
+  const boardKey = period === 'today' ? null : `${from}|${to}`;
+  const [board, setBoard] = useState(null);          // { key, data }
+  const [todayData, setTodayData] = useState(null);  // { date, rows }
+  const [earlier, setEarlier] = useState(null);      // { anchor, data }
+  const [dayDetail, setDayDetail] = useState({});    // date -> sorted entries
+
+  useEffect(() => {
+    if (boardKey === null) return;
+    let cancelled = false;
+    Storage.loadBoard(from, to)
+      .then((data) => { if (!cancelled) setBoard({ key: boardKey, data }); })
+      .catch(() => { if (!cancelled) setBoard({ key: boardKey, data: null }); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [boardKey]);
+
+  useEffect(() => {
+    if (period !== 'today') return;
+    let cancelled = false;
+    Storage.loadLeaderboard(anchorDay)
+      .then((rows) => { if (!cancelled) setTodayData({ date: anchorDay, rows }); });
+    return () => { cancelled = true; };
+  }, [period, anchorDay]);
+
+  useEffect(() => {
+    if (period !== 'today') return;
+    let cancelled = false;
+    Storage.loadEarlierDays(anchorDay, daysShown)
+      .then((data) => { if (!cancelled) setEarlier({ anchor: anchorDay, data }); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [period, anchorDay, daysShown]);
+
+  const loading = period === 'today'
+    ? todayData?.date !== anchorDay
+    : board?.key !== boardKey;
+  const boardData = !loading && period !== 'today' ? board?.data : null;
+
   const players = useMemo(() => {
-    if (!history) return [];
-    const acc = {};
-    const bucket = (n) => (acc[n] ??= {
-      name: n, times: [], wins: 0, contested: 0,
-      tiers: { easy: [], medium: [], hard: [] },
-      gaps: Array.from({ length: 6 }, () => []),
-    });
-
-    for (const d of dates) {
-      if (d < from || d > to) continue;
-      const day = history[d];
-      const dayTimes = Object.values(day).map((x) => x.time);
-      const fastest = Math.min(...dayTimes);
-      const isContested = dayTimes.length >= 2;
-      const level = difficulties[d]?.level;
-      for (const [n, r] of Object.entries(day)) {
-        const b = bucket(n);
-        b.times.push(r.time);
-        if (level) b.tiers[level].push(r.time);
-        if (isContested) {
-          b.contested++;
-          if (r.time === fastest) b.wins++;
-        }
-      }
+    if (period === 'today') {
+      if (!todayData || todayData.date !== anchorDay) return [];
+      return Object.entries(todayData.rows || {})
+        .map(([name, r]) => ({ name, n: 1, time: r.time, avg: r.time, completedAt: r.completedAt }));
     }
-
-    // per-set find times (splits store cumulative timestamps)
-    for (const row of allSplits || []) {
-      if (!row.date || row.date < from || row.date > to) continue;
-      const s = row.splits;
-      if (!Array.isArray(s) || s.length !== 6) continue;
-      if (!acc[row.name]) continue;   // no result row in window; skip
-      const b = acc[row.name];
-      let prev = 0;
-      for (let i = 0; i < 6; i++) {
-        const t = typeof s[i]?.t === 'number' ? s[i].t : null;
-        if (t == null) continue;
-        b.gaps[i].push(Math.max(0, t - prev));
-        prev = t;
-      }
-    }
-
-    return Object.values(acc).map((b) => ({
-      name: b.name,
-      n: b.times.length,
-      time: b.times[0],
-      avg: avgOf(b.times),
-      med: medianOf(b.times),
-      winPct: b.contested > 0 ? Math.round((1000 * b.wins) / b.contested) / 10 : null,
-      wins: b.wins,
-      contested: b.contested,
-      tiers: {
-        easy: avgOf(b.tiers.easy),
-        medium: avgOf(b.tiers.medium),
-        hard: avgOf(b.tiers.hard),
-      },
-      gaps: b.gaps.map((g) => avgOf(g)),
+    if (!boardData) return [];
+    return (boardData.players || []).map((p) => ({
+      name: p.name,
+      n: p.n,
+      avg: p.avg,
+      med: p.med,
+      winPct: p.contested > 0 ? Math.round((1000 * p.wins) / p.contested) / 10 : null,
+      wins: p.wins,
+      contested: p.contested,
+      tiers: { easy: p.easy, medium: p.medium, hard: p.hard },
+      gaps: p.g || [null, null, null, null, null, null],
     }));
-  }, [history, allSplits, dates, difficulties, from, to]);
+  }, [period, todayData, anchorDay, boardData]);
+
+  const subtitle = period === 'today'
+    ? (loading ? '…' : `${players.length} finished`)
+    : period === 'week' ? (anchorWeek === mondayOf(todayKey) ? 'this week' : 'Mon–Sun')
+    : period === 'month' ? (anchorMonth === monthStartOf(todayKey) ? 'this month' : 'full month')
+    : (boardData ? `${boardData.days} puzzle days` : '…');
 
   const isToday = period === 'today';
-  const qualified = isToday ? players : players.filter((p) => p.n >= LB_MIN_PUZZLES);
-  const visitors = isToday ? [] : players.filter((p) => p.n < LB_MIN_PUZZLES);
+  // The server already splits qualified players (n >= 3, LB_MIN_PUZZLES)
+  // from visitors; keep the two thresholds in sync.
+  const qualified = players;
+  const visitors = isToday || !boardData ? [] : (boardData.visitors || []);
 
   const sortVal = (p) => {
     if (sortKey === 'n') return p.n;
@@ -2775,7 +2654,7 @@ function LeaderboardContent({ history, allSplits, todayKey, currentName,
   };
   const rows = useMemo(() => {
     const arr = [...qualified];
-    if (isToday) { arr.sort((a, b) => a.time - b.time); return arr; }
+    if (isToday) { arr.sort((a, b) => a.time - b.time || a.completedAt - b.completedAt); return arr; }
     arr.sort((a, b) => {
       const av = sortVal(a), bv = sortVal(b);
       if (av == null && bv == null) return a.avg - b.avg;
@@ -2810,21 +2689,23 @@ function LeaderboardContent({ history, allSplits, todayKey, currentName,
                  : period === 'month' ? anchorMonth >= monthStartOf(todayKey)
                  : true;
 
-  const toggleDay = (d) => setExpandedDays((prev) => {
-    const next = new Set(prev);
-    next.has(d) ? next.delete(d) : next.add(d);
-    return next;
-  });
+  const toggleDay = (d) => {
+    setExpandedDays((prev) => {
+      const next = new Set(prev);
+      next.has(d) ? next.delete(d) : next.add(d);
+      return next;
+    });
+    if (!dayDetail[d]) {
+      Storage.loadLeaderboard(d).then((rows) => {
+        const entries = Object.entries(rows || {})
+          .map(([n, r]) => ({ name: n, time: r.time, completedAt: r.completedAt }))
+          .sort((a, b) => a.time - b.time || a.completedAt - b.completedAt);
+        setDayDetail((prev) => ({ ...prev, [d]: entries }));
+      });
+    }
+  };
 
   const medal = (i) => (i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : null);
-
-  if (history === null) {
-    return (
-      <main className="flex-1 flex items-center justify-center text-stone-500">
-        Loading…
-      </main>
-    );
-  }
 
   // 14 columns, identical for week / month / all-time.
   const COLS = [
@@ -2869,11 +2750,11 @@ function LeaderboardContent({ history, allSplits, todayKey, currentName,
           </div>
           <div className="text-[10.5px] text-stone-400 mt-0.5 flex items-center justify-center gap-1.5">
             <span>{subtitle}</span>
-            {isToday && difficulties[anchorDay] && (
+            {isToday && anchorDifficulty && (
               <>
                 <span className="text-stone-300">·</span>
                 <button onClick={onOpenScoring} title="How difficulty is scored">
-                  <DifficultyBadge difficulty={difficulties[anchorDay]} />
+                  <DifficultyBadge difficulty={anchorDifficulty} />
                 </button>
               </>
             )}
@@ -2920,7 +2801,9 @@ function LeaderboardContent({ history, allSplits, todayKey, currentName,
           </button>
         )}
 
-        {rows.length === 0 ? (
+        {loading ? (
+          <div className="py-10 text-center text-stone-400 text-sm">Loading…</div>
+        ) : rows.length === 0 ? (
           <div className="py-10 text-center text-stone-400 text-sm italic">
             {isToday ? 'Nobody has finished this puzzle yet.'
                      : `No one reached ${LB_MIN_PUZZLES} puzzles in this window.`}
@@ -3065,7 +2948,7 @@ function LeaderboardContent({ history, allSplits, todayKey, currentName,
                                    transition-colors text-left
                                    ${isMe ? 'bg-red-50 hover:bg-red-100' : 'hover:bg-stone-50'}`}>
                         <span className={`text-sm font-medium ${isMe ? 'text-red-800' : 'text-stone-700'}`}>
-                          {p.name}
+                          {cleanName(p.name)}
                         </span>
                         <span className="text-[10.5px] text-stone-500 tabular-nums"
                               style={{ fontFamily: '"Menlo", monospace' }}>
@@ -3100,14 +2983,16 @@ function LeaderboardContent({ history, allSplits, todayKey, currentName,
             Earlier days
           </div>
           <div className="bg-white rounded-md shadow-sm overflow-hidden">
-            {dates.filter((d) => d < anchorDay).slice(0, daysShown).map((date) => {
-              const entries = Object.entries(history[date])
-                .map(([n, r]) => ({ name: n, time: r.time }))
-                .sort((a, b) => a.time - b.time);
-              const winner = entries[0];
+            {earlier?.anchor === anchorDay && earlier.data.days.length === 0 && (
+              <div className="py-4 text-center text-stone-400 text-[11.5px] italic">No earlier days.</div>
+            )}
+            {(earlier?.anchor === anchorDay ? earlier.data.days : []).map((day) => {
+              const date = day.date;
+              const winner = { name: day.winner, time: day.t };
               const open = expandedDays.has(date);
-              const diff = difficulties[date];
-              const expandable = entries.length > 1;
+              const diff = day.level ? { level: day.level } : null;
+              const expandable = day.n > 1;
+              const entries = dayDetail[date];
               return (
                 <div key={date} className={`border-t border-stone-100 first:border-t-0 ${open ? 'bg-stone-50' : ''}`}>
                   <div role={expandable ? 'button' : undefined}
@@ -3146,7 +3031,7 @@ function LeaderboardContent({ history, allSplits, todayKey, currentName,
                         </button>
                       )}
                       <span className="text-[10.5px] text-stone-400 tabular-nums w-5 text-right">
-                        {entries.length}
+                        {day.n}
                       </span>
                       <span className="text-stone-300 text-[11px] w-2 text-right">
                         {expandable ? (open ? '⌄' : '›') : ''}
@@ -3155,7 +3040,10 @@ function LeaderboardContent({ history, allSplits, todayKey, currentName,
                   </div>
                   {open && expandable && (
                     <div className="pb-2.5 pl-[70px] pr-3">
-                      {entries.slice(1).map((e, i) => (
+                      {!entries && (
+                        <div className="text-[11px] text-stone-400 py-0.5">Loading…</div>
+                      )}
+                      {entries && entries.slice(1).map((e, i) => (
                         <div key={e.name} className="flex items-center justify-between py-0.5">
                           <span className="text-[12px] text-stone-600 min-w-0 truncate">
                             <span className="inline-block w-5 text-stone-400">{i + 2}</span>
@@ -3176,7 +3064,7 @@ function LeaderboardContent({ history, allSplits, todayKey, currentName,
                 </div>
               );
             })}
-            {dates.filter((d) => d < anchorDay).length > daysShown && (
+            {earlier?.anchor === anchorDay && earlier.data.more && (
               <button onClick={() => setDaysShown((n) => n + DAYS_PAGE)}
                 className="w-full py-2 bg-stone-50 hover:bg-stone-100 text-stone-500 text-[11px]
                            font-medium border-t border-stone-100 transition-colors">
@@ -3343,25 +3231,33 @@ function MovingAverageChart({ series }) {
 
 // ===== Player detail stats =====
 function PlayerStatsContent({ player, todayKey, currentName, onBack, onOpenScoring }) {
-  const [history, setHistory] = useState(null);
-  useEffect(() => { Storage.loadAllHistory().then(setHistory); }, []);
+  // This player's solves with each day's rank + finisher count + difficulty,
+  // aggregated server-side (player_days).
+  const [days, setDays] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    setDays(null);
+    Storage.loadPlayerDays(player)
+      .then((rows) => { if (!cancelled) setDays(rows || []); })
+      .catch(() => { if (!cancelled) setDays([]); });
+    return () => { cancelled = true; };
+  }, [player]);
 
-  // Pace-chart data: scoped fetch first (cheap), then the wider field-wide
-  // fetch only if this player actually clears the threshold to show it.
+  // Pace-chart data: scoped fetch first (cheap), then the field-wide medians
+  // (one small cached aggregate) only if this player clears the threshold.
   const [mySplits, setMySplits] = useState(null);
-  const [fieldSplits, setFieldSplits] = useState(null);
+  const [fieldPaceData, setFieldPaceData] = useState(null);
   useEffect(() => {
     setMySplits(null);
-    setFieldSplits(null);
     Storage.loadPlayerSplits(player).then(setMySplits);
   }, [player]);
   useEffect(() => {
-    if (mySplits && mySplits.length >= MIN_SPLITS_FOR_PACE_CHART && fieldSplits === null) {
-      Storage.loadFieldSplits().then(setFieldSplits);
+    if (mySplits && mySplits.length >= MIN_SPLITS_FOR_PACE_CHART && fieldPaceData === null) {
+      Storage.loadFieldPace().then(setFieldPaceData).catch(() => {});
     }
-  }, [mySplits, fieldSplits]);
+  }, [mySplits, fieldPaceData]);
 
-  if (history === null) {
+  if (days === null) {
     return (
       <main className="flex-1 flex items-center justify-center text-stone-500">
         Loading…
@@ -3369,16 +3265,7 @@ function PlayerStatsContent({ player, todayKey, currentName, onBack, onOpenScori
     );
   }
 
-  const entries = [];
-  for (const date of Object.keys(history)) {
-    const r = history[date][player];
-    if (!r) continue;
-    const dateResults = history[date];
-    const times = Object.values(dateResults).map(x => x.time);
-    const sortedTimes = [...times].sort((a, b) => a - b);
-    const rank = sortedTimes.indexOf(r.time) + 1;
-    entries.push({ date, time: r.time, rank, total: times.length });
-  }
+  const entries = days.map(([date, time, rank, total, level]) => ({ date, time, rank, total, level }));
   entries.sort((a, b) => b.date.localeCompare(a.date));
 
   if (entries.length === 0) {
@@ -3409,12 +3296,11 @@ function PlayerStatsContent({ player, todayKey, currentName, onBack, onOpenScori
     ? Math.round((sortedTimes[sortedTimes.length / 2 - 1] + sortedTimes[sortedTimes.length / 2]) / 2 * 100) / 100
     : sortedTimes[Math.floor(sortedTimes.length / 2)];
 
-  // Difficulty of each played puzzle (deterministic from the date) and
-  // per-tier time stats. ~50ms worst case per date; runs only on the rare
-  // re-renders of this view.
+  // Difficulty tier of each played puzzle comes back with the rows (puzzles.level,
+  // the server copy of computePuzzleDifficulty), so no puzzle regeneration here.
   const difficultyByDate = {};
   for (const e of entries) {
-    difficultyByDate[e.date] = computePuzzleDifficulty(generateDailyPuzzle(e.date));
+    difficultyByDate[e.date] = e.level ? { level: e.level } : null;
   }
   const tierStats = DIFFICULTY_ORDER.map((level) => {
     const ts = entries
@@ -3461,11 +3347,12 @@ function PlayerStatsContent({ player, todayKey, currentName, onBack, onOpenScori
   // Pace chart: only ready once this player clears the threshold AND the
   // field-wide comparison data has loaded. Below the threshold, or while
   // still loading, paceReady is false and the card just doesn't render.
-  const paceReady = mySplits && mySplits.length >= MIN_SPLITS_FOR_PACE_CHART && fieldSplits;
+  const paceReady = mySplits && mySplits.length >= MIN_SPLITS_FOR_PACE_CHART
+    && Array.isArray(fieldPaceData) && fieldPaceData.length > 0;
   let myPace = null, fieldPace = null, paceMax = 1, paceTakeaway = null;
   if (paceReady) {
     myPace = buildPaceByPosition(mySplits);
-    fieldPace = buildPaceByPosition(fieldSplits);
+    fieldPace = myPace.map((_, i) => fieldPaceData[i] || { median: null, n: 0 });
     const allVals = [...myPace, ...fieldPace].map((p) => p.median).filter((v) => v != null);
     paceMax = allVals.length ? Math.max(...allVals) : 1;
     let bestIdx = -1, bestAbsGap = -Infinity, bestGap = 0;
@@ -4392,27 +4279,6 @@ export default function App() {
     typeof document !== 'undefined' ? !document.hidden : true
   );
 
-  // History for the Leaderboard tab. Lazy-loaded the first time the tab is
-  // opened (loadAllHistory is cached, so this is cheap on repeat visits).
-  const [lbHistory, setLbHistory] = useState(null);
-  const [lbSplits, setLbSplits] = useState(null);
-  // Two independent effects on purpose. Sharing one effect meant whichever
-  // fetch resolved first flipped its own state, re-ran the effect, and the
-  // cleanup cancelled the slower sibling before it could land — splits were
-  // silently dropped every time. Each now guards on its own state.
-  useEffect(() => {
-    if ((view !== 'leaderboard' && view !== 'stats') || lbHistory !== null) return;
-    let cancelled = false;
-    Storage.loadAllHistory().then((h) => { if (!cancelled) setLbHistory(h); });
-    return () => { cancelled = true; };
-  }, [view, lbHistory]);
-  useEffect(() => {
-    if ((view !== 'leaderboard' && view !== 'stats') || lbSplits !== null) return;
-    let cancelled = false;
-    Storage.loadAllSplits().then((r) => { if (!cancelled) setLbSplits(r); });
-    return () => { cancelled = true; };
-  }, [view, lbSplits]);
-
   const lastActiveDateRef = useRef(null);
 
   // === Load name on mount ===
@@ -4812,8 +4678,6 @@ export default function App() {
 
       {view === 'leaderboard' && (
         <LeaderboardContent
-          history={lbHistory}
-          allSplits={lbSplits}
           todayKey={todayKey}
           currentName={name}
           onPlayerClick={openPlayerStats}
@@ -4823,8 +4687,6 @@ export default function App() {
 
       {view === 'stats' && (
         <StatsContent
-          history={lbHistory}
-          allSplits={lbSplits}
           currentName={name}
           onOpenScoring={openScoring}
         />
