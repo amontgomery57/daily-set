@@ -1231,7 +1231,7 @@ function Header({ dateKey, name, onRename, onGroups }) {
 function TabBar({ activeTab, onChange }) {
   const tabs = [
     { id: 'game', label: "Today's Puzzle" },
-    { id: 'archives', label: 'Archives' },
+    { id: 'archives', label: 'Archive' },
     { id: 'leaderboard', label: 'Leaderboard' },
     { id: 'stats', label: 'Stats' },
     // { id: 'survivor', label: 'Weekly Puzzle' },  // hidden — WIP, re-enable to restore
@@ -1901,7 +1901,7 @@ function CompletedContent({ result, leaderboard, name, isPlayingToday, practice,
                 <button onClick={() => onPlayDate(nextUnplayedDate)}
                   className="px-4 py-2 bg-red-700 hover:bg-red-800 text-white rounded-md
                              text-sm font-medium transition-colors">
-                  Play another from the archives →
+                  Play another from the archive →
                 </button>
               )}
             </>
@@ -1911,7 +1911,7 @@ function CompletedContent({ result, leaderboard, name, isPlayingToday, practice,
                 <button onClick={() => onPlayDate(nextUnplayedDate)}
                   className="px-4 py-2 bg-red-700 hover:bg-red-800 text-white rounded-md
                              text-sm font-medium transition-colors">
-                  Play another from the archives →
+                  Play another from the archive →
                 </button>
               )}
               <button onClick={onPlayToday}
