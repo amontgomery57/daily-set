@@ -1174,7 +1174,7 @@ function PreviewModeBanner() {
 }
 
 // ===== Header (brand bar) =====
-function Header({ dateKey, name, onRename }) {
+function Header({ dateKey, name, onRename, onGroups }) {
   return (
     <header className="bg-red-700 text-white shadow-md">
       <div className="max-w-6xl mx-auto relative px-4 py-2.5" style={{ minHeight: 58 }}>
@@ -1187,6 +1187,16 @@ function Header({ dateKey, name, onRename }) {
             <p className="text-[11px] text-red-100 mt-0.5">{formatLongDate(dateKey)}</p>
           )}
         </div>
+        {name && onGroups && (
+          <button onClick={onGroups}
+            className="absolute left-3 top-1/2 -translate-y-1/2 h-8 px-2.5 rounded-full
+                       border border-white/50 bg-white/10 hover:bg-white/20 text-white
+                       flex items-center gap-1.5 text-[11.5px] font-semibold transition-colors"
+            title="Join or start a group" aria-label="Groups">
+            <GroupIcon size={15} />
+            <span className="max-[359px]:hidden">Groups</span>
+          </button>
+        )}
         {name && onRename && (
           <button onClick={onRename}
             className="absolute top-1.5 right-3 flex flex-col items-end leading-tight
@@ -2937,6 +2947,18 @@ function LeaderboardContent({ todayKey, currentName, onPlayerClick, onOpenScorin
         </div>
       )}
 
+      {groups.length === 0 && onOpenJoin && (
+        <button onClick={onOpenJoin}
+          className="w-full mb-2.5 flex items-center gap-2 px-3 py-2.5 bg-white border border-stone-200
+                     rounded-lg text-left text-xs text-stone-600 hover:bg-stone-50 transition-colors">
+          <span className="w-7 h-7 rounded-full bg-stone-100 text-stone-700 flex items-center justify-center flex-shrink-0">
+            <GroupIcon size={15} />
+          </span>
+          <span className="flex-1 min-w-0">Play with a class or friends</span>
+          <span className="text-red-700 font-semibold flex-shrink-0">Join or start a group ›</span>
+        </button>
+      )}
+
       {/* period pills */}
       <div className="flex gap-1.5 mb-2.5">
         {[['today','Today'],['week','Week'],['month','Month'],['all','All-time']].map(([id, label]) => (
@@ -3224,14 +3246,6 @@ function LeaderboardContent({ todayKey, currentName, onPlayerClick, onOpenScorin
             </span>
           </span>
           <span className="text-red-700 font-semibold flex-shrink-0">Group page ›</span>
-        </button>
-      ) : groups.length === 0 && onOpenJoin ? (
-        <button onClick={onOpenJoin}
-          className="mt-2 mx-auto flex items-center gap-1.5 px-2.5 py-2 text-xs text-stone-500 hover:text-stone-700">
-          <GroupIcon size={14} />
-          <span>Playing with a class or friends?{' '}
-            <span className="text-red-700 font-semibold underline underline-offset-2">Join or start a group</span>
-          </span>
         </button>
       ) : null}
 
@@ -5307,6 +5321,19 @@ export default function App() {
     setView('playerStats');
   };
 
+  // Header "Groups" button. No groups yet: open the join/create sheet (pausing
+  // a puzzle in progress so the sheet doesn't cost them time). In a group:
+  // the Leaderboard, already scoped to it, where "+ Join or create" lives too.
+  const openGroups = () => {
+    if (groups.length === 0) {
+      if (view === 'game' && !currentResult) setUserPaused(true);
+      setSheet({ mode: 'join', code: null });
+    } else {
+      setViewingPlayer(null);
+      setView('leaderboard');
+    }
+  };
+
   // Open the scoring page from anywhere; remember origin so Back returns there.
   const openScoring = () => {
     setScoringFrom(view);
@@ -5404,7 +5431,8 @@ export default function App() {
          style={{ fontFamily: '"Inter", system-ui, sans-serif' }}>
       <SharedSvgDefs />
       <PreviewModeBanner />
-      <Header dateKey={headerDate} name={name} onRename={() => setView('rename')} />
+      <Header dateKey={headerDate} name={name} onRename={() => setView('rename')}
+              onGroups={USE_SUPABASE ? openGroups : undefined} />
       <TabBar activeTab={activeTab} onChange={handleTabChange} />
 
       {view === 'archives' && (
