@@ -168,11 +168,21 @@ function setDiffMask(a, b, c) {
 // variance unexplained by board structure. The same puzzle has produced a
 // 181s solve and a 451s solve from two different people. The score is
 // directionally useful, not precise. ScoringContent says so plainly.
+//
+// Oct 2026 out-of-sample check (6,399 solves on 600 days, all completed after
+// v3 shipped; 76 players with 20+ solves): r = 0.37, and an OLS refit on that
+// data alone gives decoys/avgVars = 0.157 vs v3's 0.141 — weights hold. With
+// big days the day-level r is higher (0.64 on 152 days with 20+ regulars;
+// split-half reliability of day difficulty ~0.61 at 8+ per half), so most of
+// the "unexplained 84%" above was small-sample noise. Per individual solve,
+// r = 0.21 (~5%). Tier mean z (658 days): -0.49 / -0.09 / +0.17.
 const RAW_SCORE_MIN = 1.808;  // min raw composite over all real daily puzzles
 const RAW_SCORE_MAX = 3.808;  // max raw composite over all real daily puzzles
-// Cut points on the 0-10 scale, set at the p20 / p75 of real daily puzzles so
-// the mix stays ~18% / 54% / 28% (unchanged from v2's feel — the tiers keep
-// their proportions, they just finally track real solve times).
+// Cut points on the 0-10 scale. Measured mix (Oct 2026, both the 1,484
+// generated daily puzzles and a 466k-puzzle Monte-Carlo of the 6-set pool):
+// ~18% 1-star / ~62% 2-star / ~20% 3-star. Note a large spike of puzzles sits
+// at exactly 6.665, just under SCORE_CUT_HARD, so nudging that cut moves ~10%
+// of puzzles between 2 and 3 stars.
 const SCORE_CUT_EASY = 3.46;  // < this -> 1 star
 const SCORE_CUT_HARD = 6.67;  // >= this -> 3 stars; between -> 2 stars
 
@@ -3819,10 +3829,11 @@ function PlayerStatsContent({ player, todayKey, currentName, onBack, onOpenScori
 // ===== Difficulty distribution data =====
 // PUZZLE_UNIVERSE is exact; the rest are Monte-Carlo estimates. The set-count
 // distribution comes from an earlier 30M-layout sample (it's formula-
-// independent). The difficulty histogram was recomputed for the v2 formula by
-// sampling 17,158,209 random 12-card layouts (400,000 valid 6-set puzzles).
+// independent; a 20M re-check in Oct 2026 agreed to within 0.1 point per bar).
+// The difficulty histogram is for the current (v3) formula: 20,000,000 random
+// 12-card layouts, of which 466,015 had exactly 6 sets (Oct 2026).
 const PUZZLE_UNIVERSE = 70724320184700;   // C(81,12) — every 12-card layout
-const DIST_SAMPLE_N   = 400000;           // sampled valid 6-set puzzles (v2)
+const DIST_SAMPLE_N   = 466015;           // sampled valid 6-set puzzles (v3)
 // [setCount, estimated number of layouts with exactly that many sets]
 const SETCOUNT_DIST = [
   [0, 2284383754579], [1, 10264189941200], [2, 18462798314654],
@@ -3830,23 +3841,18 @@ const SETCOUNT_DIST = [
   [6, 1652344079862], [7, 330159986441], [8, 48255203662],
   [9, 8163944027], [10, 2138231947],
 ];
-// v2 difficulty histogram of the 6-set pool, 0.5-wide bins:
-// [scoreLo, sampledCount, estimatedBillionsOfPuzzles]
+const SIX_SET_POOL = SETCOUNT_DIST[6][1];  // ~1.65 trillion
+// v3 difficulty histogram of the 6-set pool, 0.5-wide bins, split by star tier:
+// [scoreLo, sampled 1-star, sampled 2-star, sampled 3-star]
 const HISTO_BINS = [
-  [0.0, 72, 0.30], [0.5, 560, 2.31], [1.0, 2346, 9.69], [1.5, 7129, 29.45],
-  [2.0, 14711, 60.77], [2.5, 33319, 137.64], [3.0, 26135, 107.96],
-  [3.5, 37034, 152.98], [4.0, 53452, 220.80], [4.5, 58774, 242.79],
-  [5.0, 58681, 242.40], [5.5, 19643, 81.14], [6.0, 16020, 66.18],
-  [6.5, 15301, 63.21], [7.0, 12142, 50.16], [7.5, 16507, 68.19],
-  [8.0, 12204, 50.41], [8.5, 9884, 40.83], [9.0, 4863, 20.09],
-  [9.5, 1223, 5.05],
+  [0.0, 2223, 0, 0], [0.5, 5891, 0, 0], [1.0, 948, 0, 0], [1.5, 13484, 0, 0],
+  [2.0, 18387, 0, 0], [2.5, 9622, 0, 0], [3.0, 32085, 13932, 0], [3.5, 0, 3671, 0],
+  [4.0, 0, 61686, 0], [4.5, 0, 62718, 0], [5.0, 0, 15805, 0], [5.5, 0, 76889, 0],
+  [6.0, 0, 6584, 0], [6.5, 0, 47572, 7443], [7.0, 0, 0, 40682], [7.5, 0, 0, 3547],
+  [8.0, 0, 0, 27075], [8.5, 0, 0, 7694], [9.0, 0, 0, 5025], [9.5, 0, 0, 3052],
 ];
-
-function scoreToColor(s) {
-  if (s < SCORE_CUT_EASY) return DIFFICULTY_TIERS['easy'].color;
-  if (s < SCORE_CUT_HARD) return DIFFICULTY_TIERS['medium'].color;
-  return DIFFICULTY_TIERS['hard'].color;
-}
+const binTotal = (b) => b[1] + b[2] + b[3];
+const binEstB = (b) => (binTotal(b) / DIST_SAMPLE_N) * SIX_SET_POOL / 1e9;  // billions
 
 // Build the "sets per random layout" bar chart as a standalone SVG string.
 function buildSetCountSvg() {
@@ -3886,38 +3892,42 @@ function buildSetCountSvg() {
   return s + '</svg>';
 }
 
-// Build the v2 difficulty histogram (three colour-coded tiers) as an SVG string.
+// Build the difficulty histogram (bars stacked by star tier) as an SVG string.
 function buildDiffHistogramSvg() {
   const W = 700, H = 360, ML = 56, MR = 14, MT = 26, MB = 46;
   const plotW = W - ML - MR, plotH = H - MT - MB;
-  const yMax = 250;
+  const yMax = 300;
   const x = (v) => ML + (v / 10) * plotW;
   const y = (v) => MT + plotH - (v / yMax) * plotH;
   const cuts = [SCORE_CUT_EASY, SCORE_CUT_HARD];
+  const colors = DIFFICULTY_ORDER.map((k) => DIFFICULTY_TIERS[k].color);
   let s = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" `
         + `style="width:100%;height:auto;display:block" role="img" `
-        + `aria-label="Histogram of v2 difficulty across the 1.65 trillion six-set puzzles, in three colour-coded star tiers. It is centred near 5 with rarer extremes.">`;
+        + `aria-label="Histogram of difficulty scores across the 1.65 trillion six-set puzzles, coloured by star rating. Most puzzles score between 4 and 7; about 18 percent are 1 star, 62 percent 2 stars and 20 percent 3 stars.">`;
   for (let g = 0; g <= yMax; g += 50) {
     const gy = y(g);
     s += `<line x1="${ML}" y1="${gy}" x2="${W-MR}" y2="${gy}" stroke="#e7e5e4"/>`;
     s += `<text x="${ML-7}" y="${gy+4}" text-anchor="end" font-size="12" fill="#a8a29e" font-family="Menlo, monospace">${g}B</text>`;
   }
-  for (const [lo, , est] of HISTO_BINS) {
-    const bx = x(lo), bw = x(lo+0.5) - x(lo) - 1.4, by = y(est), bh = MT + plotH - by;
-    s += `<rect x="${bx}" y="${by}" width="${bw}" height="${Math.max(bh,0)}" fill="${scoreToColor(lo+0.25)}" rx="1.5"/>`;
+  for (const b of HISTO_BINS) {
+    const lo = b[0], bx = x(lo), bw = x(lo + 0.5) - x(lo) - 1.4;
+    const scale = binEstB(b) / Math.max(binTotal(b), 1);
+    let base = 0;
+    for (let t = 0; t < 3; t++) {
+      const v = b[1 + t] * scale;
+      if (v <= 0) continue;
+      s += `<rect x="${bx}" y="${y(base + v)}" width="${bw}" height="${y(base) - y(base + v)}" fill="${colors[t]}"/>`;
+      base += v;
+    }
+    const pct = 100 * binTotal(b) / DIST_SAMPLE_N;
+    const bh = MT + plotH - y(base);
+    if (pct >= 1 && bh >= 18)
+      s += `<text x="${bx+bw/2}" y="${y(base)+bh/2+4}" text-anchor="middle" font-size="11" font-weight="700" fill="#fff" font-family="Menlo, monospace">${Math.round(pct)}%</text>`;
   }
   for (const t of cuts) {
     const tx = x(t);
     s += `<line x1="${tx}" y1="${MT}" x2="${tx}" y2="${MT+plotH}" stroke="#1c1917" stroke-width="1.4" stroke-dasharray="4 3"/>`;
-    s += `<text x="${tx}" y="${MT-6}" text-anchor="middle" font-size="11" fill="#1c1917" font-weight="700" font-family="Menlo, monospace">${t.toFixed(1)}</text>`;
-  }
-  for (const [lo, samp] of HISTO_BINS) {
-    const pct = 100 * samp / DIST_SAMPLE_N;
-    if (pct < 1) continue;
-    const bx = x(lo), bw = x(lo+0.5) - x(lo) - 1.4, est = HISTO_BINS.find(b => b[0]===lo)[2];
-    const by = y(est), bh = MT + plotH - by;
-    if (bh >= 18)
-      s += `<text x="${bx+bw/2}" y="${by+bh/2+4}" text-anchor="middle" font-size="11" font-weight="700" fill="#fff" font-family="Menlo, monospace">${Math.round(pct)}%</text>`;
+    s += `<text x="${tx}" y="${MT-6}" text-anchor="middle" font-size="11" fill="#1c1917" font-weight="700" font-family="Menlo, monospace">${t.toFixed(2)}</text>`;
   }
   s += `<line x1="${ML}" y1="${MT+plotH}" x2="${W-MR}" y2="${MT+plotH}" stroke="#a8a29e" stroke-width="1.4"/>`;
   for (let t = 0; t <= 10; t++) {
@@ -4231,8 +4241,9 @@ function ScoringContent({ onBack }) {
       </div>
       <p className="text-xs text-stone-500 mb-5 text-center leading-relaxed">
         where <span className="font-mono">raw = avgVars + 0.141 × decoys</span>.{' '}
-        The raw composite spans 1.81–3.81 across the puzzles this site actually
-        serves, so the easiest possible daily puzzle scores ~0 and the hardest ~10.
+        The raw composite spans 1.81–3.81 across every daily puzzle generated so
+        far, so the easiest scores 0 and the hardest 10. The rare puzzle outside
+        that range (about 0.3%) is capped at 0 or 10.
       </p>
 
       <section className="mb-4">
@@ -4248,8 +4259,9 @@ function ScoringContent({ onBack }) {
           number). A set with 1 varying attribute looks nearly identical
           (e.g. three red solid ovals — just the count differs); a set with
           all 4 varying looks maximally different and is the hardest to spot.
-          Across 1,338 real solves this is comfortably the strongest structural
-          predictor of how long a puzzle takes, so it carries the most weight.{' '}
+          Across more than 8,700 solves by regular players, this is by far the
+          strongest structural predictor of how long a puzzle takes, so it
+          carries the most weight.{' '}
           <strong>Higher = harder.</strong>
         </p>
       </section>
@@ -4276,10 +4288,10 @@ function ScoringContent({ onBack }) {
       </h3>
       <p className="text-xs text-stone-500 mb-2 leading-relaxed">
         The 0–10 score is bucketed into three star ratings, cut so that 1★ and
-        3★ are the rarer ends and 2★ is the broad middle. For a player who
-        averages around 1:23, the tiers work out to roughly{' '}
-        <strong>1:09 / 1:22 / 1:36</strong> — a real spread of about 40% from
-        an easy board to a hard one.
+        3★ are the rarer ends and 2★ is the broad middle. For a regular player
+        whose usual time is about 2:13, the tiers work out to roughly{' '}
+        <strong>1:41 / 2:07 / 2:26</strong>, a spread of about 45% from an easy
+        board to a hard one.
       </p>
       <div className="bg-white rounded-md border border-stone-300 divide-y divide-stone-200 mb-5">
         <div className="px-4 py-1.5 flex items-center gap-3 bg-stone-50
@@ -4290,8 +4302,8 @@ function ScoringContent({ onBack }) {
         </div>
         {[
           [1, 'Easy', '0.0 – 3.5', '~18%'],
-          [2, 'Medium', '3.5 – 6.7', '~54%'],
-          [3, 'Hard', '6.7 – 10.0', '~28%'],
+          [2, 'Medium', '3.5 – 6.7', '~62%'],
+          [3, 'Hard', '6.7 – 10.0', '~20%'],
         ].map(([stars, label, range, share]) => (
           <div key={label} className="px-4 py-2.5 flex items-center gap-3">
             <span className="text-sm flex-1 min-w-0">
@@ -4331,11 +4343,19 @@ function ScoringContent({ onBack }) {
           <strong>0.40</strong>.
         </p>
         <p>
-          Which still means the layout explains only about{' '}
-          <strong>16% of the variance</strong> in how long a puzzle takes. The
-          other 84% is everything a structural metric can't see: which set your
-          eye lands on first, focus, luck. The same puzzle here has produced a
-          3-minute solve and a 7½-minute solve from two different people.
+          It has held up since. On 6,400 newer solves the formula never saw, the
+          correlation is <strong>0.37</strong>, and fitting the weights afresh
+          on that data alone gives almost the same balance between the two
+          terms.
+        </p>
+        <p>
+          How much the layout explains depends on what you ask. For{' '}
+          <strong>how hard a day plays across everyone</strong>, quite a lot: on
+          days with 20 or more regular players, the correlation is 0.64, about{' '}
+          <strong>40%</strong> of the day-to-day difference. For{' '}
+          <strong>your own solve</strong>, very little: about 5% of how your time
+          compares with your usual. The rest is everything a structural metric
+          can't see: which set your eye lands on first, focus, luck.
         </p>
         <p>
           That's exactly why there are three buckets and not a precise number.
@@ -4431,16 +4451,18 @@ function ScoringContent({ onBack }) {
           <span className="inline-flex items-center gap-1 text-[10px] text-stone-500">
             <span style={{ width: '14px', height: '0', borderTop: '2px dashed #1c1917',
                            display: 'inline-block' }} />
-            star cuts (3.6 / 5.7)
+            star cuts ({SCORE_CUT_EASY} / {SCORE_CUT_HARD})
           </span>
         </div>
       </div>
       <p className="text-xs text-stone-500 mb-5 leading-relaxed">
-        Every one of the ~1.65 trillion puzzles, scored with the v2 formula and
-        binned. The dashed lines are the 1★/2★ and 2★/3★ cuts; the figure inside
-        each bar is that bin's share of the pool. The bulk sits in the middle —
-        which is exactly why 2★ is the broad "typical" bucket and the star
-        ratings only call out the rarer ends.
+        The ~1.65 trillion puzzles, scored with the current formula and binned,
+        colored by star rating. The dashed lines are the 1★/2★ and 2★/3★ cuts;
+        the figure inside each bar is that bin's share of the pool. The score
+        moves in small steps (a set varies in a whole number of attributes, and
+        decoys are whole cards), so neighboring bins can differ a lot. The bulk
+        sits in the middle, which is why 2★ is the broad "typical" bucket and
+        the stars only call out the rarer ends.
       </p>
 
       {/* raw bin table */}
@@ -4457,7 +4479,7 @@ function ScoringContent({ onBack }) {
               </tr>
             </thead>
             <tbody>
-              {HISTO_BINS.map(([lo, samp, est], i) => (
+              {HISTO_BINS.map((b, i) => [b[0], binTotal(b), binEstB(b)]).map(([lo, samp, est], i) => (
                 <tr key={lo} className={i % 2 === 0 ? 'bg-white' : 'bg-stone-50'}>
                   <td className="px-3 py-1.5 text-stone-700 whitespace-nowrap">
                     {lo.toFixed(1)} – {(lo + 0.5).toFixed(1)}
@@ -4481,9 +4503,9 @@ function ScoringContent({ onBack }) {
         </div>
       </div>
       <p className="text-xs text-stone-500 mb-5 leading-relaxed">
-        Score percentiles across the pool — p10&nbsp;2.7 · p25&nbsp;3.6 ·
-        p50&nbsp;4.5 · p75&nbsp;5.7 · p90&nbsp;7.5. Mean 4.9, standard
-        deviation 1.8.
+        Score percentiles across the pool: p10&nbsp;2.6 · p25&nbsp;4.2 ·
+        p50&nbsp;5.1 · p75&nbsp;6.7 · p90&nbsp;7.5. Mean 5.3, standard
+        deviation 1.9.
       </p>
 
       {/* method */}
@@ -4492,15 +4514,18 @@ function ScoringContent({ onBack }) {
         The 70.72-trillion figure is exact — it is C(81,&nbsp;12). Everything
         else is estimated by sampling random 12-card layouts and counting the
         sets in each. About 2.33% had exactly 6 sets, which scaled up by
-        C(81,&nbsp;12) gives ~1.65 trillion puzzles. The v2 difficulty score
-        was then computed for 400,000 sampled 6-set puzzles. A "layout" /
+        C(81,&nbsp;12) gives ~1.65 trillion puzzles. The current difficulty
+        score was then computed for 466,015 sampled 6-set puzzles (from 20
+        million random layouts, October 2026). Daily puzzles are drawn from
+        this same pool at random, and the 1,484 generated so far split across
+        the stars in the same proportions. A "layout" /
         "puzzle" is an unordered set of 12 cards; layouts related by SET's
         symmetries are not deduplicated.
       </p>
 
       <p className="text-xs text-stone-500 italic leading-relaxed">
-        The coefficients and star cut points will be re-fit periodically as
-        more solve data accumulates.
+        Last checked against solve data in October 2026. The coefficients and
+        star cut points will be re-fit periodically as more data accumulates.
       </p>
     </main>
   );
