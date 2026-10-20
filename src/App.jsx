@@ -976,6 +976,88 @@ const Storage = {
     return cachedFetch(`stats:${name || ''}`, HISTORY_CACHE_TTL_MS,
       () => sbRpc('stats_page', { p_name: name || null }));
   },
+
+  // --- Groups (class codes) ---------------------------------------------
+  // A group is a named list of player names plus a permanent 6-character
+  // join code. Membership is by player name, verified with this device's
+  // secret (groups_* migrations). Group boards reuse the same aggregation
+  // as the public board, restricted to the member list.
+  // -> [{id, name, code, owner, isOwner, members:[names]}]
+  async myGroups(name) {
+    if (!USE_SUPABASE || !name) return [];
+    return cachedFetch(`groups:${name}`, HISTORY_CACHE_TTL_MS,
+      () => sbRpc('my_groups', { p_name: name, p_secret: Storage.ensureSecret() }));
+  },
+  // -> {name, owner, size} or null
+  async lookupGroup(code) {
+    if (!USE_SUPABASE) return null;
+    return sbRpc('group_lookup', { p_code: code });
+  },
+  async _groupMutation(fn, args) {
+    const r = await sbRpc(fn, { ...args, p_secret: Storage.ensureSecret() });
+    invalidateCachePrefix('groups:');
+    return r;
+  },
+  // -> {status: ok|unauthorized|not_found|removed|limit|full, group}
+  joinGroup(name, code) { return Storage._groupMutation('group_join', { p_name: name, p_code: code }); },
+  // -> {status: ok|unauthorized|invalid|limit, group}
+  createGroup(name, groupName) {
+    return Storage._groupMutation('group_create', { p_name: name, p_group_name: groupName });
+  },
+  // action 'rename' (arg = new name) | 'new_code'
+  updateGroup(name, id, action, arg = null) {
+    return Storage._groupMutation('group_update',
+      { p_name: name, p_group_id: id, p_action: action, p_arg: arg });
+  },
+  // owner only: action 'remove' (arg = member name) | 'delete'
+  adminGroup(name, id, action, arg = null) {
+    return Storage._groupMutation('group_admin',
+      { p_name: name, p_group_id: id, p_action: action, p_arg: arg });
+  },
+  leaveGroup(name, id) {
+    return Storage._groupMutation('group_leave', { p_name: name, p_group_id: id });
+  },
+  // Same shape as loadBoard / loadEarlierDays, restricted to members.
+  async loadGroupBoard(group, from, to) {
+    if (!USE_SUPABASE || !group?.members?.length) return { days: 0, earliest: null, players: [], visitors: [] };
+    return cachedFetch(`lb:g${group.id}:${group.members.length}:${from}:${to}`, HISTORY_CACHE_TTL_MS,
+      () => sbRpc('group_leaderboard', { p_names: group.members, p_from: from, p_to: to }));
+  },
+  async loadGroupDays(group, before, limit) {
+    if (!USE_SUPABASE || !group?.members?.length) return { days: [], more: false };
+    return cachedFetch(`lb:gdays${group.id}:${group.members.length}:${before}:${limit}`, HISTORY_CACHE_TTL_MS,
+      () => sbRpc('group_days', { p_names: group.members, p_before: before, p_limit: limit }));
+  },
+};
+
+// Join codes: 6 characters from an alphabet with no lookalikes (no 0/O,
+// 1/I/L). Shown as "K7Q 4MP"; typed with or without the space.
+const GROUP_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+function normGroupCode(raw) {
+  return String(raw || '').toUpperCase().split('').filter((c) => GROUP_CODE_ALPHABET.includes(c)).join('').slice(0, 6);
+}
+function prettyGroupCode(code) { return code ? `${code.slice(0, 3)} ${code.slice(3)}` : ''; }
+function groupLink(code) { return `https://dailyset.net/j/${code}`; }
+// Code from a /j/CODE path or ?join=CODE, or null.
+function joinCodeFromLocation() {
+  try {
+    const m = window.location.pathname.match(/^\/j\/([A-Za-z0-9 -]{4,12})\/?$/);
+    const raw = m ? m[1] : new URLSearchParams(window.location.search).get('join');
+    const code = normGroupCode(raw);
+    return code.length === 6 ? code : null;
+  } catch { return null; }
+}
+const GROUP_SCOPE_KEY = 'dailyset:lbScope';
+function lsGetScope() { try { return localStorage.getItem(GROUP_SCOPE_KEY); } catch { return null; } }
+function lsSetScope(v) { try { localStorage.setItem(GROUP_SCOPE_KEY, String(v)); } catch { /* ignore */ } }
+
+// Group-flavored copy shared by the join sheet and the landing banner.
+const JOIN_ERRORS = {
+  not_found: "No group has that code. Check it with whoever shared it.",
+  removed: "You were removed from this group. Ask the owner for a new code.",
+  limit: "You're in the maximum of 25 groups. Leave one to join another.",
+  full: 'This group is full (500 members).',
+  unauthorized: "Couldn't confirm your name on this device. Try again in a moment.",
 };
 
 // ===== Visual: SET shapes =====
@@ -1158,13 +1240,25 @@ function TabBar({ activeTab, onChange }) {
   );
 }
 
+function GroupIcon({ size = 14 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="9" cy="8" r="3.5" /><path d="M2.5 20c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6" />
+      <path d="M16 4.6a3.5 3.5 0 0 1 0 6.8" /><path d="M18.5 14.4c1.9.8 3 2.9 3 5.6" />
+    </svg>
+  );
+}
+
 // ===== Name entry (own screen, no chrome) =====
 // onSubmit(name, syncCode) resolves to a status string: 'ok' | 'taken' |
 // 'invalid' | 'unavailable'. On 'taken' we reveal the sync-code field, which
 // is how someone reclaims their own name on a new device (or after clearing
 // their browser). mySecret, when present, is shown as this device's own sync
 // code so it can be copied to another phone.
-function NameEntry({ initial, onSubmit, onCancel, mySecret }) {
+// joining: preview of a group the player arrived to join via /j/CODE
+// ({name, owner, size}), or null.
+function NameEntry({ initial, onSubmit, onCancel, mySecret, joining }) {
   const [input, setInput] = useState(initial || '');
   const [syncCode, setSyncCode] = useState('');
   const [showSync, setShowSync] = useState(false);
@@ -1207,6 +1301,21 @@ function NameEntry({ initial, onSubmit, onCancel, mySecret }) {
           A fresh 6-set puzzle every day. Same puzzle for everyone.
         </p>
 
+        {joining && (
+          <div className="flex gap-3 items-center p-3 mb-4 rounded-lg bg-stone-100 border border-stone-200">
+            <div className="w-10 h-10 rounded-full bg-stone-800 text-white flex items-center justify-center flex-shrink-0">
+              <GroupIcon size={20} />
+            </div>
+            <div className="leading-tight min-w-0">
+              <div className="text-xs text-stone-500">You're joining</div>
+              <div className="text-[15px] font-bold truncate">{joining.name}</div>
+              <div className="text-[11.5px] text-stone-500 truncate">
+                Started by {cleanName(joining.owner)} · {joining.size} member{joining.size === 1 ? '' : 's'}
+              </div>
+            </div>
+          </div>
+        )}
+
         <label className="block text-sm font-medium text-stone-700 mb-1">Your name</label>
         <input
           type="text" value={input}
@@ -1220,6 +1329,11 @@ function NameEntry({ initial, onSubmit, onCancel, mySecret }) {
                        ? 'border-red-400 focus:ring-red-500'
                        : 'border-stone-300 focus:ring-red-500'}`}
         />
+        {joining && (
+          <p className="mt-1.5 text-[11.5px] text-stone-500 leading-snug">
+            First name or a nickname. No last names: this shows on your group's board.
+          </p>
+        )}
 
         {status === 'taken' && (
           <div className="mt-2 text-sm text-red-700 bg-red-50 border border-red-200
@@ -1276,7 +1390,7 @@ function NameEntry({ initial, onSubmit, onCancel, mySecret }) {
                        disabled:opacity-50 disabled:cursor-not-allowed
                        transition-colors"
           >
-            {busy ? 'Checking…' : initial ? 'Save' : 'Start playing'}
+            {busy ? 'Checking…' : initial ? 'Save' : joining ? 'Join and start playing' : 'Start playing'}
           </button>
         </div>
 
@@ -1309,6 +1423,13 @@ function NameEntry({ initial, onSubmit, onCancel, mySecret }) {
         <p className="text-xs text-stone-400 mt-3 text-center">
           Your name and times will be visible to others playing this puzzle.
         </p>
+        {joining && !showSync && (
+          <p className="text-xs text-stone-400 mt-1 text-center">
+            Already play on another device?{' '}
+            <button type="button" onClick={() => setShowSync(true)}
+              className="text-red-700 underline underline-offset-2">Use your sync code</button>
+          </p>
+        )}
       </div>
     </div>
   );
@@ -1634,16 +1755,25 @@ function PersonalHistoryCard({ myResults, thisTime, thisDateKey }) {
 function CompletedContent({ result, leaderboard, name, isPlayingToday, practice, dateKey,
                             msUntilTomorrow, puzzle, myResults, onPlayToday, onPlayerClick,
                             nextUnplayedDate, onPlayDate,
-                            onRefresh, refreshing, onRename, onOpenScoring }) {
+                            onRefresh, refreshing, onRename, onOpenScoring,
+                            groups = [], scope = 'all', onScopeChange, onOpenLeaderboard }) {
   const difficulty = useMemo(() => computePuzzleDifficulty(puzzle), [puzzle]);
-  // Rank within today's field, derived from the same leaderboard data already
+  // Group scope narrows the same day's results to that group's members.
+  const group = groups.find((g) => g.id === scope) || null;
+  const shown = useMemo(() => {
+    if (!group) return leaderboard;
+    const m = new Set(group.members.map((x) => x.toLowerCase()));
+    return Object.fromEntries(Object.entries(leaderboard).filter(([n]) => m.has(n.toLowerCase())));
+  }, [leaderboard, group]);
+  // Rank within the shown field, derived from the same leaderboard data already
   // being fetched — no extra query, just a small header callout.
   const rankInfo = useMemo(() => {
-    const entries = Object.entries(leaderboard).sort((a, b) => a[1].time - b[1].time);
+    const entries = Object.entries(shown).sort((a, b) => a[1].time - b[1].time);
     const idx = entries.findIndex(([n]) => n === name);
-    if (idx === -1 || entries.length < 2) return null;
+    if (idx === -1 || (!group && entries.length < 2)) return null;
     return { rank: idx + 1, total: entries.length };
-  }, [leaderboard, name]);
+  }, [shown, name, group]);
+  const stillToPlay = group ? Math.max(0, group.members.length - Object.keys(shown).length) : 0;
   return (
     <main className="flex-1 flex items-start justify-center p-4">
       <div className="max-w-md w-full bg-white rounded-xl shadow-md p-6">
@@ -1692,21 +1822,48 @@ function CompletedContent({ result, leaderboard, name, isPlayingToday, practice,
 
         {!practice && (
         <div className="border-t border-stone-200 pt-4 mb-4">
-          <div className="flex items-center justify-between mb-2">
-            <h3 className="text-sm font-semibold text-stone-700">
-              Leaderboard
-              {rankInfo && (
-                <span className="text-stone-400 font-normal">
-                  {' '}· you're {ordinal(rankInfo.rank)} of {rankInfo.total}
-                </span>
-              )}
-            </h3>
+          {groups.length > 0 && (
+            <div className="flex gap-1.5 mb-2.5 overflow-x-auto pb-0.5" style={{ scrollbarWidth: 'none' }}>
+              {groups.map((g) => (
+                <ScopeChip key={g.id} active={group?.id === g.id} onClick={() => onScopeChange(g.id)}>
+                  {g.name}
+                </ScopeChip>
+              ))}
+              <ScopeChip active={!group} onClick={() => onScopeChange('all')}>Everyone</ScopeChip>
+            </div>
+          )}
+          <div className="flex items-center justify-between mb-2 gap-2">
+            {group ? (
+              <h3 className="text-sm font-semibold text-stone-700 min-w-0">
+                {rankInfo
+                  ? <>{ordinal(rankInfo.rank)} of {rankInfo.total} in {group.name}</>
+                  : group.name}
+                {isPlayingToday && stillToPlay > 0 && (
+                  <span className="text-stone-400 font-normal"> · {stillToPlay} still to play</span>
+                )}
+              </h3>
+            ) : (
+              <h3 className="text-sm font-semibold text-stone-700">
+                Leaderboard
+                {rankInfo && (
+                  <span className="text-stone-400 font-normal">
+                    {' '}· you're {ordinal(rankInfo.rank)} of {rankInfo.total}
+                  </span>
+                )}
+              </h3>
+            )}
             <button onClick={onRefresh} disabled={refreshing}
-              className="text-xs text-stone-500 hover:text-stone-700 disabled:opacity-50">
+              className="text-xs text-stone-500 hover:text-stone-700 disabled:opacity-50 flex-shrink-0">
               {refreshing ? 'Refreshing…' : '↻ Refresh'}
             </button>
           </div>
-          <Leaderboard results={leaderboard} currentName={name} onPlayerClick={onPlayerClick} />
+          <Leaderboard results={shown} currentName={name} onPlayerClick={onPlayerClick} />
+          {group && onOpenLeaderboard && (
+            <button onClick={onOpenLeaderboard}
+              className="block mx-auto mt-2.5 text-xs font-semibold text-red-700 hover:text-red-900">
+              Full {group.name} board ›
+            </button>
+          )}
         </div>
         )}
 
@@ -2536,7 +2693,32 @@ function medianOf(nums) {
 }
 const avgOf = (a) => (a.length ? Math.round((a.reduce((s, t) => s + t, 0) / a.length) * 100) / 100 : null);
 
-function LeaderboardContent({ todayKey, currentName, onPlayerClick, onOpenScoring }) {
+function ScopeChip({ active, onClick, icon, children }) {
+  return (
+    <button onClick={onClick} aria-pressed={active}
+      className={`flex-shrink-0 h-8 px-3 rounded-full border text-xs font-semibold whitespace-nowrap
+                 flex items-center gap-1.5 max-w-[60vw] transition-colors
+                 ${active ? 'bg-stone-800 border-stone-800 text-white'
+                          : 'bg-white border-stone-300 text-stone-700 hover:bg-stone-50'}`}>
+      {icon && <GroupIcon size={14} />}
+      <span className="truncate">{children}</span>
+    </button>
+  );
+}
+
+// groups: the player's groups; scope: group id or 'all'. With a group in
+// scope every view (Today, Week, Month, All-time, Earlier days) is the same
+// board restricted to that group's members.
+function LeaderboardContent({ todayKey, currentName, onPlayerClick, onOpenScoring,
+                              groups = [], scope = 'all', onScopeChange, onOpenJoin, onOpenGroup }) {
+  const group = groups.find((g) => g.id === scope) || null;
+  const memberLower = useMemo(
+    () => (group ? new Set(group.members.map((m) => m.toLowerCase())) : null),
+    [group]
+  );
+  const inScope = (n) => !memberLower || memberLower.has(String(n).toLowerCase());
+  const scopeKey = group ? `g${group.id}:${group.members.length}` : 'all';
+  const [showNotYet, setShowNotYet] = useState(false);
   const [period, setPeriod] = useState('today');   // today | week | month | all
   const [anchorDay, setAnchorDay] = useState(todayKey);
   const [anchorWeek, setAnchorWeek] = useState(() => mondayOf(todayKey));
@@ -2574,7 +2756,7 @@ function LeaderboardContent({ todayKey, currentName, onPlayerClick, onOpenScorin
   // Today = that one day's rows (small). Week/Month/All-time = per-player
   // aggregates computed server-side (leaderboard RPC). Earlier days = one
   // summary row per day; a day's full list loads only when it's expanded.
-  const boardKey = period === 'today' ? null : `${from}|${to}`;
+  const boardKey = period === 'today' ? null : `${scopeKey}|${from}|${to}`;
   const [board, setBoard] = useState(null);          // { key, data }
   const [todayData, setTodayData] = useState(null);  // { date, rows }
   const [earlier, setEarlier] = useState(null);      // { anchor, data }
@@ -2583,7 +2765,7 @@ function LeaderboardContent({ todayKey, currentName, onPlayerClick, onOpenScorin
   useEffect(() => {
     if (boardKey === null) return;
     let cancelled = false;
-    Storage.loadBoard(from, to)
+    (group ? Storage.loadGroupBoard(group, from, to) : Storage.loadBoard(from, to))
       .then((data) => { if (!cancelled) setBoard({ key: boardKey, data }); })
       .catch(() => { if (!cancelled) setBoard({ key: boardKey, data: null }); });
     return () => { cancelled = true; };
@@ -2601,11 +2783,15 @@ function LeaderboardContent({ todayKey, currentName, onPlayerClick, onOpenScorin
   useEffect(() => {
     if (period !== 'today') return;
     let cancelled = false;
-    Storage.loadEarlierDays(anchorDay, daysShown)
-      .then((data) => { if (!cancelled) setEarlier({ anchor: anchorDay, data }); })
+    const earlierKey = `${scopeKey}|${anchorDay}`;
+    (group ? Storage.loadGroupDays(group, anchorDay, daysShown)
+           : Storage.loadEarlierDays(anchorDay, daysShown))
+      .then((data) => { if (!cancelled) setEarlier({ anchor: earlierKey, data }); })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [period, anchorDay, daysShown]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [period, anchorDay, daysShown, scopeKey]);
+  const earlierReady = earlier?.anchor === `${scopeKey}|${anchorDay}`;
 
   const loading = period === 'today'
     ? todayData?.date !== anchorDay
@@ -2616,6 +2802,7 @@ function LeaderboardContent({ todayKey, currentName, onPlayerClick, onOpenScorin
     if (period === 'today') {
       if (!todayData || todayData.date !== anchorDay) return [];
       return Object.entries(todayData.rows || {})
+        .filter(([name]) => inScope(name))
         .map(([name, r]) => ({ name, n: 1, time: r.time, avg: r.time, completedAt: r.completedAt }));
     }
     if (!boardData) return [];
@@ -2630,10 +2817,19 @@ function LeaderboardContent({ todayKey, currentName, onPlayerClick, onOpenScorin
       tiers: { easy: p.easy, medium: p.medium, hard: p.hard },
       gaps: p.g || [null, null, null, null, null, null],
     }));
-  }, [period, todayData, anchorDay, boardData]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [period, todayData, anchorDay, boardData, memberLower]);
+
+  // Members with no time on the day being viewed (group scope, Today only).
+  const notYet = useMemo(() => {
+    if (!group || period !== 'today' || !todayData || todayData.date !== anchorDay) return [];
+    const done = new Set(Object.keys(todayData.rows || {}).map((n) => n.toLowerCase()));
+    return group.members.filter((m) => !done.has(m.toLowerCase()));
+  }, [group, period, todayData, anchorDay]);
 
   const subtitle = period === 'today'
-    ? (loading ? '…' : `${players.length} finished`)
+    ? (loading ? '…' : group ? `${players.length} of ${group.members.length} finished`
+                             : `${players.length} finished`)
     : period === 'week' ? (anchorWeek === mondayOf(todayKey) ? 'this week' : 'Mon–Sun')
     : period === 'month' ? (anchorMonth === monthStartOf(todayKey) ? 'this month' : 'full month')
     : (boardData ? `${boardData.days} puzzle days` : '…');
@@ -2724,6 +2920,23 @@ function LeaderboardContent({ todayKey, currentName, onPlayerClick, onOpenScorin
 
   return (
     <main className="flex-1 p-3 max-w-2xl w-full mx-auto">
+      {/* scope chips: only for players in at least one group */}
+      {groups.length > 0 && (
+        <div className="flex gap-1.5 mb-2.5 overflow-x-auto -mx-3 px-3 pb-0.5" style={{ scrollbarWidth: 'none' }}>
+          <ScopeChip active={!group} onClick={() => onScopeChange('all')}>Everyone</ScopeChip>
+          {groups.map((g) => (
+            <ScopeChip key={g.id} active={group?.id === g.id} onClick={() => onScopeChange(g.id)} icon>
+              {g.name}
+            </ScopeChip>
+          ))}
+          <button onClick={onOpenJoin}
+            className="flex-shrink-0 h-8 px-3 rounded-full border border-dashed border-stone-400
+                       text-stone-600 text-xs font-semibold hover:bg-white whitespace-nowrap">
+            + Join or create
+          </button>
+        </div>
+      )}
+
       {/* period pills */}
       <div className="flex gap-1.5 mb-2.5">
         {[['today','Today'],['week','Week'],['month','Month'],['all','All-time']].map(([id, label]) => (
@@ -2805,7 +3018,7 @@ function LeaderboardContent({ todayKey, currentName, onPlayerClick, onOpenScorin
           <div className="py-10 text-center text-stone-400 text-sm">Loading…</div>
         ) : rows.length === 0 ? (
           <div className="py-10 text-center text-stone-400 text-sm italic">
-            {isToday ? 'Nobody has finished this puzzle yet.'
+            {isToday ? (group ? 'No one in this group has finished this puzzle yet.' : 'Nobody has finished this puzzle yet.')
                      : `No one reached ${LB_MIN_PUZZLES} puzzles in this window.`}
           </div>
         ) : isToday ? (
@@ -2969,12 +3182,58 @@ function LeaderboardContent({ todayKey, currentName, onPlayerClick, onOpenScorin
           </>
         )}
 
+        {isToday && !loading && notYet.length > 0 && (
+          <>
+            <button onClick={() => setShowNotYet((v) => !v)}
+              className="w-full flex justify-between items-center gap-3 px-2.5 py-2.5 bg-stone-50
+                         hover:bg-stone-100 border-t border-stone-200 text-[11.5px] text-stone-600">
+              <span className="font-medium flex-shrink-0">
+                {anchorDay === todayKey ? 'Not finished yet' : "Didn't play"} · {notYet.length}
+              </span>
+              <span className="text-stone-400 truncate">
+                {showNotYet ? 'Hide ▴'
+                  : `${notYet.slice(0, 3).map(cleanName).join(', ')}${notYet.length > 3 ? `, +${notYet.length - 3}` : ''} ▾`}
+              </span>
+            </button>
+            {showNotYet && (
+              <div className="px-2.5 py-2 border-t border-stone-100 text-[12px] text-stone-500 leading-relaxed">
+                {notYet.map(cleanName).join(', ')}
+              </div>
+            )}
+          </>
+        )}
+
         <div className="text-[10px] text-stone-400 px-2.5 py-2 bg-stone-50 border-t border-stone-200 leading-relaxed">
-          {isToday
+          {isToday && group
+            ? `Members of ${group.name} who finished this puzzle. ‹ › steps through past days.`
+            : isToday
             ? 'Everyone who finished this puzzle. ‹ › steps through past days.'
             : `${LB_MIN_PUZZLES}+ puzzles to qualify. Win % counts contested days only. Tap a column to sort, or a row for that player's profile.`}
         </div>
       </div>
+
+      {group ? (
+        <button onClick={() => onOpenGroup(group.id)}
+          className="mt-2.5 w-full flex items-center justify-between gap-2 px-3 py-2.5 bg-white
+                     border border-stone-200 rounded-lg text-left text-xs text-stone-600 hover:bg-stone-50">
+          <span className="min-w-0 truncate">
+            <span className="font-semibold text-stone-800">{group.name}</span>
+            {' · '}{group.members.length} member{group.members.length === 1 ? '' : 's'}
+            {' · '}code <span className="font-bold tracking-wider" style={{ fontFamily: '"Menlo", monospace' }}>
+              {prettyGroupCode(group.code)}
+            </span>
+          </span>
+          <span className="text-red-700 font-semibold flex-shrink-0">Group page ›</span>
+        </button>
+      ) : groups.length === 0 && onOpenJoin ? (
+        <button onClick={onOpenJoin}
+          className="mt-2 mx-auto flex items-center gap-1.5 px-2.5 py-2 text-xs text-stone-500 hover:text-stone-700">
+          <GroupIcon size={14} />
+          <span>Playing with a class or friends?{' '}
+            <span className="text-red-700 font-semibold underline underline-offset-2">Join or start a group</span>
+          </span>
+        </button>
+      ) : null}
 
       {/* ---------- Earlier days: the day-by-day list, only under Today ---------- */}
       {isToday && (
@@ -2983,16 +3242,16 @@ function LeaderboardContent({ todayKey, currentName, onPlayerClick, onOpenScorin
             Earlier days
           </div>
           <div className="bg-white rounded-md shadow-sm overflow-hidden">
-            {earlier?.anchor === anchorDay && earlier.data.days.length === 0 && (
+            {earlierReady && earlier.data.days.length === 0 && (
               <div className="py-4 text-center text-stone-400 text-[11.5px] italic">No earlier days.</div>
             )}
-            {(earlier?.anchor === anchorDay ? earlier.data.days : []).map((day) => {
+            {(earlierReady ? earlier.data.days : []).map((day) => {
               const date = day.date;
               const winner = { name: day.winner, time: day.t };
               const open = expandedDays.has(date);
               const diff = day.level ? { level: day.level } : null;
               const expandable = day.n > 1;
-              const entries = dayDetail[date];
+              const entries = dayDetail[date] && dayDetail[date].filter((e) => inScope(e.name));
               return (
                 <div key={date} className={`border-t border-stone-100 first:border-t-0 ${open ? 'bg-stone-50' : ''}`}>
                   <div role={expandable ? 'button' : undefined}
@@ -3064,7 +3323,7 @@ function LeaderboardContent({ todayKey, currentName, onPlayerClick, onOpenScorin
                 </div>
               );
             })}
-            {earlier?.anchor === anchorDay && earlier.data.more && (
+            {earlierReady && earlier.data.more && (
               <button onClick={() => setDaysShown((n) => n + DAYS_PAGE)}
                 className="w-full py-2 bg-stone-50 hover:bg-stone-100 text-stone-500 text-[11px]
                            font-medium border-t border-stone-100 transition-colors">
@@ -4233,6 +4492,437 @@ function ScoringContent({ onBack }) {
   );
 }
 
+// ===== Groups: join / create sheet =====
+// Bottom sheet opened from the Leaderboard ("+ Join or create", or the
+// discreet link for players in no group) and from a /j/CODE link when the
+// player already has a name.
+function JoinSheet({ name, initialCode, initialMode = 'join', onClose, onJoined, onCreated }) {
+  const [mode, setMode] = useState(initialMode);
+  const [codeInput, setCodeInput] = useState(initialCode ? prettyGroupCode(initialCode) : '');
+  const [preview, setPreview] = useState(null);   // { code, info } info null = no such group
+  const [groupName, setGroupName] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const code = normGroupCode(codeInput);
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  useEffect(() => {
+    setError(null);
+    if (code.length !== 6) { setPreview(null); return; }
+    let cancelled = false;
+    const t = setTimeout(() => {
+      Storage.lookupGroup(code)
+        .then((info) => { if (!cancelled) setPreview({ code, info: info || null }); })
+        .catch(() => { if (!cancelled) setPreview(null); });
+    }, 150);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [code]);
+
+  const join = async () => {
+    if (busy || code.length !== 6) return;
+    setBusy(true); setError(null);
+    try {
+      const r = await Storage.joinGroup(name, code);
+      if (r?.status === 'ok') { onJoined(r.group); return; }
+      setError(JOIN_ERRORS[r?.status] || 'Something went wrong. Try again.');
+    } catch { setError("Couldn't reach the server. Check your connection and try again."); }
+    setBusy(false);
+  };
+
+  const trimmedGroup = groupName.trim().replace(/\s+/g, ' ');
+  const groupValid = trimmedGroup.length > 0 && trimmedGroup.length <= 40 && !nameIsBlocked(trimmedGroup);
+  const create = async () => {
+    if (busy || !groupValid) return;
+    setBusy(true); setError(null);
+    try {
+      const r = await Storage.createGroup(name, trimmedGroup);
+      if (r?.status === 'ok') { onCreated(r.group); return; }
+      setError(r?.status === 'invalid' ? "That name can't be used. Try another."
+             : r?.status === 'limit' ? 'You already own 25 groups, the maximum.'
+             : JOIN_ERRORS[r?.status] || 'Something went wrong. Try again.');
+    } catch { setError("Couldn't reach the server. Check your connection and try again."); }
+    setBusy(false);
+  };
+
+  const info = preview?.code === code ? preview.info : undefined;  // undefined = not looked up yet
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center">
+      <div className="absolute inset-0 bg-stone-900/45" onClick={onClose} />
+      <div role="dialog" aria-modal="true" aria-labelledby="join-title"
+           className="relative w-full max-w-md bg-white rounded-t-2xl px-4 pt-2.5 pb-7 flex flex-col gap-3.5
+                      max-h-[92vh] overflow-y-auto">
+        <div className="self-center w-10 h-1 rounded bg-stone-300" />
+        <div className="flex justify-between items-center">
+          <h2 id="join-title" className="text-xl font-bold" style={{ fontFamily: '"Georgia", serif' }}>
+            {mode === 'join' ? 'Join a group' : 'Start a group'}
+          </h2>
+          <button onClick={onClose} aria-label="Close"
+            className="w-9 h-9 rounded-full bg-stone-100 text-stone-600 flex items-center justify-center hover:bg-stone-200">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+                 strokeLinecap="round" aria-hidden="true"><path d="M6 6l12 12" /><path d="M18 6L6 18" /></svg>
+          </button>
+        </div>
+
+        {mode === 'join' ? (
+          <>
+            <div className="flex flex-col gap-1.5">
+              <label htmlFor="group-code" className="text-[13px] font-semibold text-stone-700">Group code</label>
+              <input id="group-code" type="text" value={codeInput} autoComplete="off" autoCapitalize="characters"
+                spellCheck={false} autoFocus={!initialCode} maxLength={9}
+                onChange={(e) => setCodeInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') join(); }}
+                placeholder="ABC 123"
+                className="h-[52px] px-3.5 rounded-[10px] border-2 border-stone-800 text-2xl font-bold uppercase
+                           tracking-[0.14em] text-stone-900 placeholder:text-stone-300 focus:outline-none
+                           focus:ring-2 focus:ring-red-500"
+                style={{ fontFamily: '"Menlo", monospace' }} />
+              <div className="text-[11.5px] text-stone-500">Ask your teacher or group owner for it.</div>
+            </div>
+
+            {code.length === 6 && info && (
+              <div className="flex gap-3 items-center p-3 rounded-[10px] bg-green-50 border border-green-200">
+                <div className="w-9 h-9 rounded-full bg-green-800 text-white flex items-center justify-center flex-shrink-0">
+                  <GroupIcon size={18} />
+                </div>
+                <div className="leading-tight min-w-0">
+                  <div className="text-sm font-bold truncate">{info.name}</div>
+                  <div className="text-xs text-stone-600 truncate">
+                    Started by {cleanName(info.owner)} · {info.size} member{info.size === 1 ? '' : 's'}
+                  </div>
+                </div>
+              </div>
+            )}
+            {code.length === 6 && info === null && !error && (
+              <p className="text-sm text-red-700">{JOIN_ERRORS.not_found}</p>
+            )}
+            {error && <p className="text-sm text-red-700">{error}</p>}
+
+            <button onClick={join} disabled={busy || code.length !== 6 || info === null}
+              className="h-12 rounded-[10px] bg-red-700 hover:bg-red-800 text-white text-[15px] font-semibold
+                         disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
+              {busy ? 'Joining…' : info ? `Join ${info.name}` : 'Join'}
+            </button>
+
+            <div className="flex items-center gap-2.5 text-stone-400 text-xs">
+              <div className="flex-1 h-px bg-stone-200" />or<div className="flex-1 h-px bg-stone-200" />
+            </div>
+            <button onClick={() => { setMode('create'); setError(null); }}
+              className="h-[46px] rounded-[10px] border border-stone-300 bg-white text-stone-800 text-sm font-semibold
+                         hover:bg-stone-50">
+              Start your own group
+            </button>
+            <div className="text-[11.5px] text-stone-500 text-center leading-snug">
+              For a class, a family or a group of friends. You can be in more than one.
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="flex flex-col gap-1.5">
+              <label htmlFor="group-name" className="text-[13px] font-semibold text-stone-700">Group name</label>
+              <input id="group-name" type="text" value={groupName} maxLength={40} autoFocus
+                onChange={(e) => { setGroupName(e.target.value); setError(null); }}
+                onKeyDown={(e) => { if (e.key === 'Enter') create(); }}
+                placeholder="e.g. 4th period"
+                className="h-11 px-3 rounded-lg border border-stone-300 text-[15px] focus:outline-none
+                           focus:ring-2 focus:ring-red-500" />
+              <div className="text-[11.5px] text-stone-500 leading-snug">
+                You'll get a code and a link to share. You own the group as <strong>{cleanName(name)}</strong>.
+              </div>
+            </div>
+            {trimmedGroup && nameIsBlocked(trimmedGroup) && (
+              <p className="text-sm text-red-700">That name isn't allowed. Please choose another.</p>
+            )}
+            {error && <p className="text-sm text-red-700">{error}</p>}
+            <button onClick={create} disabled={busy || !groupValid}
+              className="h-12 rounded-[10px] bg-red-700 hover:bg-red-800 text-white text-[15px] font-semibold
+                         disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
+              {busy ? 'Creating…' : 'Create group'}
+            </button>
+            <button onClick={() => { setMode('join'); setError(null); }}
+              className="text-sm text-stone-600 hover:text-stone-800 py-1">
+              ‹ I have a code
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ===== Groups: group page =====
+// Owner: rename, copy link, issue a new code, remove members, delete.
+// Member: see the code and roster, leave. justCreated shows the "ready"
+// card with the big code first (right after creating).
+function CopyButton({ text, label = 'Copy', copiedLabel = 'Copied ✓', className = '' }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch { /* clipboard blocked; the text is selectable */ }
+  };
+  return <button onClick={copy} className={className}>{copied ? copiedLabel : label}</button>;
+}
+
+function GroupPage({ group, name, todayKey, justCreated, onDismissCreated, onBack,
+                     onGroupUpdated, onGroupGone, onPlayerClick }) {
+  const [today, setToday] = useState(null);       // name(lower) -> time
+  const [renaming, setRenaming] = useState(false);
+  const [newName, setNewName] = useState(group.name);
+  const [confirm, setConfirm] = useState(null);   // 'code' | 'delete' | 'leave' | {remove: name}
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [showAll, setShowAll] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    Storage.loadLeaderboard(todayKey).then((rows) => {
+      if (cancelled) return;
+      const m = {};
+      for (const [n, r] of Object.entries(rows || {})) m[n.toLowerCase()] = r.time;
+      setToday(m);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [todayKey]);
+
+  const run = async (fn, after) => {
+    if (busy) return;
+    setBusy(true); setError(null);
+    try {
+      const r = await fn();
+      if (r?.status === 'ok') { setConfirm(null); after(r); }
+      else setError(r?.status === 'invalid' ? "That name can't be used. Try another."
+                  : r?.status === 'not_owner' ? 'Only the owner can do that.'
+                  : r?.status === 'owner' ? 'You own this group. Delete it instead.'
+                  : r?.status === 'not_found' ? 'This group no longer exists.'
+                  : JOIN_ERRORS[r?.status] || 'Something went wrong. Try again.');
+    } catch (e) {
+      // 404 = the server function isn't deployed yet (group_leave / group_admin).
+      setError(/ 404\b/.test(String(e?.message))
+        ? "This isn't switched on yet. Try again later."
+        : "Couldn't reach the server. Check your connection and try again.");
+    }
+    setBusy(false);
+  };
+
+  const link = groupLink(group.code);
+  const owner = group.isOwner;
+  const finishedCount = today ? group.members.filter((m) => today[m.toLowerCase()] != null).length : 0;
+  const LIMIT = 12;
+  const members = showAll ? group.members : group.members.slice(0, LIMIT);
+  const btn2 = 'h-9 px-3 rounded-lg border border-stone-300 bg-white text-stone-700 text-xs font-semibold hover:bg-stone-50';
+
+  if (justCreated) {
+    return (
+      <main className="flex-1 p-3 max-w-md w-full mx-auto flex flex-col gap-3">
+        <button onClick={onBack} className="self-start text-[13px] font-semibold text-red-700 hover:text-red-900">‹ Leaderboard</button>
+        <div className="bg-white rounded-xl shadow-sm px-4 py-5 flex flex-col gap-4">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-full bg-green-100 text-green-800 flex items-center justify-center flex-shrink-0">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4"
+                   strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5" /></svg>
+            </div>
+            <div className="min-w-0">
+              <div className="text-xl font-bold truncate" style={{ fontFamily: '"Georgia", serif' }}>{group.name} is ready</div>
+              <div className="text-xs text-stone-500">You own this group as {cleanName(name)}</div>
+            </div>
+          </div>
+          <div className="text-center px-3 py-4 rounded-[10px] bg-stone-100 border border-stone-200">
+            <div className="text-[11px] font-bold tracking-widest text-stone-500">JOIN CODE</div>
+            <div className="text-[40px] font-bold tracking-[0.12em] mt-1 leading-none"
+                 style={{ fontFamily: '"Menlo", monospace' }}>{prettyGroupCode(group.code)}</div>
+            <div className="text-xs text-stone-500 mt-2">Put it on the board. It never expires.</div>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="group-link" className="text-xs font-semibold text-stone-700">Or share the link</label>
+            <div className="flex gap-2">
+              <input id="group-link" readOnly value={link.replace('https://', '')} onFocus={(e) => e.target.select()}
+                className="flex-1 min-w-0 h-11 px-3 rounded-lg border border-stone-300 bg-stone-50 text-sm text-stone-700"
+                style={{ fontFamily: '"Menlo", monospace' }} />
+              <CopyButton text={link}
+                className="h-11 px-4 rounded-lg bg-stone-800 hover:bg-stone-900 text-white text-[13px] font-semibold flex-shrink-0" />
+            </div>
+          </div>
+          <div className="text-[12.5px] text-stone-700 leading-normal flex flex-col gap-1.5">
+            <div className="font-semibold">How people join</div>
+            <div>New players: open the link, pick a first name or nickname, and they're in.</div>
+            <div>Already playing: Leaderboard › Join or create › type the code.</div>
+          </div>
+          <button onClick={onDismissCreated}
+            className="h-[46px] rounded-lg bg-red-700 hover:bg-red-800 text-white text-[15px] font-semibold">
+            Open group page
+          </button>
+        </div>
+      </main>
+    );
+  }
+
+  return (
+    <main className="flex-1 p-3 max-w-md w-full mx-auto flex flex-col gap-2.5">
+      <button onClick={onBack} className="self-start text-[13px] font-semibold text-red-700 hover:text-red-900">‹ Leaderboard</button>
+
+      <div className="bg-white rounded-xl shadow-sm p-3.5 flex flex-col gap-3">
+        {renaming ? (
+          <div className="flex flex-col gap-2">
+            <label htmlFor="rename-group" className="text-xs font-semibold text-stone-700">Group name</label>
+            <input id="rename-group" value={newName} maxLength={40} autoFocus
+              onChange={(e) => setNewName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') run(() => Storage.updateGroup(name, group.id, 'rename', newName.trim()),
+                  (r) => { onGroupUpdated(r.group); setRenaming(false); });
+                if (e.key === 'Escape') setRenaming(false);
+              }}
+              className="h-10 px-3 rounded-lg border border-stone-300 text-[15px] focus:outline-none focus:ring-2 focus:ring-red-500" />
+            <div className="flex gap-2">
+              <button disabled={busy || !newName.trim()}
+                onClick={() => run(() => Storage.updateGroup(name, group.id, 'rename', newName.trim()),
+                  (r) => { onGroupUpdated(r.group); setRenaming(false); })}
+                className="h-9 px-4 rounded-lg bg-red-700 hover:bg-red-800 text-white text-xs font-semibold disabled:opacity-50">
+                Save
+              </button>
+              <button onClick={() => { setRenaming(false); setNewName(group.name); setError(null); }} className={btn2}>Cancel</button>
+            </div>
+          </div>
+        ) : (
+          <div className="flex justify-between items-start gap-2">
+            <div className="min-w-0">
+              <h2 className="text-[22px] font-bold leading-tight break-words" style={{ fontFamily: '"Georgia", serif' }}>{group.name}</h2>
+              <div className="text-xs text-stone-500 mt-0.5">
+                {group.members.length} member{group.members.length === 1 ? '' : 's'}
+                {' · '}{owner ? 'you own this group' : `started by ${cleanName(group.owner)}`}
+              </div>
+            </div>
+            {owner && (
+              <button onClick={() => { setNewName(group.name); setRenaming(true); }} className={`${btn2} flex-shrink-0 h-8`}>Rename</button>
+            )}
+          </div>
+        )}
+
+        <div className="flex items-center gap-2 p-2.5 rounded-lg bg-stone-100">
+          <div className="flex-1 min-w-0">
+            <div className="text-[10.5px] font-bold tracking-widest text-stone-500">JOIN CODE</div>
+            <div className="text-xl font-bold tracking-[0.1em]" style={{ fontFamily: '"Menlo", monospace' }}>
+              {prettyGroupCode(group.code)}
+            </div>
+          </div>
+          <CopyButton text={link} label="Copy link" copiedLabel="Copied ✓"
+            className="h-9 px-3 rounded-lg bg-stone-800 hover:bg-stone-900 text-white text-xs font-semibold flex-shrink-0" />
+          {owner && (
+            <button onClick={() => setConfirm('code')} className={`${btn2} flex-shrink-0 flex items-center gap-1`}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+                   strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M20 11a8 8 0 0 0-14.3-4.9L4 8" /><path d="M4 4v4h4" />
+                <path d="M4 13a8 8 0 0 0 14.3 4.9L20 16" /><path d="M20 20v-4h-4" />
+              </svg>
+              New code
+            </button>
+          )}
+        </div>
+        {confirm === 'code' ? (
+          <div className="flex items-center gap-2 flex-wrap text-xs text-stone-700">
+            <span className="flex-1 min-w-[10rem]">Issue a new code? The current one stops working. Everyone already in stays in.</span>
+            <button disabled={busy} onClick={() => run(() => Storage.updateGroup(name, group.id, 'new_code'), (r) => onGroupUpdated(r.group))}
+              className="h-8 px-3 rounded-lg bg-stone-800 text-white font-semibold disabled:opacity-50">New code</button>
+            <button onClick={() => setConfirm(null)} className={`${btn2} h-8`}>Cancel</button>
+          </div>
+        ) : owner && (
+          <div className="text-[11.5px] text-stone-500 leading-snug">A new code stops the old one working. Everyone already in stays in.</div>
+        )}
+      </div>
+
+      {error && <div className="text-sm text-red-700 bg-red-50 border border-red-200 rounded-md px-3 py-2">{error}</div>}
+
+      <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+        <div className="flex justify-between px-3.5 py-2.5 bg-stone-50 border-b border-stone-200 text-[10.5px] font-bold tracking-wider text-stone-500">
+          <span>MEMBERS</span>
+          <span>TODAY{today ? ` · ${finishedCount} of ${group.members.length}` : ''}</span>
+        </div>
+        {members.map((m) => {
+          const t = today ? today[m.toLowerCase()] : undefined;
+          const isMe = m === name;
+          const isOwnerRow = m.toLowerCase() === String(group.owner).toLowerCase();
+          const confirming = confirm && confirm.remove === m;
+          return (
+            <div key={m} className={`border-b border-stone-100 ${isMe ? 'bg-red-50' : ''}`}>
+              <div className="flex items-center gap-2.5 pl-3.5 pr-1.5 py-1.5 min-h-[44px]">
+                <button onClick={() => onPlayerClick(m)}
+                  className={`flex-1 min-w-0 text-left text-[13px] font-semibold truncate hover:underline underline-offset-2
+                             ${isMe ? 'text-red-800' : 'text-stone-800'}`}>
+                  {cleanName(m)}
+                  {isMe && <span className="text-stone-400 font-normal text-[11px]"> (you)</span>}
+                  {isOwnerRow && <span className="text-stone-400 font-normal text-[11px]"> · owner</span>}
+                </button>
+                <span className={`text-xs tabular-nums ${t != null ? 'text-stone-800' : 'text-stone-400'}`}
+                      style={{ fontFamily: '"Menlo", monospace' }}>
+                  {today ? (t != null ? formatCompact(t) : 'not yet') : ''}
+                </span>
+                {owner && !isOwnerRow ? (
+                  <button onClick={() => setConfirm({ remove: m })} aria-label={`Remove ${cleanName(m)}`}
+                    className="w-9 h-9 rounded-lg text-stone-400 hover:text-stone-700 hover:bg-stone-100 flex items-center justify-center flex-shrink-0">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+                         strokeLinecap="round" aria-hidden="true"><path d="M6 6l12 12" /><path d="M18 6L6 18" /></svg>
+                  </button>
+                ) : owner ? <span className="w-9 flex-shrink-0" /> : null}
+              </div>
+              {confirming && (
+                <div className="flex items-center gap-2 flex-wrap px-3.5 pb-2.5 text-xs text-stone-700">
+                  <span className="flex-1 min-w-[9rem]">Remove {cleanName(m)} from {group.name}?</span>
+                  <button disabled={busy}
+                    onClick={() => run(() => Storage.adminGroup(name, group.id, 'remove', m), (r) => onGroupUpdated(r.group))}
+                    className="h-8 px-3 rounded-lg bg-red-700 text-white font-semibold disabled:opacity-50">Remove</button>
+                  <button onClick={() => setConfirm(null)} className={`${btn2} h-8`}>Cancel</button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {group.members.length > LIMIT && (
+          <button onClick={() => setShowAll((v) => !v)}
+            className="w-full py-2.5 bg-stone-50 hover:bg-stone-100 text-xs font-medium text-stone-500">
+            {showAll ? 'Show fewer ▴' : `Show all ${group.members.length} ▾`}
+          </button>
+        )}
+      </div>
+
+      {owner && (
+        <div className="text-[11.5px] text-stone-500 leading-snug px-1">
+          Removing someone takes them off this group's board. They can't rejoin unless you issue a new code.
+        </div>
+      )}
+
+      {confirm === 'delete' || confirm === 'leave' ? (
+        <div className="bg-white rounded-xl shadow-sm p-3 flex items-center gap-2 flex-wrap text-xs text-stone-700">
+          <span className="flex-1 min-w-[10rem]">
+            {confirm === 'delete'
+              ? `Delete ${group.name} for everyone? Times stay on the public board.`
+              : `Leave ${group.name}? You'd need the code to rejoin.`}
+          </span>
+          <button disabled={busy}
+            onClick={() => run(
+              () => confirm === 'delete' ? Storage.adminGroup(name, group.id, 'delete') : Storage.leaveGroup(name, group.id),
+              () => onGroupGone(group.id))}
+            className="h-8 px-3 rounded-lg bg-red-700 text-white font-semibold disabled:opacity-50">
+            {confirm === 'delete' ? 'Delete group' : 'Leave'}
+          </button>
+          <button onClick={() => setConfirm(null)} className={`${btn2} h-8`}>Cancel</button>
+        </div>
+      ) : (
+        <button onClick={() => setConfirm(owner ? 'delete' : 'leave')}
+          className="self-start px-1 py-1.5 text-xs font-semibold text-red-700 hover:text-red-900">
+          {owner ? 'Delete group' : 'Leave group'}
+        </button>
+      )}
+    </main>
+  );
+}
+
 // ===== Main app =====
 export default function App() {
   const [todayKey, setTodayKey] = useState(() => utcDateKey());
@@ -4280,6 +4970,63 @@ export default function App() {
   );
 
   const lastActiveDateRef = useRef(null);
+
+  // === Groups ===
+  // pendingJoin: a code from a /j/CODE link, consumed once — by the name
+  // screen for a new player, or by opening the join sheet for an existing one.
+  const pendingJoinRef = useRef(null);
+  const [joinPreview, setJoinPreview] = useState(null);   // {name, owner, size}
+  const [groups, setGroups] = useState([]);
+  const [groupsLoaded, setGroupsLoaded] = useState(false);
+  const [scopePref, setScopePref] = useState(() => {
+    const v = lsGetScope();
+    return v === null ? null : v === 'all' ? 'all' : Number(v);
+  });
+  const [sheet, setSheet] = useState(null);               // {mode, code}
+  const [groupView, setGroupView] = useState(null);       // {id, justCreated}
+
+  useEffect(() => {
+    const code = joinCodeFromLocation();
+    if (!code) return;
+    pendingJoinRef.current = code;
+    try { window.history.replaceState(null, '', '/'); } catch { /* ignore */ }
+    Storage.lookupGroup(code).then((info) => { if (info) setJoinPreview(info); }).catch(() => {});
+  }, []);
+
+  const refreshGroups = async (n = name) => {
+    if (!n) return [];
+    try {
+      const g = await Storage.myGroups(n);
+      setGroups(Array.isArray(g) ? g : []);
+      setGroupsLoaded(true);
+      return g;
+    } catch { setGroupsLoaded(true); return []; }
+  };
+  useEffect(() => {
+    setGroups([]); setGroupsLoaded(false);
+    if (name) refreshGroups(name);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [name]);
+
+  // Existing player who opened a join link: open the sheet once groups load
+  // (or jump straight to the group if they're already in it).
+  useEffect(() => {
+    const code = pendingJoinRef.current;
+    if (!code || !name || !groupsLoaded) return;
+    pendingJoinRef.current = null;
+    const already = groups.find((g) => g.code === code);
+    if (already) { chooseScope(already.id); setView('leaderboard'); }
+    else { setView('leaderboard'); setSheet({ mode: 'join', code }); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [name, groupsLoaded]);
+
+  // Effective scope: the last choice if still valid, else first group, else all.
+  const scope = scopePref === 'all' ? 'all'
+              : groups.some((g) => g.id === scopePref) ? scopePref
+              : groups.length ? groups[0].id : 'all';
+  const chooseScope = (v) => { setScopePref(v); lsSetScope(v); };
+  const upsertGroup = (g) => setGroups((prev) =>
+    prev.some((x) => x.id === g.id) ? prev.map((x) => (x.id === g.id ? g : x)) : [...prev, g]);
 
   // === Load name on mount ===
   // Existing players arrive here with a name in localStorage but no secret
@@ -4533,6 +5280,16 @@ export default function App() {
     // 'unavailable' (offline — fail open, the server still gates writes).
     if (syncCode && res === 'ok') Storage.setSecret(secret);  // adopt the synced identity
     await Storage.setName(n);
+    // Arrived from a group link: join now, before the name effect fires, so
+    // the first board they see already includes the group.
+    const code = pendingJoinRef.current;
+    if (code && res !== 'unavailable') {
+      pendingJoinRef.current = null;
+      try {
+        const j = await Storage.joinGroup(n, code);
+        if (j?.status === 'ok' && j.group) chooseScope(j.group.id);
+      } catch { /* they can join from the Leaderboard later */ }
+    }
     setNameState(n);
     setView('game');
     return 'ok';
@@ -4562,6 +5319,7 @@ export default function App() {
                   : view === 'stats' ? 'stats'
                   : view === 'survivor' ? 'survivor'
                   : view === 'playerStats' ? 'leaderboard'
+                  : view === 'group' ? 'leaderboard'
                   : view === 'scoring' ? (scoringFrom === 'archives' ? 'archives'
                       : (scoringFrom === 'leaderboard' || scoringFrom === 'playerStats' || scoringFrom === 'stats') ? 'leaderboard'
                       : 'game')
@@ -4617,7 +5375,8 @@ export default function App() {
       <>
         <SharedSvgDefs />
         <PreviewModeBanner />
-        <NameEntry onSubmit={handleNameSubmit} />
+        <NameEntry onSubmit={handleNameSubmit}
+                   joining={pendingJoinRef.current ? joinPreview : null} />
       </>
     );
   }
@@ -4682,6 +5441,47 @@ export default function App() {
           currentName={name}
           onPlayerClick={openPlayerStats}
           onOpenScoring={openScoring}
+          groups={groups}
+          scope={scope}
+          onScopeChange={chooseScope}
+          onOpenJoin={USE_SUPABASE ? () => setSheet({ mode: 'join', code: null }) : undefined}
+          onOpenGroup={(id) => { setGroupView({ id, justCreated: false }); setView('group'); }}
+        />
+      )}
+
+      {view === 'group' && groupView && groups.find((g) => g.id === groupView.id) && (
+        <GroupPage
+          key={groupView.id}
+          group={groups.find((g) => g.id === groupView.id)}
+          name={name}
+          todayKey={todayKey}
+          justCreated={groupView.justCreated}
+          onDismissCreated={() => setGroupView({ ...groupView, justCreated: false })}
+          onBack={() => setView('leaderboard')}
+          onGroupUpdated={upsertGroup}
+          onGroupGone={(id) => {
+            setGroups((prev) => prev.filter((g) => g.id !== id));
+            if (scopePref === id) chooseScope('all');
+            setView('leaderboard');
+          }}
+          onPlayerClick={openPlayerStats}
+        />
+      )}
+
+      {sheet && (
+        <JoinSheet
+          name={name}
+          initialCode={sheet.code}
+          initialMode={sheet.mode}
+          onClose={() => setSheet(null)}
+          onJoined={(g) => {
+            upsertGroup(g); chooseScope(g.id); setSheet(null);
+            if (view !== 'game') setView('leaderboard');
+          }}
+          onCreated={(g) => {
+            upsertGroup(g); chooseScope(g.id); setSheet(null);
+            setGroupView({ id: g.id, justCreated: true }); setView('group');
+          }}
         />
       )}
 
@@ -4725,6 +5525,10 @@ export default function App() {
           refreshing={refreshing}
           onRename={() => setView('rename')}
           onOpenScoring={openScoring}
+          groups={groups}
+          scope={scope}
+          onScopeChange={chooseScope}
+          onOpenLeaderboard={() => handleTabChange('leaderboard')}
         />
       )}
 
